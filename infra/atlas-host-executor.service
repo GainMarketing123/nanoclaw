@@ -21,13 +21,8 @@ Environment=HOME=/home/atlas
 Environment=TZ=America/New_York
 Environment=PATH=/usr/local/bin:/usr/bin:/bin:/home/atlas/.local/bin
 
-# Security hardening
+# Minimal hardening — claude -p needs broad filesystem access for hooks
 NoNewPrivileges=true
-ProtectSystem=strict
-ReadWritePaths=/home/atlas/.atlas/host-tasks
-ReadWritePaths=/home/atlas/.atlas/audit
-ReadWritePaths=/home/atlas/projects
-PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
