@@ -330,16 +330,111 @@ def write_result(
     log(f"Result written: {result_path}")
 
 
+# --- Escalation file watcher (structural backup) ---
+# Tracks which escalation files we've already alerted on.
+# If the IPC alert from the container worked, the CEO already knows.
+# This catches any escalation the container forgot to notify about.
+
+SHARED_DIR = ATLAS_DIR / "shared"
+ESCALATION_SEEN_FILE = ATLAS_DIR / "state" / "escalations-seen.json"
+
+
+def load_seen_escalations() -> set[str]:
+    """Load set of escalation file paths we've already alerted on."""
+    try:
+        if ESCALATION_SEEN_FILE.exists():
+            return set(json.loads(ESCALATION_SEEN_FILE.read_text()))
+    except Exception:
+        pass
+    return set()
+
+
+def save_seen_escalations(seen: set[str]) -> None:
+    """Persist seen escalation set."""
+    try:
+        ESCALATION_SEEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+        ESCALATION_SEEN_FILE.write_text(json.dumps(sorted(seen)))
+    except Exception:
+        pass
+
+
+def check_escalations() -> None:
+    """Scan all department escalation directories for new files. Alert CEO on unseen ones."""
+    if not SHARED_DIR.exists():
+        return
+
+    seen = load_seen_escalations()
+    new_found = False
+
+    for dept_dir in sorted(SHARED_DIR.iterdir()):
+        if not dept_dir.is_dir():
+            continue
+        dept = dept_dir.name
+        esc_dir = dept_dir / "escalations"
+        if not esc_dir.exists():
+            continue
+
+        for esc_file in sorted(esc_dir.glob("*.md")):
+            file_key = str(esc_file)
+            if file_key in seen:
+                continue
+
+            # New escalation — read first few lines for summary
+            try:
+                content = esc_file.read_text(encoding="utf-8")
+                # Extract title from first heading or first line
+                title = "Unknown"
+                for line in content.split("\n"):
+                    line = line.strip()
+                    if line.startswith("# "):
+                        title = line[2:].strip()
+                        break
+                    elif line and title == "Unknown":
+                        title = line[:80]
+                        break
+
+                summary = content[:200].replace("\n", " ").strip()
+
+                alert_msg = (
+                    f"*Staff Escalation — {dept}*\n\n"
+                    f"{title}\n\n"
+                    f"{summary}{'...' if len(content) > 200 else ''}\n\n"
+                    f"File: `shared/{dept}/escalations/{esc_file.name}`"
+                )
+                send_telegram_alert(alert_msg)
+                log(f"Escalation alert sent: {dept}/{esc_file.name}")
+
+            except Exception as e:
+                log(f"Error reading escalation {esc_file}: {e}")
+
+            seen.add(file_key)
+            new_found = True
+
+    if new_found:
+        save_seen_escalations(seen)
+
+
 def main() -> None:
     log("Atlas Host-Executor starting")
     log(f"  Watching: {PENDING_DIR}")
     log(f"  Output:   {COMPLETED_DIR}")
+    log(f"  Escalations: {SHARED_DIR}/*/escalations/")
     log(f"  Timeout:  {TASK_TIMEOUT}s per task")
 
     # Ensure directories exist
     for d in [PENDING_DIR, COMPLETED_DIR, OUTPUTS_DIR]:
         d.mkdir(parents=True, exist_ok=True)
 
+    # Seed seen escalations with existing files (don't alert on old ones at startup)
+    seen = load_seen_escalations()
+    if not seen and SHARED_DIR.exists():
+        for esc_file in SHARED_DIR.glob("*/escalations/*.md"):
+            seen.add(str(esc_file))
+        if seen:
+            save_seen_escalations(seen)
+            log(f"Seeded {len(seen)} existing escalation(s) as seen")
+
+    poll_count = 0
     while True:
         try:
             # List pending tasks (sorted by name for deterministic order)
@@ -347,6 +442,11 @@ def main() -> None:
 
             for task_path in pending:
                 process_task(task_path)
+
+            # Check escalations every 6th poll (~30 seconds)
+            poll_count += 1
+            if poll_count % 6 == 0:
+                check_escalations()
 
         except Exception as e:
             log(f"Poll error: {e}")

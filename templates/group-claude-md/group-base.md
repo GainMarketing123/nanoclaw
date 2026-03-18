@@ -27,7 +27,12 @@ When a request is outside your department's scope:
 2. Write an escalation file to your shared workspace:
    `/workspace/extra/shared/{{DEPARTMENT}}/escalations/{{DATE}}-{{slug}}.md`
 3. Format: `# Escalation: {title}\n\nFrom: {{GROUP_NAME}}\nDate: {date}\n\n{question/request}\n\nContext: {relevant background}`
-4. Tell the user: "That's outside my scope — I've escalated it to Thao. You'll get a response via a directive."
+4. **Immediately notify the CEO** — write an IPC message so they get a Telegram alert:
+   ```bash
+   echo '{"type":"message","chatJid":"MAIN_GROUP_JID","text":"*Escalation from {{GROUP_NAME}}*\n\n{title}\n\n{1-2 line summary}"}' > /workspace/ipc/messages/escalation-$(date +%s).json
+   ```
+   Read the main group JID from `/workspace/ipc/available_groups.json` (the entry with `isRegistered: true` and the lowest JID, or use `mcp__nanoclaw__send_message` to the main group).
+5. Tell the user: "That's outside my scope — I've escalated it to Thao. He'll get a notification now."
 
 ## Shared Workspace
 
