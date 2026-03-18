@@ -14,6 +14,7 @@ import { CronExpressionParser } from 'cron-parser';
 const IPC_DIR = '/workspace/ipc';
 const MESSAGES_DIR = path.join(IPC_DIR, 'messages');
 const TASKS_DIR = path.join(IPC_DIR, 'tasks');
+const FILES_DIR = path.join(IPC_DIR, 'files');
 
 // Context from environment variables (set by the agent runner)
 const chatJid = process.env.NANOCLAW_CHAT_JID!;
@@ -59,6 +60,48 @@ server.tool(
     writeIpcFile(MESSAGES_DIR, data);
 
     return { content: [{ type: 'text' as const, text: 'Message sent.' }] };
+  },
+);
+
+server.tool(
+  'send_document',
+  `Send a file to the user or group as a document attachment (PDF, XLSX, CSV, MD, etc.). The file must exist on disk — generate it first using Bash/Write, then call this tool with the path.
+
+Steps: 1) Create the file (e.g., write an XLSX, generate a PDF). 2) Call send_document with the absolute path. The file is copied to the IPC staging area and delivered as a Telegram/channel attachment.`,
+  {
+    file_path: z.string().describe('Absolute path to the file to send (e.g., "/workspace/group/report.xlsx")'),
+    caption: z.string().optional().describe('Caption text shown with the file attachment'),
+    filename: z.string().optional().describe('Override the filename shown to the recipient (defaults to the original filename)'),
+  },
+  async (args) => {
+    if (!fs.existsSync(args.file_path)) {
+      return {
+        content: [{ type: 'text' as const, text: `File not found: "${args.file_path}". Create the file first, then call send_document.` }],
+        isError: true,
+      };
+    }
+
+    // Copy file into IPC staging area so the host can access it
+    fs.mkdirSync(FILES_DIR, { recursive: true });
+    const originalName = args.filename || path.basename(args.file_path);
+    const stagedName = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${originalName}`;
+    const stagedPath = path.join(FILES_DIR, stagedName);
+    fs.copyFileSync(args.file_path, stagedPath);
+
+    // Write IPC message referencing the staged file (relative to IPC dir)
+    const data = {
+      type: 'document',
+      chatJid,
+      filePath: `files/${stagedName}`,
+      caption: args.caption || undefined,
+      filename: originalName,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(MESSAGES_DIR, data);
+
+    return { content: [{ type: 'text' as const, text: `Document "${originalName}" sent.` }] };
   },
 );
 

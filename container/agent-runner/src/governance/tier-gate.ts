@@ -37,6 +37,7 @@ const TIER_TOOLS: Record<number, string[]> = {
     ...READ_ONLY_TOOLS,
     'mcp__nanoclaw__list_tasks',
     'mcp__nanoclaw__send_message',  // Can send digest/alerts to CEO
+    'mcp__nanoclaw__send_document', // Can send file attachments to CEO
   ],
   2: [
     ...ALL_CONTAINER_TOOLS,
@@ -46,6 +47,7 @@ const TIER_TOOLS: Record<number, string[]> = {
     ...READ_ONLY_TOOLS,
     'Write',  // For writing to approval queue
     'mcp__nanoclaw__send_message',
+    'mcp__nanoclaw__send_document',
     'mcp__nanoclaw__list_tasks',
   ],
   4: [],  // CEO only — never runs autonomously
