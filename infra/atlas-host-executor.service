@@ -1,0 +1,33 @@
+[Unit]
+Description=Atlas Host-Executor Bridge
+Documentation=https://github.com/GainMarketing123/nanoclaw
+After=nanoclaw.service
+Wants=nanoclaw.service
+
+[Service]
+Type=simple
+User=atlas
+Group=atlas
+WorkingDirectory=/home/atlas/nanoclaw
+ExecStart=/usr/bin/python3 /home/atlas/nanoclaw/host/host-executor.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=atlas-host-executor
+
+# Environment
+Environment=HOME=/home/atlas
+Environment=TZ=America/New_York
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/home/atlas/.local/bin
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/home/atlas/.atlas/host-tasks
+ReadWritePaths=/home/atlas/.atlas/audit
+ReadWritePaths=/home/atlas/projects
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
