@@ -385,22 +385,35 @@ async function runQuery(
   let messageCount = 0;
   let resultCount = 0;
 
-  // Explicitly load CLAUDE.md files and inject into system prompt.
+  // Explicitly load system prompt files and inject into SDK.
+  // Order: self-knowledge FIRST (who Atlas is), then global governance, then group persona.
   // The SDK does not reliably auto-discover CLAUDE.md from cwd,
   // so we read and concatenate them ourselves.
-  const groupClaudeMdPath = '/workspace/group/CLAUDE.md';
+  const selfKnowledgePath = '/workspace/extra/atlas-state/atlas-self-knowledge.md';
   const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
+  const groupClaudeMdPath = '/workspace/group/CLAUDE.md';
   const claudeMdParts: string[] = [];
+
+  // 1. Self-knowledge — Atlas knows itself first (infrastructure, capabilities, build principles)
+  if (fs.existsSync(selfKnowledgePath)) {
+    claudeMdParts.push(fs.readFileSync(selfKnowledgePath, 'utf-8'));
+    log('Loaded self-knowledge from /workspace/extra/atlas-state/atlas-self-knowledge.md');
+  }
+
+  // 2. Global CLAUDE.md — governance rules (authority tiers, kill switch, communication guardrails)
+  if (fs.existsSync(globalClaudeMdPath)) {
+    claudeMdParts.push(fs.readFileSync(globalClaudeMdPath, 'utf-8'));
+    log('Loaded global CLAUDE.md from /workspace/global/CLAUDE.md');
+  }
+
+  // 3. Group CLAUDE.md — group-specific persona, department scope, restrictions
   if (fs.existsSync(groupClaudeMdPath)) {
     claudeMdParts.push(fs.readFileSync(groupClaudeMdPath, 'utf-8'));
     log('Loaded group CLAUDE.md from /workspace/group/CLAUDE.md');
   } else {
     log('WARNING: No CLAUDE.md found at /workspace/group/CLAUDE.md');
   }
-  if (fs.existsSync(globalClaudeMdPath)) {
-    claudeMdParts.push(fs.readFileSync(globalClaudeMdPath, 'utf-8'));
-    log('Loaded global CLAUDE.md from /workspace/global/CLAUDE.md');
-  }
+
   const injectedClaudeMd: string | undefined = claudeMdParts.length > 0
     ? claudeMdParts.join('\n\n---\n\n')
     : undefined;
