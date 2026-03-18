@@ -79,6 +79,11 @@ export interface TaskRunLog {
 
 // --- Channel abstraction ---
 
+export interface SendDocumentOptions {
+  caption?: string;
+  filename?: string;
+}
+
 export interface Channel {
   name: string;
   connect(): Promise<void>;
@@ -90,6 +95,12 @@ export interface Channel {
   setTyping?(jid: string, isTyping: boolean): Promise<void>;
   // Optional: sync group/chat names from the platform.
   syncGroups?(force: boolean): Promise<void>;
+  // Optional: send a file as a document attachment.
+  sendDocument?(
+    jid: string,
+    filePath: string,
+    options?: SendDocumentOptions,
+  ): Promise<void>;
 }
 
 // Callback type that channels use to deliver inbound messages

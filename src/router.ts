@@ -1,4 +1,4 @@
-import { Channel, NewMessage } from './types.js';
+import { Channel, NewMessage, SendDocumentOptions } from './types.js';
 import { formatLocalTime } from './timezone.js';
 
 export function escapeXml(s: string): string {
@@ -42,6 +42,20 @@ export function routeOutbound(
   const channel = channels.find((c) => c.ownsJid(jid) && c.isConnected());
   if (!channel) throw new Error(`No channel for JID: ${jid}`);
   return channel.sendMessage(jid, text);
+}
+
+export async function routeOutboundDocument(
+  channels: Channel[],
+  jid: string,
+  filePath: string,
+  options?: SendDocumentOptions,
+): Promise<void> {
+  const channel = channels.find((c) => c.ownsJid(jid) && c.isConnected());
+  if (!channel) throw new Error(`No channel for JID: ${jid}`);
+  if (!channel.sendDocument) {
+    throw new Error(`Channel ${channel.name} does not support sendDocument`);
+  }
+  return channel.sendDocument(jid, filePath, options);
 }
 
 export function findChannel(

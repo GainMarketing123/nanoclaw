@@ -1,5 +1,7 @@
 import https from 'https';
-import { Api, Bot } from 'grammy';
+import fs from 'fs';
+import pathMod from 'path';
+import { Api, Bot, InputFile } from 'grammy';
 
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
 import { readEnvFile } from '../env.js';
@@ -10,6 +12,7 @@ import {
   OnChatMetadata,
   OnInboundMessage,
   RegisteredGroup,
+  SendDocumentOptions,
 } from '../types.js';
 
 export interface TelegramChannelOpts {
@@ -262,6 +265,35 @@ export class TelegramChannel implements Channel {
       logger.info({ jid, length: text.length }, 'Telegram message sent');
     } catch (err) {
       logger.error({ jid, err }, 'Failed to send Telegram message');
+    }
+  }
+
+  async sendDocument(
+    jid: string,
+    filePath: string,
+    options: SendDocumentOptions = {},
+  ): Promise<void> {
+    if (!this.bot) {
+      logger.warn('Telegram bot not initialized');
+      return;
+    }
+
+    try {
+      const numericId = jid.replace(/^tg:/, '');
+      const filename =
+        options.filename || pathMod.basename(filePath);
+
+      // Grammy InputFile accepts a readable stream + optional filename
+      const file = new InputFile(fs.createReadStream(filePath), filename);
+
+      await this.bot.api.sendDocument(numericId, file, {
+        caption: options.caption,
+        parse_mode: options.caption ? 'Markdown' : undefined,
+      });
+
+      logger.info({ jid, filename }, 'Telegram document sent');
+    } catch (err) {
+      logger.error({ jid, filePath, err }, 'Failed to send Telegram document');
     }
   }
 
