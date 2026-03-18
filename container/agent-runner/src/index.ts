@@ -18,6 +18,18 @@ import fs from 'fs';
 import path from 'path';
 import { query, HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
+import {
+  runPreflightChecks,
+  getAllowedToolsForTier,
+  getDefaultTools,
+  createAuditInterceptor,
+  logPostTaskAnalysis,
+  getQuotaStatus,
+  shouldRunTask,
+  logInvocation,
+  logGovernanceEvent,
+  type GovernanceContainerInput,
+} from './governance/index.js';
 
 interface ContainerInput {
   prompt: string;
@@ -27,6 +39,10 @@ interface ContainerInput {
   isMain: boolean;
   isScheduledTask?: boolean;
   assistantName?: string;
+  // Atlas governance extensions
+  tier?: number;
+  model?: string;
+  taskId?: string;
 }
 
 interface ContainerOutput {
@@ -335,6 +351,8 @@ async function runQuery(
   mcpServerPath: string,
   containerInput: ContainerInput,
   sdkEnv: Record<string, string | undefined>,
+  governedTools: string[],
+  auditInterceptor: ReturnType<typeof createAuditInterceptor>,
   resumeAt?: string,
 ): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean }> {
   const stream = new MessageStream();
@@ -389,6 +407,20 @@ async function runQuery(
     log(`Additional directories: ${extraDirs.join(', ')}`);
   }
 
+  // Use governed tools if available, otherwise default full set
+  const effectiveTools = (containerInput as ContainerInput).tier
+    ? governedTools
+    : [
+        'Bash',
+        'Read', 'Write', 'Edit', 'Glob', 'Grep',
+        'WebSearch', 'WebFetch',
+        'Task', 'TaskOutput', 'TaskStop',
+        'TeamCreate', 'TeamDelete', 'SendMessage',
+        'TodoWrite', 'ToolSearch', 'Skill',
+        'NotebookEdit',
+        'mcp__nanoclaw__*'
+      ];
+
   for await (const message of query({
     prompt: stream,
     options: {
@@ -399,16 +431,8 @@ async function runQuery(
       systemPrompt: globalClaudeMd
         ? { type: 'preset' as const, preset: 'claude_code' as const, append: globalClaudeMd }
         : undefined,
-      allowedTools: [
-        'Bash',
-        'Read', 'Write', 'Edit', 'Glob', 'Grep',
-        'WebSearch', 'WebFetch',
-        'Task', 'TaskOutput', 'TaskStop',
-        'TeamCreate', 'TeamDelete', 'SendMessage',
-        'TodoWrite', 'ToolSearch', 'Skill',
-        'NotebookEdit',
-        'mcp__nanoclaw__*'
-      ],
+      allowedTools: effectiveTools,
+      model: (containerInput as ContainerInput).model || undefined,
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
       allowDangerouslySkipPermissions: true,
@@ -432,6 +456,9 @@ async function runQuery(
     messageCount++;
     const msgType = message.type === 'system' ? `system/${(message as { subtype?: string }).subtype}` : message.type;
     log(`[msg #${messageCount}] type=${msgType}`);
+
+    // Atlas governance: intercept tool calls for audit logging
+    auditInterceptor.interceptMessage(message as { type: string; message?: { content?: { type: string; name?: string; input?: Record<string, unknown> }[] } });
 
     if (message.type === 'assistant' && 'uuid' in message) {
       lastAssistantUuid = (message as { uuid: string }).uuid;
@@ -481,6 +508,39 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  // --- Atlas Governance: Preflight checks ---
+  const entity = containerInput.groupFolder;
+  const tier = containerInput.tier;
+  const taskModel = containerInput.model || 'sonnet';
+  const taskStartTime = Date.now();
+
+  const preflight = runPreflightChecks(entity);
+  if (!preflight.ok) {
+    log(`Governance preflight failed: ${preflight.reason}`);
+    writeOutput({ status: 'error', result: null, error: `Preflight: ${preflight.reason}` });
+    process.exit(1);
+  }
+
+  // Quota check for autonomous tasks
+  if (containerInput.isScheduledTask) {
+    if (!shouldRunTask('autonomous')) {
+      const quota = getQuotaStatus();
+      log(`Quota exceeded (${quota.throttle_level}) — skipping autonomous task`);
+      writeOutput({ status: 'error', result: null, error: `Quota ${quota.throttle_level}: autonomous tasks paused` });
+      process.exit(0);
+    }
+  }
+
+  // Create audit interceptor for this session
+  const auditInterceptor = createAuditInterceptor(
+    entity,
+    tier || 0,
+    containerInput.isScheduledTask ? `task:${containerInput.taskId || 'unknown'}` : `ceo:${entity}`,
+  );
+
+  // Determine allowed tools based on tier
+  const governedTools = tier ? getAllowedToolsForTier(tier) : getDefaultTools();
+
   // Credentials are injected by the host's credential proxy via ANTHROPIC_BASE_URL.
   // No real secrets exist in the container environment.
   const sdkEnv: Record<string, string | undefined> = { ...process.env };
@@ -511,7 +571,7 @@ async function main(): Promise<void> {
     while (true) {
       log(`Starting query (session: ${sessionId || 'new'}, resumeAt: ${resumeAt || 'latest'})...`);
 
-      const queryResult = await runQuery(prompt, sessionId, mcpServerPath, containerInput, sdkEnv, resumeAt);
+      const queryResult = await runQuery(prompt, sessionId, mcpServerPath, containerInput, sdkEnv, governedTools, auditInterceptor, resumeAt);
       if (queryResult.newSessionId) {
         sessionId = queryResult.newSessionId;
       }
@@ -542,9 +602,55 @@ async function main(): Promise<void> {
       log(`Got new message (${nextMessage.length} chars), starting new query`);
       prompt = nextMessage;
     }
+    // --- Atlas Governance: Post-task analysis ---
+    const taskDuration = Date.now() - taskStartTime;
+    logPostTaskAnalysis({
+      taskId: containerInput.taskId || containerInput.groupFolder,
+      entity,
+      tier: tier || 0,
+      model: taskModel,
+      success: true,
+      durationMs: taskDuration,
+      toolCallCount: auditInterceptor.getToolCallCount(),
+    });
+
+    logInvocation({
+      timestamp: new Date().toISOString(),
+      type: containerInput.isScheduledTask ? 'autonomous' : 'ceo_session',
+      task_id: containerInput.taskId,
+      model: taskModel,
+      entity,
+      duration_ms: taskDuration,
+    });
+
+    log(`Governance: task completed in ${taskDuration}ms, ${auditInterceptor.getToolCallCount()} tool calls audited`);
+
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
     log(`Agent error: ${errorMessage}`);
+
+    // Log failure to governance
+    const taskDuration = Date.now() - taskStartTime;
+    logPostTaskAnalysis({
+      taskId: containerInput.taskId || containerInput.groupFolder,
+      entity,
+      tier: tier || 0,
+      model: taskModel,
+      success: false,
+      durationMs: taskDuration,
+      toolCallCount: auditInterceptor.getToolCallCount(),
+      errorMessage,
+    });
+
+    logInvocation({
+      timestamp: new Date().toISOString(),
+      type: containerInput.isScheduledTask ? 'autonomous' : 'ceo_session',
+      task_id: containerInput.taskId,
+      model: taskModel,
+      entity,
+      duration_ms: taskDuration,
+    });
+
     writeOutput({
       status: 'error',
       result: null,
