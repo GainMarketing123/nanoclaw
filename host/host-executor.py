@@ -130,9 +130,22 @@ def _call_haiku(response_text: str) -> dict:
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             text = data.get("content", [{}])[0].get("text", "{}")
+            # Strip markdown fences (```json ... ```)
             if text.startswith("```"):
                 text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-            result = json.loads(text)
+            # Strip any preamble text before the JSON object
+            json_start = text.find("{")
+            if json_start > 0:
+                text = text[json_start:]
+            # Strip any trailing text after the JSON object
+            json_end = text.rfind("}")
+            if json_end >= 0:
+                text = text[:json_end + 1]
+            try:
+                result = json.loads(text)
+            except json.JSONDecodeError:
+                log(f"Haiku returned unparseable text: {text[:300]}")
+                return {"score": -2, "error": f"Haiku response not valid JSON: {text[:200]}"}
             return result
     except urllib.error.HTTPError as e:
         err_body = ""
