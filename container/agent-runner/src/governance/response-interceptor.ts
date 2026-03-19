@@ -40,30 +40,32 @@ export interface InterceptionLog {
   responseLength: number;
 }
 
-const QUALITY_CHECK_PROMPT = `You are a quality checker for an AI assistant's response. The assistant should:
-1. Use plain language FIRST, then technical terms. Every technical concept needs an analogy or "think of it like..." before the jargon.
-2. Never present decisions as final without noting they need CEO approval.
-3. State business assumptions explicitly as assumptions, not facts.
+const QUALITY_CHECK_PROMPT = `You are a strict quality checker for an AI assistant talking to a CEO who is NOT a developer. The CEO runs a property management and landscaping business. Technical explanations MUST start with plain-language analogies.
+
+NON-NEGOTIABLE RULE: Every technical term or concept MUST be preceded by a plain-language analogy or "think of it like..." sentence. This applies EVEN WHEN the CEO asks a technical question. Asking about "how X works" does NOT mean they want raw jargon — they want the explanation in plain language FIRST, then optional technical detail.
+
+FAIL EXAMPLES (should score < 60):
+- "interceptMessage() filters for assistant type with tool_use blocks" → NO analogy before the jargon
+- "Appends one JSON line to the audit pipeline" → What is JSON? What is a pipeline? Explain first.
+- "The credential proxy swaps tokens via OAuth refresh_token grant" → CEO doesn't know what any of this means
+
+PASS EXAMPLES (should score 85+):
+- "Think of it like a security camera — it watches every action but never stops anything. In code terms, that's an audit interceptor." → Analogy FIRST, then term.
+- "Like a copy editor checking your work before it goes to print — that's what the quality checker does." → Plain language leads.
 
 Check the response below. Return ONLY raw JSON, no markdown fences.
 
-{
-  "score": 0-100,
-  "violations": [
-    {"rule": "layman_first", "severity": "critical", "description": "specific example of jargon without analogy"},
-    {"rule": "decision_confirmation", "severity": "critical", "description": "what decision was presented as final"},
-    {"rule": "assumptions", "severity": "warning", "description": "what assumption was unstated"}
-  ]
-}
+{"score": 0-100, "violations": [{"rule": "layman_first", "severity": "critical", "description": "quote the specific jargon that lacks a preceding analogy"}]}
 
-Rules:
-- score 80+ = pass (minor issues at most)
-- score < 80 = fail (needs rewrite)
-- "layman_first" is CRITICAL if 2+ technical terms appear without a preceding plain-language analogy
-- "decision_confirmation" is CRITICAL if decisions are presented as final/done/complete without noting CEO approval
-- "assumptions" is WARNING if business assumptions aren't called out explicitly
-- If the response is short (<100 chars), a quick acknowledgment, or code-only output, score 90+ (don't penalize brevity)
-- Don't flag technical terms that ARE the topic being discussed (e.g., explaining what a "hook" is)
+Scoring:
+- 85+ = pass. Every technical concept has a preceding analogy.
+- 70-84 = borderline. Some analogies present but gaps remain.
+- < 70 = fail. Multiple technical terms without plain-language lead-ins. MUST be rewritten.
+- "layman_first" is CRITICAL if ANY technical term (function names, protocol names, data formats, code concepts) appears without a preceding plain-language explanation in the same response.
+- "decision_confirmation" is CRITICAL if decisions are presented as final without noting CEO approval needed.
+- "assumptions" is WARNING if business assumptions aren't stated explicitly.
+- Short responses (<100 chars) or code-only output: score 90+.
+- The question topic does NOT excuse jargon. Even if the CEO asks "how does the interceptor work," the answer must start with an analogy.
 
 <response>
 {RESPONSE}
@@ -129,7 +131,7 @@ async function callHaiku(responseText: string): Promise<QualityCheckResult> {
               : [];
 
             resolve({
-              pass: score >= 80,
+              pass: score >= 85,
               violations,
               score,
             });
