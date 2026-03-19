@@ -122,6 +122,13 @@ async function callHaiku(responseText: string): Promise<QualityCheckResult> {
             }
             const result = JSON.parse(data);
             const score = typeof result.score === 'number' ? result.score : 50;
+
+            // If host-executor returned an error (score < 0), log the raw detail
+            if (score < 0 && result.raw_text) {
+              log(`Host-executor error: ${result.error}`);
+              log(`Raw Haiku text (first 300): ${result.raw_text.slice(0, 300)}`);
+            }
+
             const violations: QualityViolation[] = Array.isArray(result.violations)
               ? result.violations.filter((v: QualityViolation) => v.rule && v.severity)
               : [];

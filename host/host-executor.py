@@ -143,9 +143,11 @@ def _call_haiku(response_text: str) -> dict:
                 text = text[:json_end + 1]
             try:
                 result = json.loads(text)
-            except json.JSONDecodeError:
-                log(f"Haiku returned unparseable text: {text[:300]}")
-                return {"score": -2, "error": f"Haiku response not valid JSON: {text[:200]}"}
+            except json.JSONDecodeError as e:
+                log(f"Haiku JSON parse failed: {e}")
+                log(f"Text length: {len(text)}, first 200: {repr(text[:200])}")
+                log(f"Last 200: {repr(text[-200:])}")
+                return {"score": -2, "error": f"JSON parse: {str(e)}", "raw_text": text[:500]}
             return result
     except urllib.error.HTTPError as e:
         err_body = ""
