@@ -177,10 +177,10 @@ function getQuotaToday() {
     else ceo++;
   }
 
-  const maxQuota = 200;
+  const calFile = path.join(ATLAS_DIR, "autonomy", "quota-calibration.json"); let maxQuota = 1000; try { maxQuota = JSON.parse(fs.readFileSync(calFile, "utf-8")).estimated_limit || 1000; } catch { }
   const pct = Math.round((weighted / maxQuota) * 100);
   const level = pct >= 90 ? 'PAUSED' : pct >= 60 ? 'THROTTLED' : 'NORMAL';
-  return { total, autonomous, ceo, weighted: Math.round(weighted * 100) / 100, level, pct: Math.min(pct, 100) };
+  return { total, autonomous, ceo, weighted: Math.round(weighted * 100) / 100, level, pct: Math.min(pct, 100), maxQuota };
 }
 
 function getApprovalQueue() {
@@ -844,7 +844,7 @@ function renderPage(data) {
       <div class="label">Quota</div>
       <div class="value" style="color:${quotaColor}">${quota.pct}%</div>
       <div class="quota-bar"><div class="quota-fill" style="width:${quota.pct}%;background:${quotaColor}"></div></div>
-      <div class="sub">${quota.weighted}/200 weighted \u2022 ${quota.level}</div>
+      <div class="sub">${quota.weighted}/${quota.maxQuota} weighted \u2022 ${quota.level}</div>
     </div>
     <div class="stat-card">
       <div class="label">Approvals</div>
