@@ -55,7 +55,9 @@ function loadCalibration(): CalibrationData {
     if (fs.existsSync(CALIBRATION_FILE)) {
       return JSON.parse(fs.readFileSync(CALIBRATION_FILE, 'utf-8'));
     }
-  } catch { /* use defaults */ }
+  } catch (err) {
+    console.error(`[governance/quota] Failed to read calibration: ${err instanceof Error ? err.message : String(err)}`);
+  }
   return {
     estimated_limit: DEFAULT_LIMIT_ESTIMATE,
     last_429_at: null,
