@@ -103,11 +103,12 @@ async function callHaiku(responseText: string): Promise<QualityCheckResult> {
       'anthropic-version': '2023-06-01',
     };
 
-    // The credential proxy handles auth — container never sees real tokens.
-    // Send a placeholder header that the proxy will replace.
-    // DO NOT set x-api-key to empty string — that can cause auth errors.
-    // The proxy strips and replaces auth headers on all upstream requests.
-    headers['x-api-key'] = 'proxy-injected';
+    // The credential proxy in OAuth mode only replaces the Authorization header
+    // if the incoming request already has one. Send a placeholder so the proxy
+    // injects the real OAuth token. Without this, the request arrives at
+    // api.anthropic.com with no auth → 401.
+    headers['Authorization'] = 'Bearer proxy-placeholder';
+    headers['x-api-key'] = 'proxy-placeholder';
 
     const log = (msg: string) => console.error(`[response-interceptor] ${msg}`);
 
