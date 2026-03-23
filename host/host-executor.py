@@ -398,6 +398,72 @@ def auto_push(project_dir: str, entity: str) -> bool:
         return False
 
 
+
+def merge_worktree_branches(project_dir: str) -> list[str]:
+    """Find and merge worktree branches created by claude -p --worktree.
+
+    After claude -p exits, commits may be in a worktree branch rather than
+    the main branch. This merges them back so commit detection and auto-push
+    work correctly.
+    """
+    merged = []
+    try:
+        # List all worktrees
+        result = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            cwd=project_dir, capture_output=True, text=True, timeout=10
+        )
+        if result.returncode != 0:
+            return merged
+
+        # Parse worktree branches (skip main/master)
+        branches = []
+        for line in result.stdout.split("\n"):
+            if line.startswith("branch "):
+                branch = line[7:].replace("refs/heads/", "")
+                if branch not in ("main", "master"):
+                    branches.append(branch)
+
+        # Get current branch
+        current = subprocess.run(
+            ["git", "branch", "--show-current"],
+            cwd=project_dir, capture_output=True, text=True, timeout=5
+        )
+        current_branch = current.stdout.strip() if current.returncode == 0 else "main"
+
+        for branch in branches:
+            # Check if branch has commits ahead of current
+            ahead = subprocess.run(
+                ["git", "log", f"{current_branch}..{branch}", "--oneline"],
+                cwd=project_dir, capture_output=True, text=True, timeout=10
+            )
+            if ahead.stdout.strip():
+                # Merge the branch
+                merge = subprocess.run(
+                    ["git", "merge", branch, "--no-edit"],
+                    cwd=project_dir, capture_output=True, text=True, timeout=30
+                )
+                if merge.returncode == 0:
+                    merged.append(branch)
+                    log(f"  Merged worktree branch: {branch}")
+                    # Clean up branch
+                    subprocess.run(
+                        ["git", "branch", "-d", branch],
+                        cwd=project_dir, capture_output=True, text=True, timeout=10
+                    )
+                else:
+                    log(f"  WARN: Failed to merge worktree branch {branch}: {merge.stderr[:100]}")
+
+        # Clean up any stale worktrees
+        subprocess.run(
+            ["git", "worktree", "prune"],
+            cwd=project_dir, capture_output=True, text=True, timeout=10
+        )
+    except Exception as e:
+        log(f"  Worktree merge error: {e}")
+    return merged
+
+
 def process_task(task_path: Path) -> None:
     """Process a single task request."""
     task_id = None
@@ -442,6 +508,10 @@ def process_task(task_path: Path) -> None:
         # Tier 1: read-only (no code modifications)
         if tier == 1:
             cmd.extend(["--allowedTools", "Read,Glob,Grep,WebSearch,WebFetch"])
+
+        # Tier 2+: use worktree isolation to prevent file conflicts
+        if tier >= 2:
+            cmd.append("--worktree")
 
         # Run claude -p with the prompt on stdin
         start_time = time.time()
@@ -500,7 +570,13 @@ def process_task(task_path: Path) -> None:
         full_output_path = OUTPUTS_DIR / f"{task_id}.txt"
         full_output_path.write_text(stdout)
 
-        # Check for new commits
+        # Merge any worktree branches back to main before commit detection
+        if tier >= 2:
+            wt_merged = merge_worktree_branches(project_dir)
+            if wt_merged:
+                log(f"  Merged {len(wt_merged)} worktree branch(es)")
+
+        # Check for new commits (now includes worktree merges)
         new_commits = get_commits_since(project_dir, head_before) if head_before else []
         pushed = False
 
