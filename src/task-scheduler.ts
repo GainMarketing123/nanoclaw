@@ -4,6 +4,11 @@ import fs from 'fs';
 
 import { ASSISTANT_NAME, SCHEDULER_POLL_INTERVAL, TIMEZONE } from './config.js';
 import {
+  buildEscalationMessage,
+  isGroupPaused,
+  recordTaskResult,
+} from './auto-pause.js';
+import {
   ContainerOutput,
   runContainerAgent,
   writeTasksSnapshot,
@@ -19,6 +24,7 @@ import {
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { logger } from './logger.js';
+import { buildExecutionPlan } from './task-planner.js';
 import { RegisteredGroup, ScheduledTask } from './types.js';
 
 /**
@@ -241,6 +247,27 @@ async function runTask(
   // Think of this like a scorecard — after each cron run, grade it against
   // the 6 clean-run criteria and log the result for milestone tracking.
   evaluateM2CleanRun(task.id, error ? 'error' : 'success', !!result, error);
+
+  // --- 3c-6: Auto-pause on consecutive failures ---
+  // Like a circuit breaker — after enough failures in a row, stop trying
+  // and alert the CEO instead of burning through quota on broken tasks.
+  const pauseResult = recordTaskResult(task.group_folder, !error);
+  if (pauseResult.shouldPause && pauseResult.reason) {
+    const escalation = buildEscalationMessage(
+      task.group_folder,
+      pauseResult.reason,
+    );
+    // Send escalation to the task's chat
+    deps.sendMessage(task.chat_jid, escalation).catch((err) =>
+      logger.error({ err, chatJid: task.chat_jid }, 'Failed to send auto-pause escalation'),
+    );
+    // Pause the task itself
+    updateTask(task.id, { status: 'paused' });
+    logger.error(
+      { taskId: task.id, groupFolder: task.group_folder, failureCount: pauseResult.failureCount },
+      'Task auto-paused after consecutive failures',
+    );
+  }
 }
 
 /**
@@ -299,16 +326,67 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
         logger.info({ count: dueTasks.length }, 'Found due tasks');
       }
 
+      // Filter out paused/cancelled tasks first
+      const activeTasks: ScheduledTask[] = [];
       for (const task of dueTasks) {
-        // Re-check task status in case it was paused/cancelled
         const currentTask = getTaskById(task.id);
-        if (!currentTask || currentTask.status !== 'active') {
+        if (!currentTask || currentTask.status !== 'active') continue;
+
+        // 3c-6: Skip tasks in auto-paused groups
+        const pauseStatus = isGroupPaused(currentTask.group_folder);
+        if (pauseStatus.paused) {
+          logger.info(
+            { taskId: currentTask.id, reason: pauseStatus.reason },
+            'Skipping task — group is auto-paused',
+          );
           continue;
         }
 
-        deps.queue.enqueueTask(currentTask.chat_jid, currentTask.id, () =>
-          runTask(currentTask, deps),
-        );
+        activeTasks.push(currentTask);
+      }
+
+      // 3c-1/2/3: Run planner on batch to detect conflicts
+      if (activeTasks.length > 1) {
+        const plan = buildExecutionPlan(activeTasks);
+        if (plan.conflicts.length > 0) {
+          logger.info(
+            {
+              conflicts: plan.conflicts.length,
+              serialized: plan.serialized.length,
+              parallel: plan.parallelGroups.flat().length,
+            },
+            'Task planner: scheduling serialized tasks after parallel batch',
+          );
+        }
+
+        // Enqueue parallel-safe tasks first
+        for (const group of plan.parallelGroups) {
+          for (const scope of group) {
+            const task = activeTasks.find((t) => t.id === scope.taskId);
+            if (task) {
+              deps.queue.enqueueTask(task.chat_jid, task.id, () =>
+                runTask(task, deps),
+              );
+            }
+          }
+        }
+
+        // Enqueue serialized tasks (they'll naturally queue in order)
+        for (const scope of plan.serialized) {
+          const task = activeTasks.find((t) => t.id === scope.taskId);
+          if (task) {
+            deps.queue.enqueueTask(task.chat_jid, task.id, () =>
+              runTask(task, deps),
+            );
+          }
+        }
+      } else {
+        // Single task — no planner needed
+        for (const task of activeTasks) {
+          deps.queue.enqueueTask(task.chat_jid, task.id, () =>
+            runTask(task, deps),
+          );
+        }
       }
     } catch (err) {
       logger.error({ err }, 'Error in scheduler loop');
