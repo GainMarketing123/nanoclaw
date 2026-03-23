@@ -77,6 +77,28 @@ let messageLoopRunning = false;
 const channels: Channel[] = [];
 const queue = new GroupQueue();
 
+/**
+ * Extract a human-readable entity label from a group folder name.
+ * "atlas_main" → "Atlas", "atlas_gpg" → "GPG", "atlas_crownscape" → "Crownscape"
+ */
+function entityLabel(group: RegisteredGroup): string {
+  const parts = group.folder.split('_');
+  const last = parts[parts.length - 1];
+  if (last === 'main') return 'Atlas';
+  return last.charAt(0).toUpperCase() + last.slice(1);
+}
+
+/**
+ * Build a short summary from message content (first 80 chars, single line).
+ */
+function messageSummary(content: string, maxLen = 80): string {
+  const clean = content
+    .replace(new RegExp(`@${ASSISTANT_NAME}`, 'gi'), '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return clean.length > maxLen ? clean.slice(0, maxLen) + '...' : clean;
+}
+
 function loadState(): void {
   lastTimestamp = getRouterState('last_timestamp') || '';
   const agentTs = getRouterState('last_agent_timestamp');
@@ -253,6 +275,18 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     'Processing messages',
   );
 
+  // 3d-1: Mechanical receive ack — fires synchronously before container spawn
+  try {
+    const entity = entityLabel(group);
+    const summary = messageSummary(missedMessages[0].content);
+    await channel.sendMessage(
+      chatJid,
+      `[${entity}] Received: ${summary}`,
+    );
+  } catch (err) {
+    logger.warn({ chatJid, err }, 'Failed to send receive ack');
+  }
+
   // Track idle timer for closing stdin when agent is idle
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -268,6 +302,14 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   };
 
   await channel.setTyping?.(chatJid, true);
+
+  // 3d-3: Container spawn ack — tells user the agent is starting
+  try {
+    await channel.sendMessage(chatJid, 'Working on it...');
+  } catch (err) {
+    logger.warn({ chatJid, err }, 'Failed to send spawn ack');
+  }
+
   let hadError = false;
   let outputSentToUser = false;
 
@@ -648,7 +690,7 @@ async function main(): Promise<void> {
         }
       }
 
-      // Sender allowlist drop mode: discard messages from denied senders before storing
+      // 3d-2: Failure ack — denied sender gets a specific reason, not silence
       if (!msg.is_from_me && !msg.is_bot_message && registeredGroups[chatJid]) {
         const cfg = loadSenderAllowlist();
         if (
@@ -660,6 +702,18 @@ async function main(): Promise<void> {
               { chatJid, sender: msg.sender },
               'sender-allowlist: dropping message (drop mode)',
             );
+          }
+          // Send denial ack to the group
+          const channel = findChannel(channels, chatJid);
+          if (channel) {
+            channel
+              .sendMessage(
+                chatJid,
+                `Message from ${msg.sender_name || 'unknown sender'} — not on the approved sender list for this group.`,
+              )
+              .catch((err) =>
+                logger.warn({ chatJid, err }, 'Failed to send denial ack'),
+              );
           }
           return;
         }
