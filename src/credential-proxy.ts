@@ -410,7 +410,7 @@ export function startCredentialProxy(
             timeToExpiry <= 0
               ? `expired ${Math.round(-timeToExpiry / 60000)}m ago`
               : `expiring in ${Math.round(timeToExpiry / 60000)}m`;
-          logger.info(label, 'Proactively refreshing token');
+          logger.info({ label }, 'Proactively refreshing token');
 
           refreshAccessToken(oauth.refreshToken).then((result) => {
             if (result.ok) {
