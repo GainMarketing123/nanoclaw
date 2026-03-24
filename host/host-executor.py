@@ -609,6 +609,26 @@ def process_task(task_path: Path) -> None:
         if stderr:
             log(f"  stderr: {stderr[:200]}")
 
+        # --- M2 graduation: evaluate clean run criteria ---
+        # Think of this like a scorecard — after each Tier 1 cron run, grade it
+        # against the 6 clean-run criteria for milestone tracking.
+        # Only Tier 1 tasks count toward M2 (Tier 1 = read-only autonomous ops).
+        if tier == 1:
+            try:
+                sys.path.insert(0, str(ATLAS_DIR / "lib"))
+                from autonomy_tracker import evaluate_m2_clean_run
+                m2_result = evaluate_m2_clean_run(
+                    task_id=task_id,
+                    run_status=status,
+                    result_delivered=bool(result_summary),
+                    run_error=stderr[:200] if exit_code != 0 else None,
+                )
+                m2_eval = m2_result.get("evaluation", {})
+                log(f"  M2 eval: clean={m2_eval.get('is_clean')} "
+                    f"failed={m2_eval.get('failed_criteria', [])}")
+            except Exception as e:
+                log(f"  M2 eval failed (non-blocking): {e}")
+
     except subprocess.TimeoutExpired:
         log(f"Task {task_id} timed out after {TASK_TIMEOUT}s")
         write_result(task_id or "unknown", entity, "error", 1,
