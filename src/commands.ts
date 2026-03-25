@@ -9,6 +9,7 @@
 import fs from 'fs';
 import path from 'path';
 
+import { getPauseStatus, resumeGroup } from './auto-pause.js';
 import { ATLAS_STATE_DIR } from './config.js';
 import { getAllTasks, getTaskById, updateTask } from './db.js';
 import { logger } from './logger.js';
@@ -117,31 +118,55 @@ function handlePause(args: string[]): string {
 }
 
 function handleResume(args: string[]): string {
+  const lines: string[] = [];
+
+  // Always clear group-level auto-pause (the building lockdown, not individual doors)
+  const pauseStatus = getPauseStatus();
+  const pausedGroupNames = Object.keys(pauseStatus.pausedGroups);
+  if (pausedGroupNames.length > 0) {
+    for (const group of pausedGroupNames) {
+      resumeGroup(group);
+    }
+    logger.info({ groups: pausedGroupNames }, 'Auto-paused groups resumed via /resume');
+    lines.push(`Cleared auto-pause on ${pausedGroupNames.length} group(s): ${pausedGroupNames.join(', ')}`);
+  }
+
   if (args.length > 0) {
     // Resume specific task
     const taskId = args[0];
     const task = getTaskById(taskId);
-    if (!task) return `Task not found: ${taskId}`;
-    if (task.status === 'active') return `Task already active: ${taskId}`;
-    if (task.status !== 'paused')
-      return `Task is ${task.status}, cannot resume: ${taskId}`;
+    if (!task) {
+      lines.push(`Task not found: ${taskId}`);
+      return lines.join('\n') || 'Nothing to resume.';
+    }
+    if (task.status === 'active') {
+      lines.push(`Task already active: ${taskId}`);
+      return lines.join('\n');
+    }
+    if (task.status !== 'paused') {
+      lines.push(`Task is ${task.status}, cannot resume: ${taskId}`);
+      return lines.join('\n');
+    }
 
     updateTask(taskId, { status: 'active' });
     logger.info({ taskId }, 'Task resumed via command');
-    return `Resumed task: ${taskId}\n${task.prompt.slice(0, 80)}...`;
+    lines.push(`Resumed task: ${taskId}\n${task.prompt.slice(0, 80)}...`);
+    return lines.join('\n');
   }
 
   // Resume all paused tasks
   const tasks = getAllTasks().filter((t) => t.status === 'paused');
-  if (tasks.length === 0) return 'No paused tasks to resume.';
-
-  let count = 0;
-  for (const task of tasks) {
-    updateTask(task.id, { status: 'active' });
-    count++;
+  if (tasks.length > 0) {
+    let count = 0;
+    for (const task of tasks) {
+      updateTask(task.id, { status: 'active' });
+      count++;
+    }
+    logger.info({ count }, 'All tasks resumed via command');
+    lines.push(`Resumed ${count} task${count === 1 ? '' : 's'}.`);
   }
-  logger.info({ count }, 'All tasks resumed via command');
-  return `Resumed ${count} task${count === 1 ? '' : 's'}.`;
+
+  return lines.join('\n') || 'Nothing to resume — no paused groups or tasks.';
 }
 
 function handleStatus(): string {
@@ -150,6 +175,28 @@ function handleStatus(): string {
   // Mode
   const mode = readMode();
   lines.push(`Mode: ${mode}`);
+
+  // Auto-pause state (group-level safety lockdowns)
+  const pauseStatus = getPauseStatus();
+  const autoPausedGroups = Object.entries(pauseStatus.pausedGroups);
+  if (autoPausedGroups.length > 0) {
+    lines.push('');
+    lines.push(`⚠️ Auto-paused groups: ${autoPausedGroups.length}`);
+    for (const [group, info] of autoPausedGroups) {
+      lines.push(`  ${group}: ${info.reason} (since ${info.pausedAt})`);
+    }
+    lines.push('  Use /resume to clear.');
+  }
+
+  // Failure tracking (groups approaching auto-pause threshold)
+  const failingGroups = Object.entries(pauseStatus.failureCounts).filter(([, c]) => c > 0);
+  if (failingGroups.length > 0) {
+    lines.push('');
+    lines.push('Failure counts:');
+    for (const [group, count] of failingGroups) {
+      lines.push(`  ${group}: ${count}/3 consecutive failures`);
+    }
+  }
 
   // Scheduled tasks
   const tasks = getAllTasks();
