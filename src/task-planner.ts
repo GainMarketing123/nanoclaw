@@ -1,12 +1,13 @@
 /**
  * Task Planner — Parallelization Safety for Concurrent Containers
  *
- * Analyzes queued tasks before execution to determine which can safely
- * run in parallel vs which must be serialized. Based on file-scope overlap
- * detection and shared-state conflict analysis.
+ * SUPERSEDED: The --worktree flag (Session 3c) gives each Tier 2+ task
+ * its own git checkout, making file-scope overlap impossible. This module
+ * is kept for observability (logging which tasks WOULD have conflicted)
+ * but no longer prevents actual damage — worktree isolation does that.
  *
- * Session 3c items: 3c-1 (scope declaration), 3c-2 (overlap detection),
- * 3c-3 (parallel vs sequential recommendation).
+ * Original Session 3c items: 3c-1 (scope declaration), 3c-2 (overlap
+ * detection), 3c-3 (parallel vs sequential recommendation).
  */
 
 import { logger } from './logger.js';

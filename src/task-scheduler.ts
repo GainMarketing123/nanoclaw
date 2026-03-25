@@ -5,7 +5,6 @@ import fs from 'fs';
 import { ASSISTANT_NAME, SCHEDULER_POLL_INTERVAL, TIMEZONE } from './config.js';
 import {
   buildEscalationMessage,
-  detectScopeExpansion,
   isGroupPaused,
   recordTaskResult,
 } from './auto-pause.js';
@@ -25,7 +24,7 @@ import {
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { logger } from './logger.js';
-import { buildExecutionPlan, declareScope } from './task-planner.js';
+import { buildExecutionPlan } from './task-planner.js';
 import { RegisteredGroup, ScheduledTask } from './types.js';
 
 /**
@@ -252,27 +251,10 @@ async function runTask(
   // the 6 clean-run criteria and log the result for milestone tracking.
   evaluateM2CleanRun(task.id, error ? 'error' : 'success', !!result, error);
 
-  // --- 3c-4/3c-5: Scope expansion detection ---
-  // Like a security perimeter — after each task run, check if the container
-  // touched files outside its declared scope and escalate if it did.
-  if (containerLogPath) {
-    try {
-      const scope = declareScope(task);
-      const scopeWarning = detectScopeExpansion(scope, containerLogPath);
-      if (scopeWarning) {
-        const escalation = buildEscalationMessage(
-          task.group_folder,
-          scopeWarning,
-        );
-        deps.sendMessage(task.chat_jid, escalation).catch((err) =>
-          logger.error({ err, chatJid: task.chat_jid }, 'Failed to send scope expansion alert'),
-        );
-        logger.warn({ taskId: task.id, groupFolder: task.group_folder }, scopeWarning);
-      }
-    } catch (err) {
-      logger.warn({ err, taskId: task.id }, 'Scope expansion check failed (non-blocking)');
-    }
-  }
+  // --- 3c-4/3c-5: Scope expansion detection — SUPERSEDED by --worktree ---
+  // Worktree isolation (Tier 2+) gives each task its own checkout, making
+  // scope expansion impossible at the filesystem level. The old detection
+  // code (log-parsing) has been removed to eliminate wasted I/O.
 
   // --- 3c-6: Auto-pause on consecutive failures ---
   // Like a circuit breaker — after enough failures in a row, stop trying
