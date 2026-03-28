@@ -376,27 +376,36 @@ function buildVolumeMounts(
 function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
+  hasMountedCredentials: boolean = false,
 ): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
 
-  // Route API traffic through the credential proxy (containers never see real secrets)
-  args.push(
-    '-e',
-    `ANTHROPIC_BASE_URL=http://${CONTAINER_HOST_GATEWAY}:${CREDENTIAL_PROXY_PORT}`,
-  );
-
-  // Mirror the host's auth method with a placeholder value.
-  // API key mode: SDK sends x-api-key, proxy replaces with real key.
-  // OAuth mode:   SDK exchanges placeholder token for temp API key,
-  //               proxy injects real OAuth token on that exchange request.
-  const authMode = detectAuthMode();
-  if (authMode === 'api-key') {
-    args.push('-e', 'ANTHROPIC_API_KEY=placeholder');
+  // Auth strategy: credentials file (direct) vs proxy (placeholder).
+  // If the mounted .claude/ has .credentials.json with a valid OAuth token,
+  // let the CLI use it directly — no proxy needed. This avoids the failure
+  // mode where CLAUDE_CODE_OAUTH_TOKEN=placeholder overrides the credentials
+  // file and the CLI tries to exchange "placeholder" with claude.ai (401).
+  // Proxy mode is fallback for API key auth or when no credentials file exists.
+  if (hasMountedCredentials) {
+    // Direct auth: CLI reads .credentials.json, handles refresh internally.
+    // Don't set ANTHROPIC_BASE_URL or CLAUDE_CODE_OAUTH_TOKEN — let CLI
+    // talk to Anthropic directly with the real token.
+    logger.info({ containerName }, 'Using mounted credentials (direct auth)');
   } else {
-    args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
+    // Proxy auth: route through credential proxy with placeholder token.
+    args.push(
+      '-e',
+      `ANTHROPIC_BASE_URL=http://${CONTAINER_HOST_GATEWAY}:${CREDENTIAL_PROXY_PORT}`,
+    );
+    const authMode = detectAuthMode();
+    if (authMode === 'api-key') {
+      args.push('-e', 'ANTHROPIC_API_KEY=placeholder');
+    } else {
+      args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
+    }
   }
 
   // Runtime-specific args for host gateway resolution
@@ -439,7 +448,11 @@ export async function runContainerAgent(
   const mounts = buildVolumeMounts(group, input.isMain);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
   const containerName = `nanoclaw-${safeName}-${Date.now()}`;
-  const containerArgs = buildContainerArgs(mounts, containerName);
+
+  // Check if the mounted .claude/ has credentials for direct auth
+  const groupClaudeDir = path.join(DATA_DIR, 'sessions', group.folder, '.claude');
+  const hasMountedCreds = fs.existsSync(path.join(groupClaudeDir, '.credentials.json'));
+  const containerArgs = buildContainerArgs(mounts, containerName, hasMountedCreds);
 
   logger.debug(
     {
