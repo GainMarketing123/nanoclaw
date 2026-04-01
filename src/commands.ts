@@ -26,6 +26,7 @@ const QUOTA_TRACKING_PATH = path.join(
   'quota-tracking.jsonl',
 );
 const MODE_PATH = path.join(ATLAS_STATE_DIR, 'state', 'mode.json');
+const CODEX_TOGGLE_PATH = path.join(ATLAS_STATE_DIR, 'state', 'codex-toggle.json');
 const APPROVAL_PENDING_DIR = path.join(
   ATLAS_STATE_DIR,
   'approval-queue',
@@ -82,6 +83,8 @@ export function handleCommand(text: string): CommandResult {
       return { handled: true, response: handleQuota() };
     case '/reset-mode':
       return { handled: true, response: handleResetMode() };
+    case '/codex':
+      return { handled: true, response: handleCodex(args) };
     default:
       return { handled: false };
   }
@@ -342,6 +345,87 @@ function handleResetMode(): string {
     const msg = err instanceof Error ? err.message : String(err);
     return `Error resetting mode: ${msg}`;
   }
+}
+
+function handleCodex(args: string[]): string {
+  // /codex        — show current toggle state
+  // /codex on     — enable Codex (default behavior)
+  // /codex off    — disable Codex, use Claude subagents instead
+  try {
+    const subcommand = args[0]?.toLowerCase();
+
+    if (!subcommand) {
+      // Show current state
+      const state = readCodexToggle();
+      const status = state.codex_enabled ? 'ON (Codex active)' : 'OFF (Claude subagents)';
+      const updated = state.updated_at
+        ? `\nLast changed: ${state.updated_at}`
+        : '';
+      const by = state.updated_by ? ` by ${state.updated_by}` : '';
+      return `Codex toggle: ${status}${updated}${by}`;
+    }
+
+    if (subcommand === 'on') {
+      writeCodexToggle(true);
+      logger.info('Codex enabled via /codex on command');
+      return (
+        'Codex toggle: ON\n' +
+        'All delegation, cross-review, and challenge routes through Codex.\n' +
+        'Delegation gate enforces cx wrapper usage.'
+      );
+    }
+
+    if (subcommand === 'off') {
+      writeCodexToggle(false);
+      logger.info('Codex disabled via /codex off command');
+      return (
+        'Codex toggle: OFF\n' +
+        'All Codex processes replaced by Claude subagents:\n' +
+        '- Delegation gate: passes (Atlas writes directly)\n' +
+        '- Cross-review: routes to Claude\n' +
+        '- Challenge: routes to Claude\n' +
+        '- Routing gate: skipped\n' +
+        '- Pre-push receipts: skipped (certificates only)'
+      );
+    }
+
+    return 'Usage: /codex [on|off]\n  /codex     — show current state\n  /codex on  — enable Codex\n  /codex off — disable Codex';
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return `Error handling codex toggle: ${msg}`;
+  }
+}
+
+function readCodexToggle(): {
+  codex_enabled: boolean;
+  updated_at?: string;
+  updated_by?: string;
+} {
+  try {
+    if (!fs.existsSync(CODEX_TOGGLE_PATH)) {
+      return { codex_enabled: true }; // Default: Codex ON
+    }
+    return JSON.parse(fs.readFileSync(CODEX_TOGGLE_PATH, 'utf-8'));
+  } catch {
+    return { codex_enabled: true };
+  }
+}
+
+function writeCodexToggle(enabled: boolean): void {
+  const stateDir = path.dirname(CODEX_TOGGLE_PATH);
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(
+    CODEX_TOGGLE_PATH,
+    JSON.stringify(
+      {
+        codex_enabled: enabled,
+        updated_at: new Date().toISOString(),
+        updated_by: 'CEO',
+      },
+      null,
+      2,
+    ),
+  );
 }
 
 // --- Helper functions ---
