@@ -171,8 +171,8 @@ export function detectScopeExpansion(
     // Check each edited file against declared scope
     const outOfScope: string[] = [];
     for (const file of editedFiles) {
-      const inScope = scope.writePaths.some(
-        (wp) => file.startsWith(wp.toLowerCase()),
+      const inScope = scope.writePaths.some((wp) =>
+        file.startsWith(wp.toLowerCase()),
       );
       if (!inScope) {
         outOfScope.push(file);
@@ -191,7 +191,8 @@ export function detectScopeExpansion(
     };
     savePauseState(state);
 
-    const msg = `SCOPE EXPANSION: Task ${scope.taskId} in ${scope.groupFolder} touched files outside declared scope:\n` +
+    const msg =
+      `SCOPE EXPANSION: Task ${scope.taskId} in ${scope.groupFolder} touched files outside declared scope:\n` +
       outOfScope.map((f) => `  - ${f}`).join('\n');
 
     logger.warn({ scope, outOfScope }, msg);

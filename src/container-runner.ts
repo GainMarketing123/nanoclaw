@@ -69,35 +69,22 @@ interface VolumeMount {
  * Container needs: "python3 /home/node/.atlas/hooks/foo.py"
  */
 function rewriteHookCommand(command: string): string {
-  return command
-    // Normalize python → python3 (container has python3, not python)
-    .replace(/^python\s/, 'python3 ')
-    // Windows paths: C:/Users/xxx/.atlas/hooks/ → /home/node/.atlas/hooks/
-    .replace(
-      /[A-Za-z]:\/[^"'\s]*\/\.atlas\/hooks\//g,
-      '/home/node/.atlas/hooks/',
-    )
-    .replace(
-      /[A-Za-z]:\/[^"'\s]*\/\.atlas\/lib\//g,
-      '/home/node/.atlas/lib/',
-    )
-    .replace(
-      /[A-Za-z]:\/[^"'\s]*\/\.claude\//g,
-      '/home/node/.claude/',
-    )
-    // Linux host paths: /home/<user>/.atlas/hooks/ → /home/node/.atlas/hooks/
-    .replace(
-      /\/home\/[^/]+\/\.atlas\/hooks\//g,
-      '/home/node/.atlas/hooks/',
-    )
-    .replace(
-      /\/home\/[^/]+\/\.atlas\/lib\//g,
-      '/home/node/.atlas/lib/',
-    )
-    .replace(
-      /\/home\/[^/]+\/\.claude\//g,
-      '/home/node/.claude/',
-    );
+  return (
+    command
+      // Normalize python → python3 (container has python3, not python)
+      .replace(/^python\s/, 'python3 ')
+      // Windows paths: C:/Users/xxx/.atlas/hooks/ → /home/node/.atlas/hooks/
+      .replace(
+        /[A-Za-z]:\/[^"'\s]*\/\.atlas\/hooks\//g,
+        '/home/node/.atlas/hooks/',
+      )
+      .replace(/[A-Za-z]:\/[^"'\s]*\/\.atlas\/lib\//g, '/home/node/.atlas/lib/')
+      .replace(/[A-Za-z]:\/[^"'\s]*\/\.claude\//g, '/home/node/.claude/')
+      // Linux host paths: /home/<user>/.atlas/hooks/ → /home/node/.atlas/hooks/
+      .replace(/\/home\/[^/]+\/\.atlas\/hooks\//g, '/home/node/.atlas/hooks/')
+      .replace(/\/home\/[^/]+\/\.atlas\/lib\//g, '/home/node/.atlas/lib/')
+      .replace(/\/home\/[^/]+\/\.claude\//g, '/home/node/.claude/')
+  );
 }
 
 /**
@@ -138,9 +125,7 @@ function writeContainerSettings(settingsFile: string): void {
   }
 
   try {
-    const hostSettings = JSON.parse(
-      fs.readFileSync(hostSettingsPath, 'utf-8'),
-    );
+    const hostSettings = JSON.parse(fs.readFileSync(hostSettingsPath, 'utf-8'));
 
     // Deep-clone hooks and rewrite all command paths
     const containerHooks: Record<string, unknown[]> = {};
@@ -149,15 +134,15 @@ function writeContainerSettings(settingsFile: string): void {
         containerHooks[event] = (entries as Array<Record<string, unknown>>).map(
           (entry) => ({
             ...entry,
-            hooks: (
-              (entry.hooks as Array<Record<string, unknown>>) || []
-            ).map((hook) => ({
-              ...hook,
-              command:
-                typeof hook.command === 'string'
-                  ? rewriteHookCommand(hook.command)
-                  : hook.command,
-            })),
+            hooks: ((entry.hooks as Array<Record<string, unknown>>) || []).map(
+              (hook) => ({
+                ...hook,
+                command:
+                  typeof hook.command === 'string'
+                    ? rewriteHookCommand(hook.command)
+                    : hook.command,
+              }),
+            ),
           }),
         );
       }
@@ -452,9 +437,20 @@ export async function runContainerAgent(
   const containerName = `nanoclaw-${safeName}-${Date.now()}`;
 
   // Check if the mounted .claude/ has credentials for direct auth
-  const groupClaudeDir = path.join(DATA_DIR, 'sessions', group.folder, '.claude');
-  const hasMountedCreds = fs.existsSync(path.join(groupClaudeDir, '.credentials.json'));
-  const containerArgs = buildContainerArgs(mounts, containerName, hasMountedCreds);
+  const groupClaudeDir = path.join(
+    DATA_DIR,
+    'sessions',
+    group.folder,
+    '.claude',
+  );
+  const hasMountedCreds = fs.existsSync(
+    path.join(groupClaudeDir, '.credentials.json'),
+  );
+  const containerArgs = buildContainerArgs(
+    mounts,
+    containerName,
+    hasMountedCreds,
+  );
 
   logger.debug(
     {

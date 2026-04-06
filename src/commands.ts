@@ -26,7 +26,11 @@ const QUOTA_TRACKING_PATH = path.join(
   'quota-tracking.jsonl',
 );
 const MODE_PATH = path.join(ATLAS_STATE_DIR, 'state', 'mode.json');
-const CODEX_TOGGLE_PATH = path.join(ATLAS_STATE_DIR, 'state', 'codex-toggle.json');
+const CODEX_TOGGLE_PATH = path.join(
+  ATLAS_STATE_DIR,
+  'state',
+  'codex-toggle.json',
+);
 const APPROVAL_PENDING_DIR = path.join(
   ATLAS_STATE_DIR,
   'approval-queue',
@@ -130,8 +134,13 @@ function handleResume(args: string[]): string {
     for (const group of pausedGroupNames) {
       resumeGroup(group);
     }
-    logger.info({ groups: pausedGroupNames }, 'Auto-paused groups resumed via /resume');
-    lines.push(`Cleared auto-pause on ${pausedGroupNames.length} group(s): ${pausedGroupNames.join(', ')}`);
+    logger.info(
+      { groups: pausedGroupNames },
+      'Auto-paused groups resumed via /resume',
+    );
+    lines.push(
+      `Cleared auto-pause on ${pausedGroupNames.length} group(s): ${pausedGroupNames.join(', ')}`,
+    );
   }
 
   if (args.length > 0) {
@@ -192,7 +201,9 @@ function handleStatus(): string {
   }
 
   // Failure tracking (groups approaching auto-pause threshold)
-  const failingGroups = Object.entries(pauseStatus.failureCounts).filter(([, c]) => c > 0);
+  const failingGroups = Object.entries(pauseStatus.failureCounts).filter(
+    ([, c]) => c > 0,
+  );
   if (failingGroups.length > 0) {
     lines.push('');
     lines.push('Failure counts:');
@@ -357,7 +368,9 @@ function handleCodex(args: string[]): string {
     if (!subcommand) {
       // Show current state
       const state = readCodexToggle();
-      const status = state.codex_enabled ? 'ON (Codex active)' : 'OFF (Claude subagents)';
+      const status = state.codex_enabled
+        ? 'ON (Codex active)'
+        : 'OFF (Claude subagents)';
       const updated = state.updated_at
         ? `\nLast changed: ${state.updated_at}`
         : '';

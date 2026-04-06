@@ -266,13 +266,22 @@ async function runTask(
       pauseResult.reason,
     );
     // Send escalation to the task's chat
-    deps.sendMessage(task.chat_jid, escalation).catch((err) =>
-      logger.error({ err, chatJid: task.chat_jid }, 'Failed to send auto-pause escalation'),
-    );
+    deps
+      .sendMessage(task.chat_jid, escalation)
+      .catch((err) =>
+        logger.error(
+          { err, chatJid: task.chat_jid },
+          'Failed to send auto-pause escalation',
+        ),
+      );
     // Pause the task itself
     updateTask(task.id, { status: 'paused' });
     logger.error(
-      { taskId: task.id, groupFolder: task.group_folder, failureCount: pauseResult.failureCount },
+      {
+        taskId: task.id,
+        groupFolder: task.group_folder,
+        failureCount: pauseResult.failureCount,
+      },
       'Task auto-paused after consecutive failures',
     );
   }

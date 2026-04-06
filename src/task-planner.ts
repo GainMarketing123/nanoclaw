@@ -41,16 +41,31 @@ export interface ExecutionPlan {
 
 /** Keywords that suggest a task touches Atlas infrastructure */
 const ATLAS_INFRA_KEYWORDS = [
-  'hook', 'enforcement', 'settings.json', 'constitution',
-  'graduation', 'manifest', 'self-knowledge', 'agent-runner',
-  'build.sh', 'dockerfile', 'nanoclaw',
+  'hook',
+  'enforcement',
+  'settings.json',
+  'constitution',
+  'graduation',
+  'manifest',
+  'self-knowledge',
+  'agent-runner',
+  'build.sh',
+  'dockerfile',
+  'nanoclaw',
 ];
 
 /** Keywords that suggest shared state access */
 const SHARED_STATE_KEYWORDS = [
-  'session-status', 'graduation', 'autonomy', 'evolution-log',
-  'project-registry', 'entity-map', 'config.json', 'quota',
-  'blocker', 'milestone',
+  'session-status',
+  'graduation',
+  'autonomy',
+  'evolution-log',
+  'project-registry',
+  'entity-map',
+  'config.json',
+  'quota',
+  'blocker',
+  'milestone',
 ];
 
 /**
@@ -64,13 +79,13 @@ export function declareScope(task: ScheduledTask): TaskScope {
   const promptLower = task.prompt.toLowerCase();
 
   // Check for Atlas infra keywords
-  const touchesAtlasInfra = ATLAS_INFRA_KEYWORDS.some(
-    (kw) => promptLower.includes(kw),
+  const touchesAtlasInfra = ATLAS_INFRA_KEYWORDS.some((kw) =>
+    promptLower.includes(kw),
   );
 
   // Check for shared state keywords
-  const sharedState = SHARED_STATE_KEYWORDS.some(
-    (kw) => promptLower.includes(kw),
+  const sharedState = SHARED_STATE_KEYWORDS.some((kw) =>
+    promptLower.includes(kw),
   );
 
   // Write paths: the group's own workspace is always in scope.
@@ -117,10 +132,7 @@ export function detectOverlap(a: TaskScope, b: TaskScope): string | null {
   // Check for overlapping write paths
   for (const pathA of a.writePaths) {
     for (const pathB of b.writePaths) {
-      if (
-        pathA.startsWith(pathB) ||
-        pathB.startsWith(pathA)
-      ) {
+      if (pathA.startsWith(pathB) || pathB.startsWith(pathA)) {
         return `Overlapping paths: ${pathA} ↔ ${pathB} (${a.taskId} vs ${b.taskId})`;
       }
     }

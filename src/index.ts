@@ -279,10 +279,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   try {
     const entity = entityLabel(group);
     const summary = messageSummary(missedMessages[0].content);
-    await channel.sendMessage(
-      chatJid,
-      `[${entity}] Received: ${summary}`,
-    );
+    await channel.sendMessage(chatJid, `[${entity}] Received: ${summary}`);
   } catch (err) {
     logger.warn({ chatJid, err }, 'Failed to send receive ack');
   }
