@@ -107,8 +107,13 @@ export function handleCommand(text: string, sender?: string): CommandResult {
   const cmd = parts[0].toLowerCase();
   const args = parts.slice(1);
 
-  // CEO-only gate: dangerous commands require verified sender
-  if (CEO_ONLY_COMMANDS.has(cmd) && TELEGRAM_CEO_USER_ID) {
+  // CEO-only gate: dangerous commands require verified sender.
+  // Fail-closed: if TELEGRAM_CEO_USER_ID is unset, ALL users are blocked (not all pass).
+  if (CEO_ONLY_COMMANDS.has(cmd)) {
+    if (!TELEGRAM_CEO_USER_ID) {
+      logger.warn({ cmd }, 'CEO-only command blocked: TELEGRAM_CEO_USER_ID not configured');
+      return { handled: true, response: `${cmd} blocked — CEO user ID not configured on this server.` };
+    }
     if (!sender || sender !== TELEGRAM_CEO_USER_ID) {
       logger.warn(
         { cmd, sender, expected: TELEGRAM_CEO_USER_ID },
@@ -598,7 +603,7 @@ function missionCreate(missionType?: string, entity?: string): string {
       return `Unknown mission type: ${missionType}\nRun /mission types for available types.`;
 
     const missionEntity = entity || 'gpg';
-    const missionId = `m-${Date.now()}`;
+    const missionId = `m-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
 
     // Create mission in SQLite (single source of truth)
     createMission({

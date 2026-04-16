@@ -771,10 +771,10 @@ export function createMission(mission: {
     mission.entity,
     mission.template_type,
     mission.title,
-    mission.brief || null,
-    mission.roster || null,
-    mission.cost_estimate_usd || null,
-    mission.correlation_id || null,
+    mission.brief ?? null,
+    mission.roster ?? null,
+    mission.cost_estimate_usd ?? null,
+    mission.correlation_id ?? null,
     new Date().toISOString(),
   );
 }
