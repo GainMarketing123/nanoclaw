@@ -112,8 +112,14 @@ export function handleCommand(text: string, sender?: string): CommandResult {
   // Fail-closed: if TELEGRAM_CEO_USER_ID is unset, ALL users are blocked (not all pass).
   if (CEO_ONLY_COMMANDS.has(cmd)) {
     if (!TELEGRAM_CEO_USER_ID) {
-      logger.warn({ cmd }, 'CEO-only command blocked: TELEGRAM_CEO_USER_ID not configured');
-      return { handled: true, response: `${cmd} blocked — CEO user ID not configured on this server.` };
+      logger.warn(
+        { cmd },
+        'CEO-only command blocked: TELEGRAM_CEO_USER_ID not configured',
+      );
+      return {
+        handled: true,
+        response: `${cmd} blocked — CEO user ID not configured on this server.`,
+      };
     }
     if (!sender || sender !== TELEGRAM_CEO_USER_ID) {
       logger.warn(

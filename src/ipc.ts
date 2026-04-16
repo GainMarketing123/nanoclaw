@@ -624,12 +624,13 @@ export async function processTaskIpc(
         // Use inline keyboard buttons when available; fall back to plain text
         const buttons = [
           [
-            { text: '✅ Approve', callback_data: `mission:approve:${missionId}` },
+            {
+              text: '✅ Approve',
+              callback_data: `mission:approve:${missionId}`,
+            },
             { text: '❌ Reject', callback_data: `mission:reject:${missionId}` },
           ],
-          [
-            { text: '📋 Status', callback_data: `mission:status:${missionId}` },
-          ],
+          [{ text: '📋 Status', callback_data: `mission:status:${missionId}` }],
         ];
         try {
           if (deps.sendMessageWithKeyboard) {
