@@ -101,6 +101,12 @@ export interface Channel {
     filePath: string,
     options?: SendDocumentOptions,
   ): Promise<void>;
+  // Optional: send a message with inline keyboard buttons (approve/reject flows).
+  sendMessageWithKeyboard?(
+    jid: string,
+    text: string,
+    buttons: Array<Array<{ text: string; callback_data: string }>>,
+  ): Promise<void>;
 }
 
 // Callback type that channels use to deliver inbound messages

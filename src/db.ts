@@ -753,6 +753,14 @@ export interface MissionRoleRow {
   error: string | null;
 }
 
+/**
+ * Generate a collision-resistant mission ID.
+ * Single source of truth — used by both /mission create and IPC create_mission.
+ */
+export function generateMissionId(): string {
+  return `m-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+}
+
 export function createMission(mission: {
   id: string;
   entity: string;

@@ -18,6 +18,13 @@ export interface IpcDeps {
     filePath: string,
     options?: { caption?: string; filename?: string },
   ) => Promise<void>;
+  // Optional: send message with inline keyboard (approve/reject buttons).
+  // Falls back to plain sendMessage when the channel doesn't support it.
+  sendMessageWithKeyboard?: (
+    jid: string,
+    text: string,
+    buttons: Array<Array<{ text: string; callback_data: string }>>,
+  ) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   syncGroups: (force: boolean) => Promise<void>;
@@ -526,6 +533,17 @@ export async function processTaskIpc(
       break;
 
     case 'create_mission': {
+      // Only main group can create missions — same gate as refresh_groups
+      // and register_group. Prevents non-main containers from creating
+      // mission records or sending proposals to the CEO-facing main chat.
+      if (!isMain) {
+        logger.warn(
+          { sourceGroup },
+          'Unauthorized create_mission attempt blocked — not main group',
+        );
+        break;
+      }
+
       // NL detection: main group agent proposes a mission from conversation
       const { createMission, createMissionRole, logMissionEvent } =
         await import('./db.js');
@@ -560,7 +578,8 @@ export async function processTaskIpc(
         break;
       }
 
-      const missionId = `m-${Date.now()}`;
+      const { generateMissionId } = await import('./db.js');
+      const missionId = generateMissionId();
       createMission({
         id: missionId,
         entity,
@@ -594,7 +613,6 @@ export async function processTaskIpc(
         ([, g]) => g.isMain,
       )?.[0];
       if (mainJid) {
-        const roleNames = Object.keys(template.roles).join(', ');
         const msg =
           `📋 Mission: ${template.name}\n` +
           `Entity: ${entity.toUpperCase()}\n\n` +
@@ -602,9 +620,27 @@ export async function processTaskIpc(
             .map(([n, c]) => `  • ${n} (${(c as any).model})`)
             .join('\n')}\n\n` +
           `Est. cost: ~$${template.estimated_cost}  |  Est. time: ~${template.estimated_minutes}min\n\n` +
-          `⏳ ID: ${missionId}\nApprove: /mission approve ${missionId}`;
+          `⏳ ID: ${missionId}`;
+        // Use inline keyboard buttons when available; fall back to plain text
+        const buttons = [
+          [
+            { text: '✅ Approve', callback_data: `mission:approve:${missionId}` },
+            { text: '❌ Reject', callback_data: `mission:reject:${missionId}` },
+          ],
+          [
+            { text: '📋 Status', callback_data: `mission:status:${missionId}` },
+          ],
+        ];
         try {
-          await deps.sendMessage(mainJid, msg);
+          if (deps.sendMessageWithKeyboard) {
+            await deps.sendMessageWithKeyboard(mainJid, msg, buttons);
+          } else {
+            // Plain text fallback with command hints
+            await deps.sendMessage(
+              mainJid,
+              msg + `\nApprove: /mission approve ${missionId}`,
+            );
+          }
         } catch (err) {
           logger.error(
             { err, missionId },

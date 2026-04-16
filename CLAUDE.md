@@ -1,12 +1,14 @@
 # NanoClaw
 
-Personal Claude assistant. See [README.md](README.md) for philosophy and setup. See [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) for architecture decisions.
+Personal Claude assistant (v2.0.0). See [README.md](README.md) for philosophy and setup. See [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) for architecture decisions.
 
 ## Quick Context
 
 Single Node.js process with skill-based channel system. Channels (WhatsApp, Telegram, Slack, Discord, Gmail) are skills that self-register at startup. Messages route to Claude Agent SDK running in containers (Linux VMs). Each group has isolated filesystem and memory.
 
 Three execution layers: (1) NanoClaw orchestrator handles message routing and scheduling, (2) host-executor runs `claude -p` tasks on the VPS host with full Python hooks, (3) containers run agent sessions with governance guardrails. Tier 2+ tasks use `--worktree` isolation for safe parallel execution.
+
+Mission control redesign (v2.0.0): bridge-first architecture with SQLite state for missions. Mission lifecycle: create -> pending_approval -> approved -> executing -> synthesis -> complete. Missions flow through Atlas Bridge (HTTP) for Paperclip integration, constraint enforcement, and security evaluation. Telegram inline keyboards for CEO approve/reject. CEO-only commands gated by TELEGRAM_CEO_USER_ID.
 
 ## Key Files
 

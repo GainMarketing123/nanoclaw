@@ -228,6 +228,21 @@ export class TelegramChannel implements Channel {
         'Inline keyboard callback received',
       );
 
+      // Main-group gate: same check as the normal command path (index.ts:675).
+      // Callbacks from non-main chats are rejected so mission approvals
+      // can't be triggered outside the control group.
+      const group = this.opts.registeredGroups()[chatJid];
+      if (!group?.isMain) {
+        logger.warn(
+          { chatJid, sender },
+          'Callback query rejected: not from a main group',
+        );
+        await ctx.answerCallbackQuery({
+          text: 'Commands are only available in the main group.',
+        });
+        return;
+      }
+
       // Route callback to command handler — reuse existing handleCommand
       // Callback data format: "mission:approve:{id}" → "/mission approve {id}"
       const parts = data.split(':');

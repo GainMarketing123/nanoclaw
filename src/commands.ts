@@ -18,6 +18,7 @@ import {
 import {
   createMission,
   createMissionRole,
+  generateMissionId,
   getActiveMissions,
   getMission,
   getMissionByPrefix,
@@ -419,6 +420,8 @@ function handleMission(args: string[]): string {
   /mission status <id> — Mission details with role progress
   /mission create <type> [entity] — Create mission for approval
   /mission approve <id> — Approve and execute mission
+  /mission reject <id> — Reject a proposed mission
+  /mission modify <id> <notes> — Add modification notes to a proposed mission
   /mission stop <id> — Stop running mission
   /mission types — List available mission types
   /mission history — Last 20 completed missions
@@ -437,6 +440,10 @@ function handleMission(args: string[]): string {
       return missionCreate(subargs[0], subargs[1]);
     case 'approve':
       return missionApprove(subargs[0]);
+    case 'reject':
+      return missionReject(subargs[0]);
+    case 'modify':
+      return missionModify(subargs[0], subargs.slice(1).join(' '));
     case 'stop':
       return missionStop(subargs[0]);
     case 'types':
@@ -603,7 +610,7 @@ function missionCreate(missionType?: string, entity?: string): string {
       return `Unknown mission type: ${missionType}\nRun /mission types for available types.`;
 
     const missionEntity = entity || 'gpg';
-    const missionId = `m-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    const missionId = generateMissionId();
 
     // Create mission in SQLite (single source of truth)
     createMission({
@@ -682,6 +689,66 @@ function missionApprove(id?: string): string {
 
     const roles = getMissionRoles(mission.id);
     return `🚀 Mission approved: ${mission.title}\n\n${roles.length} roles spawning...\n${roles.map((r) => `  🔄 ${r.role_name} (${r.model})`).join('\n')}\n\nTrack: /mission status ${mission.id}`;
+  } catch (err) {
+    return `Error: ${err}`;
+  }
+}
+
+function missionReject(id?: string): string {
+  if (!id) return 'Usage: /mission reject <mission-id>';
+  try {
+    const mission = getMissionByPrefix(id) || getMission(id);
+    if (!mission) return `Mission not found: ${id}`;
+
+    if (mission.status !== 'proposed') {
+      return `Mission ${mission.id} is ${mission.status}, not proposed — can only reject proposed missions.`;
+    }
+
+    updateMission(mission.id, {
+      status: 'rejected' as any,
+      completed_at: new Date().toISOString(),
+    });
+    logMissionEvent(
+      mission.id,
+      'rejected',
+      undefined,
+      'CEO rejected via Telegram',
+    );
+
+    logger.info(
+      { missionId: mission.id },
+      'Mission rejected via /mission reject',
+    );
+
+    return `❌ Mission rejected: ${mission.title}\nID: ${mission.id}`;
+  } catch (err) {
+    return `Error: ${err}`;
+  }
+}
+
+function missionModify(id?: string, notes?: string): string {
+  if (!id) return 'Usage: /mission modify <mission-id> <notes>';
+  try {
+    const mission = getMissionByPrefix(id) || getMission(id);
+    if (!mission) return `Mission not found: ${id}`;
+
+    if (mission.status !== 'proposed') {
+      return `Mission ${mission.id} is ${mission.status}, not proposed — can only modify proposed missions.`;
+    }
+
+    logMissionEvent(
+      mission.id,
+      'modified',
+      undefined,
+      `CEO modification request: ${notes || '(no details)'}`,
+    );
+
+    logger.info(
+      { missionId: mission.id, notes },
+      'Mission modification requested via /mission modify',
+    );
+
+    return `📝 Modification noted for: ${mission.title}\nNotes: ${notes || '(none)'}\nMission remains proposed — approve or reject when ready.\n\nApprove: /mission approve ${mission.id}\nReject: /mission reject ${mission.id}`;
   } catch (err) {
     return `Error: ${err}`;
   }
