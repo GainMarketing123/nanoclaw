@@ -7,7 +7,10 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
+import http from 'http';
+
 import {
+  BRIDGE_CALLBACK_PORT,
   CONTAINER_IMAGE,
   CONTAINER_MAX_OUTPUT_SIZE,
   CONTAINER_TIMEOUT,
@@ -59,6 +62,108 @@ interface VolumeMount {
   hostPath: string;
   containerPath: string;
   readonly: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Mission callback — notify bridge when a container finishes
+// ---------------------------------------------------------------------------
+
+const CALLBACK_SPOOL_DIR = path.join(DATA_DIR, 'bridge-callbacks');
+
+interface MissionCallback {
+  missionId: string;
+  role: string;
+  status: 'success' | 'error' | 'timeout';
+  completedAt: string;
+  error?: string;
+  logPath?: string;
+  inputTokens?: number;
+  outputTokens?: number;
+}
+
+/**
+ * POST role completion to bridge HTTP endpoint. If bridge is down,
+ * persist to disk for retry on next poll. Idempotent on (missionId, role).
+ *
+ * Per Codex architecture review: NanoClaw is the authority for container
+ * terminal state. The bridge should not poll for this — push it.
+ */
+function notifyBridgeCallback(callback: MissionCallback): void {
+  const payload = JSON.stringify(callback);
+
+  const req = http.request(
+    {
+      hostname: '127.0.0.1',
+      port: BRIDGE_CALLBACK_PORT,
+      path: '/callback',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload),
+      },
+      timeout: 5000,
+    },
+    (res) => {
+      if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+        logger.info(
+          { missionId: callback.missionId, role: callback.role },
+          'Bridge callback delivered',
+        );
+      } else {
+        logger.warn(
+          { missionId: callback.missionId, status: res.statusCode },
+          'Bridge callback rejected, spooling for retry',
+        );
+        spoolCallback(callback);
+      }
+    },
+  );
+
+  req.on('error', () => {
+    // Bridge is down — persist for retry
+    logger.warn(
+      { missionId: callback.missionId, role: callback.role },
+      'Bridge unreachable, spooling callback for retry',
+    );
+    spoolCallback(callback);
+  });
+
+  req.write(payload);
+  req.end();
+}
+
+/** Write callback to disk for retry when bridge comes back up */
+function spoolCallback(callback: MissionCallback): void {
+  try {
+    fs.mkdirSync(CALLBACK_SPOOL_DIR, { recursive: true });
+    const filename = `${callback.missionId}-${callback.role}-${Date.now()}.json`;
+    // Atomic write: temp file then rename
+    const tmpPath = path.join(CALLBACK_SPOOL_DIR, `.${filename}.tmp`);
+    const finalPath = path.join(CALLBACK_SPOOL_DIR, filename);
+    fs.writeFileSync(tmpPath, JSON.stringify(callback, null, 2));
+    fs.renameSync(tmpPath, finalPath);
+  } catch (err) {
+    logger.error(
+      { missionId: callback.missionId, err },
+      'Failed to spool bridge callback',
+    );
+  }
+}
+
+/**
+ * Check if an IPC task payload is a bridge mission task.
+ * Bridge tasks include a missionId and role in the prompt metadata.
+ */
+function parseMissionContext(prompt: string): { missionId: string; role: string } | null {
+  // Bridge prefixes mission tasks with [Bridge Mission {id}]
+  const match = prompt.match(/\[Bridge Mission (\S+)\]/);
+  if (!match) return null;
+  // Role is in the "Role: {name}" line
+  const roleMatch = prompt.match(/Role:\s*(.+)/);
+  return {
+    missionId: match[1],
+    role: roleMatch ? roleMatch[1].trim() : 'unknown',
+  };
 }
 
 /**
@@ -238,17 +343,43 @@ function buildVolumeMounts(
     }
   }
 
-  // Mount ~/.atlas into the container so enforcement hooks can access
-  // state files, agents, lib, and other Atlas infrastructure.
+  // Mount ~/.atlas READ-ONLY into the container for enforcement hooks.
   // Hooks use Path.home() / ".atlas" which resolves to /home/node/.atlas in container.
+  // SECURITY: read-only prevents containers from modifying hooks, approval
+  // queues, session tokens, or bridge config. Per adversarial review (Codex +
+  // Claude cross-model consensus): "Remove writable ~/.atlas mounts from
+  // containers before adding entity-scoped execution."
   const atlasDir = path.join(HOME_DIR, '.atlas');
   if (fs.existsSync(atlasDir)) {
     mounts.push({
       hostPath: atlasDir,
       containerPath: '/home/node/.atlas',
-      readonly: false,
+      readonly: true,
     });
   }
+
+  // Writable governance state directory — governance module writes audit logs,
+  // quota tracking, and graduation status here. Separate from the read-only
+  // ~/.atlas mount so containers can write state without accessing control plane.
+  const govStateDir = path.join(DATA_DIR, 'governance-state', group.folder);
+  fs.mkdirSync(govStateDir, { recursive: true });
+  mounts.push({
+    hostPath: govStateDir,
+    containerPath: '/workspace/extra/atlas-state',
+    readonly: false,
+  });
+
+  // Writable host-tasks directory — containers can request host-executor work
+  // by writing JSON to this directory. Separate mount so the RO ~/.atlas
+  // doesn't block host-task delegation.
+  const hostTasksDir = path.join(HOME_DIR, '.atlas', 'host-tasks');
+  fs.mkdirSync(path.join(hostTasksDir, 'pending'), { recursive: true });
+  fs.mkdirSync(path.join(hostTasksDir, 'completed'), { recursive: true });
+  mounts.push({
+    hostPath: hostTasksDir,
+    containerPath: '/workspace/extra/atlas-state/host-tasks',
+    readonly: false,
+  });
 
   // Per-group Claude sessions directory (isolated from other groups)
   // Each group gets their own .claude/ to prevent cross-group session access
@@ -474,7 +605,7 @@ export async function runContainerAgent(
   const logsDir = path.join(groupDir, 'logs');
   fs.mkdirSync(logsDir, { recursive: true });
 
-  return new Promise((resolve) => {
+  const result = await new Promise<ContainerOutput>((resolve) => {
     const container = spawn(CONTAINER_RUNTIME_BIN, containerArgs, {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
@@ -811,6 +942,26 @@ export async function runContainerAgent(
       });
     });
   });
+
+  // Post-completion: if this was a bridge mission task, notify the bridge
+  const missionCtx = parseMissionContext(input.prompt);
+  if (missionCtx) {
+    const duration = Date.now() - startTime;
+    notifyBridgeCallback({
+      missionId: missionCtx.missionId,
+      role: missionCtx.role,
+      status: result.status === 'success' ? 'success' : 'error',
+      completedAt: new Date().toISOString(),
+      error: result.error,
+      logPath: result.logPath,
+    });
+    logger.info(
+      { missionId: missionCtx.missionId, role: missionCtx.role, duration },
+      'Mission role container completed',
+    );
+  }
+
+  return result;
 }
 
 export function writeTasksSnapshot(

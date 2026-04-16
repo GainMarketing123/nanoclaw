@@ -82,6 +82,63 @@ function createSchema(database: Database.Database): void {
       container_config TEXT,
       requires_trigger INTEGER DEFAULT 1
     );
+
+    -- Mission state (single source of truth per Codex architecture review)
+    CREATE TABLE IF NOT EXISTS missions (
+      id TEXT PRIMARY KEY,
+      entity TEXT NOT NULL,
+      template_type TEXT NOT NULL,
+      title TEXT NOT NULL,
+      brief TEXT,
+      status TEXT NOT NULL DEFAULT 'proposed',
+      roster TEXT,
+      cost_estimate_usd REAL,
+      cost_actual_usd REAL DEFAULT 0,
+      correlation_id TEXT,
+      paperclip_issue_id TEXT,
+      created_at TEXT NOT NULL,
+      approved_at TEXT,
+      started_at TEXT,
+      completed_at TEXT,
+      result_summary TEXT,
+      chain_parent_id TEXT,
+      FOREIGN KEY (chain_parent_id) REFERENCES missions(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_missions_status ON missions(status);
+    CREATE INDEX IF NOT EXISTS idx_missions_entity ON missions(entity);
+
+    -- Per-role state within a mission
+    CREATE TABLE IF NOT EXISTS mission_roles (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      mission_id TEXT NOT NULL,
+      role_name TEXT NOT NULL,
+      model TEXT NOT NULL DEFAULT 'sonnet',
+      task TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      container_name TEXT,
+      started_at TEXT,
+      completed_at TEXT,
+      cost_usd REAL DEFAULT 0,
+      input_tokens INTEGER DEFAULT 0,
+      output_tokens INTEGER DEFAULT 0,
+      output_path TEXT,
+      error TEXT,
+      FOREIGN KEY (mission_id) REFERENCES missions(id),
+      UNIQUE(mission_id, role_name)
+    );
+    CREATE INDEX IF NOT EXISTS idx_mission_roles_mission ON mission_roles(mission_id);
+
+    -- Mission event log (append-only audit trail)
+    CREATE TABLE IF NOT EXISTS mission_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      mission_id TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      role_name TEXT,
+      details TEXT,
+      timestamp TEXT NOT NULL,
+      FOREIGN KEY (mission_id) REFERENCES missions(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_mission_events_mission ON mission_events(mission_id);
   `);
 
   // Add context_mode column if it doesn't exist (migration for existing DBs)
@@ -655,6 +712,205 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
     };
   }
   return result;
+}
+
+// --- Mission accessors ---
+
+export interface MissionRow {
+  id: string;
+  entity: string;
+  template_type: string;
+  title: string;
+  brief: string | null;
+  status: string;
+  roster: string | null;
+  cost_estimate_usd: number | null;
+  cost_actual_usd: number;
+  correlation_id: string | null;
+  paperclip_issue_id: string | null;
+  created_at: string;
+  approved_at: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  result_summary: string | null;
+  chain_parent_id: string | null;
+}
+
+export interface MissionRoleRow {
+  id: number;
+  mission_id: string;
+  role_name: string;
+  model: string;
+  task: string | null;
+  status: string;
+  container_name: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  cost_usd: number;
+  input_tokens: number;
+  output_tokens: number;
+  output_path: string | null;
+  error: string | null;
+}
+
+export function createMission(mission: {
+  id: string;
+  entity: string;
+  template_type: string;
+  title: string;
+  brief?: string;
+  roster?: string;
+  cost_estimate_usd?: number;
+  correlation_id?: string;
+}): void {
+  db.prepare(
+    `INSERT INTO missions (id, entity, template_type, title, brief, roster, cost_estimate_usd, correlation_id, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    mission.id,
+    mission.entity,
+    mission.template_type,
+    mission.title,
+    mission.brief || null,
+    mission.roster || null,
+    mission.cost_estimate_usd || null,
+    mission.correlation_id || null,
+    new Date().toISOString(),
+  );
+}
+
+export function getMission(id: string): MissionRow | undefined {
+  return db.prepare('SELECT * FROM missions WHERE id = ?').get(id) as
+    | MissionRow
+    | undefined;
+}
+
+export function getMissionByPrefix(prefix: string): MissionRow | undefined {
+  return db
+    .prepare('SELECT * FROM missions WHERE id LIKE ? ORDER BY created_at DESC LIMIT 1')
+    .get(`${prefix}%`) as MissionRow | undefined;
+}
+
+export function updateMission(
+  id: string,
+  updates: Partial<Pick<MissionRow,
+    'status' | 'approved_at' | 'started_at' | 'completed_at' |
+    'result_summary' | 'cost_actual_usd' | 'paperclip_issue_id'
+  >>,
+): void {
+  const fields: string[] = [];
+  const values: unknown[] = [];
+  for (const [key, value] of Object.entries(updates)) {
+    if (value !== undefined) {
+      fields.push(`${key} = ?`);
+      values.push(value);
+    }
+  }
+  if (fields.length === 0) return;
+  values.push(id);
+  db.prepare(`UPDATE missions SET ${fields.join(', ')} WHERE id = ?`).run(
+    ...values,
+  );
+}
+
+export function getActiveMissions(): MissionRow[] {
+  return db
+    .prepare(
+      `SELECT * FROM missions WHERE status IN ('proposed', 'approved', 'running', 'synthesizing')
+       ORDER BY created_at DESC`,
+    )
+    .all() as MissionRow[];
+}
+
+export function getRecentMissions(limit: number = 20): MissionRow[] {
+  return db
+    .prepare('SELECT * FROM missions ORDER BY created_at DESC LIMIT ?')
+    .all(limit) as MissionRow[];
+}
+
+export function createMissionRole(role: {
+  mission_id: string;
+  role_name: string;
+  model: string;
+  task?: string;
+}): void {
+  db.prepare(
+    `INSERT INTO mission_roles (mission_id, role_name, model, task)
+     VALUES (?, ?, ?, ?)`,
+  ).run(role.mission_id, role.role_name, role.model, role.task || null);
+}
+
+export function getMissionRoles(missionId: string): MissionRoleRow[] {
+  return db
+    .prepare('SELECT * FROM mission_roles WHERE mission_id = ? ORDER BY id')
+    .all(missionId) as MissionRoleRow[];
+}
+
+export function updateMissionRole(
+  missionId: string,
+  roleName: string,
+  updates: Partial<Pick<MissionRoleRow,
+    'status' | 'container_name' | 'started_at' | 'completed_at' |
+    'cost_usd' | 'input_tokens' | 'output_tokens' | 'output_path' | 'error'
+  >>,
+): void {
+  const fields: string[] = [];
+  const values: unknown[] = [];
+  for (const [key, value] of Object.entries(updates)) {
+    if (value !== undefined) {
+      fields.push(`${key} = ?`);
+      values.push(value);
+    }
+  }
+  if (fields.length === 0) return;
+  values.push(missionId, roleName);
+  db.prepare(
+    `UPDATE mission_roles SET ${fields.join(', ')} WHERE mission_id = ? AND role_name = ?`,
+  ).run(...values);
+}
+
+export function logMissionEvent(
+  missionId: string,
+  eventType: string,
+  roleName?: string,
+  details?: string,
+): void {
+  db.prepare(
+    `INSERT INTO mission_events (mission_id, event_type, role_name, details, timestamp)
+     VALUES (?, ?, ?, ?, ?)`,
+  ).run(missionId, eventType, roleName || null, details || null, new Date().toISOString());
+}
+
+export function getMissionEvents(missionId: string): Array<{
+  event_type: string;
+  role_name: string | null;
+  details: string | null;
+  timestamp: string;
+}> {
+  return db
+    .prepare(
+      'SELECT event_type, role_name, details, timestamp FROM mission_events WHERE mission_id = ? ORDER BY timestamp',
+    )
+    .all(missionId) as Array<{
+    event_type: string;
+    role_name: string | null;
+    details: string | null;
+    timestamp: string;
+  }>;
+}
+
+/** Count missions with given status, optionally filtered by entity */
+export function countMissionsByStatus(status: string, entity?: string): number {
+  if (entity) {
+    const row = db
+      .prepare('SELECT COUNT(*) as cnt FROM missions WHERE status = ? AND entity = ?')
+      .get(status, entity) as { cnt: number };
+    return row.cnt;
+  }
+  const row = db
+    .prepare('SELECT COUNT(*) as cnt FROM missions WHERE status = ?')
+    .get(status) as { cnt: number };
+  return row.cnt;
 }
 
 // --- JSON migration ---

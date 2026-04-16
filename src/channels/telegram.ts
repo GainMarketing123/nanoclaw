@@ -217,6 +217,39 @@ export class TelegramChannel implements Channel {
     this.bot.on('message:location', (ctx) => storeNonText(ctx, '[Location]'));
     this.bot.on('message:contact', (ctx) => storeNonText(ctx, '[Contact]'));
 
+    // Handle inline keyboard callback queries (mission approve/reject/modify)
+    this.bot.on('callback_query:data', async (ctx) => {
+      const data = ctx.callbackQuery.data;
+      const sender = ctx.from?.id.toString() || '';
+      const chatJid = ctx.chat ? `tg:${ctx.chat.id}` : '';
+
+      logger.info(
+        { callbackData: data, sender, chatJid },
+        'Inline keyboard callback received',
+      );
+
+      // Route callback to command handler — reuse existing handleCommand
+      // Callback data format: "mission:approve:{id}" → "/mission approve {id}"
+      const parts = data.split(':');
+      if (parts[0] === 'mission' && parts.length >= 3) {
+        const subcmd = parts[1];
+        const missionId = parts.slice(2).join(':');
+        const { handleCommand } = await import('../commands.js');
+        const result = handleCommand(`/mission ${subcmd} ${missionId}`, sender);
+        if (result.response) {
+          await ctx.answerCallbackQuery({ text: result.response.slice(0, 200) });
+          // Also send full response to chat
+          if (chatJid) {
+            await sendTelegramMessage(this.bot!.api, chatJid.replace(/^tg:/, ''), result.response);
+          }
+        } else {
+          await ctx.answerCallbackQuery({ text: 'Done' });
+        }
+      } else {
+        await ctx.answerCallbackQuery({ text: 'Unknown action' });
+      }
+    });
+
     // Handle errors gracefully
     this.bot.catch((err) => {
       logger.error({ err: err.message }, 'Telegram bot error');
@@ -265,6 +298,55 @@ export class TelegramChannel implements Channel {
       logger.info({ jid, length: text.length }, 'Telegram message sent');
     } catch (err) {
       logger.error({ jid, err }, 'Failed to send Telegram message');
+    }
+  }
+
+  /**
+   * Send a message with Grammy inline keyboard buttons.
+   * Used for mission approve/reject/modify flows.
+   *
+   * @param buttons - Array of rows, each row is array of {text, callback_data}
+   */
+  async sendMessageWithKeyboard(
+    jid: string,
+    text: string,
+    buttons: Array<Array<{ text: string; callback_data: string }>>,
+  ): Promise<void> {
+    if (!this.bot) {
+      logger.warn('Telegram bot not initialized');
+      return;
+    }
+
+    try {
+      const numericId = jid.replace(/^tg:/, '');
+      const { InlineKeyboard } = await import('grammy');
+      const keyboard = new InlineKeyboard();
+      for (const row of buttons) {
+        for (const btn of row) {
+          keyboard.text(btn.text, btn.callback_data);
+        }
+        keyboard.row();
+      }
+
+      try {
+        await this.bot.api.sendMessage(numericId, text, {
+          parse_mode: 'Markdown',
+          reply_markup: keyboard,
+        });
+      } catch {
+        // Fallback: plain text if Markdown fails
+        await this.bot.api.sendMessage(numericId, text, {
+          reply_markup: keyboard,
+        });
+      }
+      logger.info(
+        { jid, buttonCount: buttons.flat().length },
+        'Telegram message with keyboard sent',
+      );
+    } catch (err) {
+      logger.error({ jid, err }, 'Failed to send Telegram keyboard message');
+      // Fallback: send without keyboard
+      await this.sendMessage(jid, text);
     }
   }
 

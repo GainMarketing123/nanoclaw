@@ -10,11 +10,26 @@ import fs from 'fs';
 import path from 'path';
 
 import { getPauseStatus, resumeGroup } from './auto-pause.js';
-import { ATLAS_STATE_DIR } from './config.js';
-import { getAllTasks, getTaskById, updateTask } from './db.js';
+import { ATLAS_STATE_DIR, ATLAS_OPS_DIR, TELEGRAM_CEO_USER_ID } from './config.js';
+import {
+  createMission,
+  createMissionRole,
+  getActiveMissions,
+  getMission,
+  getMissionByPrefix,
+  getMissionEvents,
+  getMissionRoles,
+  getRecentMissions,
+  logMissionEvent,
+  updateMission,
+  updateMissionRole,
+  getAllTasks,
+  getTaskById,
+  updateTask,
+} from './db.js';
 import { logger } from './logger.js';
 
-// Atlas state paths (host-level)
+// Atlas state paths (host-level, engineering repo)
 const GRADUATION_STATUS_PATH = path.join(
   ATLAS_STATE_DIR,
   'autonomy',
@@ -27,19 +42,14 @@ const QUOTA_TRACKING_PATH = path.join(
 );
 const MODE_PATH = path.join(ATLAS_STATE_DIR, 'state', 'mode.json');
 
-// Mission state paths
-const MISSIONS_DIR = path.join(ATLAS_STATE_DIR, 'swarm', 'missions');
+// Mission state paths (operations repo — post three-repo split)
+const MISSIONS_DIR = path.join(ATLAS_OPS_DIR, 'swarm', 'missions');
 const MISSION_TEMPLATES_PATH = path.join(
-  ATLAS_STATE_DIR,
+  ATLAS_OPS_DIR,
   'swarm',
   'mission-templates.json',
 );
 const HOST_TASKS_PENDING = path.join(ATLAS_STATE_DIR, 'host-tasks', 'pending');
-const CODEX_TOGGLE_PATH = path.join(
-  ATLAS_STATE_DIR,
-  'state',
-  'codex-toggle.json',
-);
 const APPROVAL_PENDING_DIR = path.join(
   ATLAS_STATE_DIR,
   'approval-queue',
@@ -55,6 +65,12 @@ const APPROVAL_REJECTED_DIR = path.join(
   'approval-queue',
   'rejected',
 );
+
+// Dangerous commands that require CEO sender verification
+const CEO_ONLY_COMMANDS = new Set([
+  '/approve', '/reject', '/pause', '/resume',
+  '/reset-mode', '/mission',
+]);
 
 // Model weights for quota display (mirrors governance/quota.ts)
 const MODEL_WEIGHTS: Record<string, number> = {
@@ -72,14 +88,30 @@ interface CommandResult {
  * Try to handle a message as a command.
  * Returns { handled: true, response } if it was a command, { handled: false } otherwise.
  * Only processes commands from main group.
+ *
+ * @param sender - Telegram user ID (ctx.from.id) for CEO-only command gating
  */
-export function handleCommand(text: string): CommandResult {
+export function handleCommand(text: string, sender?: string): CommandResult {
   const trimmed = text.trim();
   if (!trimmed.startsWith('/')) return { handled: false };
 
   const parts = trimmed.split(/\s+/);
   const cmd = parts[0].toLowerCase();
   const args = parts.slice(1);
+
+  // CEO-only gate: dangerous commands require verified sender
+  if (CEO_ONLY_COMMANDS.has(cmd) && TELEGRAM_CEO_USER_ID) {
+    if (!sender || sender !== TELEGRAM_CEO_USER_ID) {
+      logger.warn(
+        { cmd, sender, expected: TELEGRAM_CEO_USER_ID },
+        'CEO-only command rejected: sender mismatch',
+      );
+      return {
+        handled: true,
+        response: `Command ${cmd} requires CEO authorization.`,
+      };
+    }
+  }
 
   switch (cmd) {
     case '/pause':
@@ -98,8 +130,6 @@ export function handleCommand(text: string): CommandResult {
       return { handled: true, response: handleMission(args) };
     case '/reset-mode':
       return { handled: true, response: handleResetMode() };
-    case '/codex':
-      return { handled: true, response: handleCodex(args) };
     default:
       return { handled: false };
   }
@@ -372,12 +402,14 @@ function handleResetMode(): string {
 function handleMission(args: string[]): string {
   if (args.length === 0) {
     return `Usage:
-  /mission list — Show recent missions
-  /mission status <id> — Mission details
-  /mission create <type> [entity] — Create mission (queues for approval)
-  /mission approve <id> — Execute approved mission
+  /mission list — Show active + recent missions
+  /mission status <id> — Mission details with role progress
+  /mission create <type> [entity] — Create mission for approval
+  /mission approve <id> — Approve and execute mission
   /mission stop <id> — Stop running mission
-  /mission types — List available mission types`;
+  /mission types — List available mission types
+  /mission history — Last 20 completed missions
+  /mission show <id> — Full mission report with outputs`;
   }
 
   const subcmd = args[0].toLowerCase();
@@ -396,6 +428,10 @@ function handleMission(args: string[]): string {
       return missionStop(subargs[0]);
     case 'types':
       return missionTypes();
+    case 'history':
+      return missionHistory();
+    case 'show':
+      return missionShow(subargs[0]);
     default:
       return `Unknown mission command: ${subcmd}`;
   }
@@ -427,30 +463,44 @@ function missionTypes(): string {
 }
 
 function missionList(): string {
+  // SQLite-backed: read from missions table instead of filesystem
   try {
-    if (!fs.existsSync(MISSIONS_DIR)) return 'No missions yet.';
-    const dirs = fs
-      .readdirSync(MISSIONS_DIR)
-      .filter((d) => fs.statSync(path.join(MISSIONS_DIR, d)).isDirectory())
-      .sort()
-      .reverse()
-      .slice(0, 10);
+    const active = getActiveMissions();
+    const recent = getRecentMissions(10);
 
-    if (dirs.length === 0) return 'No missions yet.';
+    if (active.length === 0 && recent.length === 0) return 'No missions yet.';
 
-    const lines = ['Recent missions:'];
-    for (const dir of dirs) {
-      const statusPath = path.join(MISSIONS_DIR, dir, 'status.json');
-      try {
-        const status = JSON.parse(fs.readFileSync(statusPath, 'utf-8'));
-        const roleCount = Object.keys(status.roles || {}).length;
+    const lines: string[] = [];
+
+    if (active.length > 0) {
+      lines.push(`Active (${active.length}):`);
+      for (const m of active) {
+        const roles = getMissionRoles(m.id);
+        const done = roles.filter(r => r.status === 'success').length;
+        const statusEmoji = m.status === 'proposed' ? '📋' : m.status === 'running' ? '🚀' : '🔀';
         lines.push(
-          `  ${dir} | ${status.status} | ${roleCount} roles | ${status.started_at || 'pending'}`,
+          `  ${statusEmoji} ${m.title}  ${m.entity.toUpperCase()}  ${done}/${roles.length} roles  $${m.cost_actual_usd.toFixed(2)}`,
         );
-      } catch {
-        lines.push(`  ${dir} | (no status file)`);
       }
     }
+
+    // Show recent completed/failed that aren't in active
+    const activeIds = new Set(active.map(m => m.id));
+    const completed = recent.filter(m => !activeIds.has(m.id));
+    if (completed.length > 0) {
+      if (lines.length > 0) lines.push('');
+      lines.push('Recent:');
+      for (const m of completed.slice(0, 7)) {
+        const emoji = m.status === 'complete' ? '✅' : m.status === 'failed' ? '❌' : '⏸️';
+        const date = m.completed_at
+          ? new Date(m.completed_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+          : '';
+        lines.push(
+          `  ${emoji} ${m.title}  ${m.entity.toUpperCase()}  $${m.cost_actual_usd.toFixed(2)}  ${date}`,
+        );
+      }
+    }
+
     return lines.join('\n');
   } catch (err) {
     return `Error: ${err}`;
@@ -460,40 +510,43 @@ function missionList(): string {
 function missionStatus(id?: string): string {
   if (!id) return 'Usage: /mission status <mission-id>';
   try {
-    // Find mission by partial match
-    if (!fs.existsSync(MISSIONS_DIR)) return 'No missions directory.';
-    const dirs = fs.readdirSync(MISSIONS_DIR);
-    const match = dirs.find((d) => d.includes(id));
-    if (!match) return `Mission not found: ${id}`;
+    // SQLite-backed: find by prefix match
+    const mission = getMissionByPrefix(id) || getMission(id);
+    if (!mission) return `Mission not found: ${id}`;
 
-    const statusPath = path.join(MISSIONS_DIR, match, 'status.json');
-    const status = JSON.parse(fs.readFileSync(statusPath, 'utf-8'));
+    const roles = getMissionRoles(mission.id);
+    const events = getMissionEvents(mission.id);
+
+    const statusEmoji: Record<string, string> = {
+      proposed: '📋', approved: '⏳', running: '🚀',
+      synthesizing: '🔀', complete: '✅', failed: '❌', stopped: '⏸️',
+    };
+
+    const roleEmoji: Record<string, string> = {
+      pending: '⏳', running: '🔄', success: '✅',
+      error: '❌', timeout: '❌', cancelled: '⏸️',
+    };
+
     const lines = [
-      `Mission: ${match}`,
-      `Status: ${status.status}`,
-      `Started: ${status.started_at || 'n/a'}`,
-      `Completed: ${status.completed_at || 'running'}`,
+      `${statusEmoji[mission.status] || '❓'} ${mission.title}`,
+      `Entity: ${mission.entity.toUpperCase()}  |  Status: ${mission.status}`,
+      `Cost: $${mission.cost_actual_usd.toFixed(2)}${mission.cost_estimate_usd ? ` / ~$${mission.cost_estimate_usd.toFixed(2)} est.` : ''}`,
       '',
       'Roles:',
     ];
-    for (const [role, roleStatus] of Object.entries(status.roles || {})) {
-      lines.push(`  ${role}: ${roleStatus}`);
+    for (const r of roles) {
+      const dur = r.started_at && r.completed_at
+        ? `${Math.round((new Date(r.completed_at).getTime() - new Date(r.started_at).getTime()) / 1000)}s`
+        : '';
+      lines.push(
+        `  ${roleEmoji[r.status] || '❓'} ${r.role_name} (${r.model})${dur ? ` — ${dur}` : ''}${r.error ? ` — ${r.error.slice(0, 60)}` : ''}`,
+      );
     }
 
-    // Check for outputs
-    const workspace = path.join(MISSIONS_DIR, match, 'workspace');
-    if (fs.existsSync(workspace)) {
-      const outputs = fs
-        .readdirSync(workspace)
-        .filter((f) => f.endsWith('-output.md'));
-      if (outputs.length > 0) {
-        lines.push('');
-        lines.push('Outputs:');
-        for (const f of outputs) {
-          const size = fs.statSync(path.join(workspace, f)).size;
-          lines.push(`  ${f} (${size} bytes)`);
-        }
-      }
+    if (mission.result_summary) {
+      lines.push('');
+      lines.push('Summary:');
+      lines.push(mission.result_summary.slice(0, 500));
     }
 
     return lines.join('\n');
@@ -513,33 +566,38 @@ function missionCreate(missionType?: string, entity?: string): string {
     if (!template)
       return `Unknown mission type: ${missionType}\nRun /mission types for available types.`;
 
-    const missionId = `mission-${Date.now()}`;
-    const missionEntity = entity || 'atlas_main';
+    const missionEntity = entity || 'gpg';
+    const missionId = `m-${Date.now()}`;
 
-    // Queue as host-executor task
-    const task = {
-      task_id: missionId,
-      type: 'mission',
+    // Create mission in SQLite (single source of truth)
+    createMission({
+      id: missionId,
       entity: missionEntity,
+      template_type: missionType,
+      title: template.name,
       brief: template.brief_template,
-      roster: { roles: template.roles },
-      model: 'sonnet',
-      status: 'pending_approval',
-      created_at: new Date().toISOString(),
-      created_via: 'telegram',
-      mission_type: missionType,
-    };
+      roster: JSON.stringify(template.roles),
+      cost_estimate_usd: template.estimated_cost,
+      correlation_id: `${missionEntity.toUpperCase().slice(0, 3)}-${missionId.slice(2, 10)}-${Math.floor(Date.now() / 1000)}`,
+    });
 
-    // Write to approval queue, not directly to pending
-    const approvalDir = path.join(ATLAS_STATE_DIR, 'approval-queue', 'pending');
-    fs.mkdirSync(approvalDir, { recursive: true });
-    fs.writeFileSync(
-      path.join(approvalDir, `${missionId}.json`),
-      JSON.stringify(task, null, 2),
-    );
+    // Create role entries
+    for (const [roleName, roleConfig] of Object.entries(template.roles)) {
+      const rc = roleConfig as { model: string; task: string };
+      createMissionRole({
+        mission_id: missionId,
+        role_name: roleName,
+        model: rc.model || 'sonnet',
+        task: rc.task,
+      });
+    }
+
+    logMissionEvent(missionId, 'created', undefined, `Template: ${missionType}, Entity: ${missionEntity}`);
 
     const roleNames = Object.keys(template.roles).join(', ');
-    return `Mission created: ${missionId}\nType: ${template.name}\nEntity: ${missionEntity}\nRoles: ${roleNames}\nEst. cost: ~$${template.estimated_cost}\n\n⏳ Awaiting approval. Run: /mission approve ${missionId}`;
+    logger.info({ missionId, missionType, entity: missionEntity }, 'Mission created via /mission create');
+
+    return `📋 Mission: ${template.name}\nEntity: ${missionEntity.toUpperCase()}\n\nRoster:\n${Object.entries(template.roles).map(([name, cfg]) => `  • ${name} (${(cfg as { model: string }).model})`).join('\n')}\n\nEst. cost: ~$${template.estimated_cost}  |  Est. time: ~${template.estimated_minutes}min\n\n⏳ ID: ${missionId}\nApprove: /mission approve ${missionId}`;
   } catch (err) {
     return `Error: ${err}`;
   }
@@ -548,40 +606,24 @@ function missionCreate(missionType?: string, entity?: string): string {
 function missionApprove(id?: string): string {
   if (!id) return 'Usage: /mission approve <mission-id>';
   try {
-    const approvalDir = path.join(ATLAS_STATE_DIR, 'approval-queue', 'pending');
-    if (!fs.existsSync(approvalDir)) return 'No pending approvals.';
+    const mission = getMissionByPrefix(id) || getMission(id);
+    if (!mission) return `Mission not found: ${id}`;
 
-    const files = fs
-      .readdirSync(approvalDir)
-      .filter((f) => f === `${id}.json` || f.startsWith(`${id}-`));
-    if (files.length === 0) return `No pending mission found: ${id}`;
-
-    const filePath = path.join(approvalDir, files[0]);
-    const task = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-
-    if (task.type !== 'mission') return `Item ${id} is not a mission.`;
-
-    // Move to host-executor pending tasks
-    delete task.status;
-    fs.mkdirSync(HOST_TASKS_PENDING, { recursive: true });
-    fs.writeFileSync(
-      path.join(HOST_TASKS_PENDING, files[0]),
-      JSON.stringify(task, null, 2),
-    );
-
-    // Remove from approval queue
-    try {
-      fs.unlinkSync(filePath);
-    } catch (unlinkErr) {
-      logger.error(
-        { missionId: id, error: unlinkErr },
-        'Failed to remove from approval queue after writing to pending — task may execute twice',
-      );
-      throw unlinkErr;
+    if (mission.status !== 'proposed') {
+      return `Mission ${mission.id} is ${mission.status}, not proposed.`;
     }
 
-    logger.info({ missionId: id }, 'Mission approved and queued for execution');
-    return `✅ Mission approved: ${id}\nQueued for execution. Use /mission list to track.`;
+    // Update status to approved — bridge server will pick it up and spawn roles
+    updateMission(mission.id, {
+      status: 'approved',
+      approved_at: new Date().toISOString(),
+    });
+    logMissionEvent(mission.id, 'approved', undefined, 'CEO approved via Telegram');
+
+    logger.info({ missionId: mission.id }, 'Mission approved via /mission approve');
+
+    const roles = getMissionRoles(mission.id);
+    return `🚀 Mission approved: ${mission.title}\n\n${roles.length} roles spawning...\n${roles.map(r => `  🔄 ${r.role_name} (${r.model})`).join('\n')}\n\nTrack: /mission status ${mission.id}`;
   } catch (err) {
     return `Error: ${err}`;
   }
@@ -590,112 +632,129 @@ function missionApprove(id?: string): string {
 function missionStop(id?: string): string {
   if (!id) return 'Usage: /mission stop <mission-id>';
   try {
-    if (!fs.existsSync(MISSIONS_DIR)) return 'No missions directory.';
-    const dirs = fs.readdirSync(MISSIONS_DIR);
-    const match = dirs.find((d) => d.includes(id));
-    if (!match) return `Mission not found: ${id}`;
+    const mission = getMissionByPrefix(id) || getMission(id);
+    if (!mission) return `Mission not found: ${id}`;
 
-    const statusPath = path.join(MISSIONS_DIR, match, 'status.json');
-    const status = JSON.parse(fs.readFileSync(statusPath, 'utf-8'));
-
-    if (status.status !== 'running') {
-      return `Mission ${match} is ${status.status}, not running.`;
+    if (!['running', 'approved', 'synthesizing'].includes(mission.status)) {
+      return `Mission ${mission.id} is ${mission.status}, cannot stop.`;
     }
 
-    status.status = 'stopped';
-    status.stopped_at = new Date().toISOString();
-    status.stopped_by = 'ceo_telegram';
-    fs.writeFileSync(statusPath, JSON.stringify(status, null, 2));
+    updateMission(mission.id, {
+      status: 'stopped' as any,
+      completed_at: new Date().toISOString(),
+    });
+    logMissionEvent(mission.id, 'stopped', undefined, 'CEO stopped via Telegram');
 
-    // Note: actual process termination happens via host-executor monitoring
-    // This sets the flag that the monitor checks
-    logger.info({ missionId: match }, 'Mission stop requested via Telegram');
-    return `🛑 Mission stopped: ${match}\nRunning processes will be terminated by host-executor.`;
+    // Mark any running roles as cancelled
+    const roles = getMissionRoles(mission.id);
+    for (const r of roles) {
+      if (['pending', 'running'].includes(r.status)) {
+        updateMissionRole(mission.id, r.role_name, {
+          status: 'cancelled' as any,
+          completed_at: new Date().toISOString(),
+        });
+      }
+    }
+
+    logger.info({ missionId: mission.id }, 'Mission stopped via /mission stop');
+    return `🛑 Mission stopped: ${mission.title}\nRunning containers will be terminated.`;
   } catch (err) {
     return `Error: ${err}`;
   }
 }
-function handleCodex(args: string[]): string {
-  // /codex        — show current toggle state
-  // /codex on     — enable Codex (default behavior)
-  // /codex off    — disable Codex, use Claude subagents instead
-  try {
-    const subcommand = args[0]?.toLowerCase();
 
-    if (!subcommand) {
-      // Show current state
-      const state = readCodexToggle();
-      const status = state.codex_enabled
-        ? 'ON (Codex active)'
-        : 'OFF (Claude subagents)';
-      const updated = state.updated_at
-        ? `\nLast changed: ${state.updated_at}`
+function missionHistory(): string {
+  try {
+    const missions = getRecentMissions(20);
+    const completed = missions.filter(m =>
+      ['complete', 'failed', 'stopped'].includes(m.status),
+    );
+    if (completed.length === 0) return 'No completed missions yet.';
+
+    const lines = ['Mission History (last 20):'];
+    for (const m of completed) {
+      const emoji = m.status === 'complete' ? '✅' : m.status === 'failed' ? '❌' : '⏸️';
+      const date = m.completed_at
+        ? new Date(m.completed_at).toLocaleDateString('en-US', {
+            month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
+          })
         : '';
-      const by = state.updated_by ? ` by ${state.updated_by}` : '';
-      return `Codex toggle: ${status}${updated}${by}`;
-    }
-
-    if (subcommand === 'on') {
-      writeCodexToggle(true);
-      logger.info('Codex enabled via /codex on command');
-      return (
-        'Codex toggle: ON\n' +
-        'All delegation, cross-review, and challenge routes through Codex.\n' +
-        'Delegation gate enforces cx wrapper usage.'
+      lines.push(
+        `${emoji} ${m.title}  ${m.entity.toUpperCase()}  $${m.cost_actual_usd.toFixed(2)}  ${date}`,
       );
+      lines.push(`   ID: ${m.id}  |  /mission show ${m.id}`);
     }
-
-    if (subcommand === 'off') {
-      writeCodexToggle(false);
-      logger.info('Codex disabled via /codex off command');
-      return (
-        'Codex toggle: OFF\n' +
-        'All Codex processes replaced by Claude subagents:\n' +
-        '- Delegation gate: passes (Atlas writes directly)\n' +
-        '- Cross-review: routes to Claude\n' +
-        '- Challenge: routes to Claude\n' +
-        '- Routing gate: skipped\n' +
-        '- Pre-push receipts: skipped (certificates only)'
-      );
-    }
-
-    return 'Usage: /codex [on|off]\n  /codex     — show current state\n  /codex on  — enable Codex\n  /codex off — disable Codex';
+    return lines.join('\n');
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    return `Error handling codex toggle: ${msg}`;
+    return `Error: ${err}`;
   }
 }
 
-function readCodexToggle(): {
-  codex_enabled: boolean;
-  updated_at?: string;
-  updated_by?: string;
-} {
+function missionShow(id?: string): string {
+  if (!id) return 'Usage: /mission show <mission-id>';
   try {
-    if (!fs.existsSync(CODEX_TOGGLE_PATH)) {
-      return { codex_enabled: true }; // Default: Codex ON
-    }
-    return JSON.parse(fs.readFileSync(CODEX_TOGGLE_PATH, 'utf-8'));
-  } catch {
-    return { codex_enabled: true };
-  }
-}
+    const mission = getMissionByPrefix(id) || getMission(id);
+    if (!mission) return `Mission not found: ${id}`;
 
-function writeCodexToggle(enabled: boolean): void {
-  const stateDir = path.dirname(CODEX_TOGGLE_PATH);
-  fs.mkdirSync(stateDir, { recursive: true });
-  fs.writeFileSync(
-    CODEX_TOGGLE_PATH,
-    JSON.stringify(
-      {
-        codex_enabled: enabled,
-        updated_at: new Date().toISOString(),
-        updated_by: 'CEO',
-      },
-      null,
-      2,
-    ),
-  );
+    const roles = getMissionRoles(mission.id);
+    const events = getMissionEvents(mission.id);
+
+    const statusEmoji: Record<string, string> = {
+      proposed: '📋', approved: '⏳', running: '🚀',
+      synthesizing: '🔀', complete: '✅', failed: '❌', stopped: '⏸️',
+    };
+    const roleEmoji: Record<string, string> = {
+      pending: '⏳', running: '🔄', success: '✅',
+      error: '❌', timeout: '❌', cancelled: '⏸️',
+    };
+
+    const lines = [
+      `${statusEmoji[mission.status] || '❓'} *${mission.title}*`,
+      `Entity: ${mission.entity.toUpperCase()}  |  Type: ${mission.template_type}`,
+      `Status: ${mission.status}  |  Cost: $${mission.cost_actual_usd.toFixed(2)}`,
+      '',
+    ];
+
+    // Timeline
+    if (events.length > 0) {
+      lines.push('*Timeline:*');
+      for (const evt of events) {
+        const time = new Date(evt.timestamp).toLocaleTimeString('en-US', {
+          hour: 'numeric', minute: '2-digit', hour12: true,
+        });
+        const role = evt.role_name ? ` [${evt.role_name}]` : '';
+        lines.push(`  ${time}  ${evt.event_type}${role}`);
+      }
+      lines.push('');
+    }
+
+    // Roles
+    lines.push('*Roles:*');
+    for (const r of roles) {
+      const dur = r.started_at && r.completed_at
+        ? `${Math.round((new Date(r.completed_at).getTime() - new Date(r.started_at).getTime()) / 1000)}s`
+        : '';
+      lines.push(
+        `  ${roleEmoji[r.status] || '❓'} ${r.role_name} (${r.model})  $${r.cost_usd.toFixed(2)}${dur ? `  ${dur}` : ''}`,
+      );
+      if (r.error) lines.push(`    Error: ${r.error.slice(0, 100)}`);
+    }
+
+    // Summary
+    if (mission.result_summary) {
+      lines.push('');
+      lines.push('*Summary:*');
+      lines.push(mission.result_summary.slice(0, 1000));
+    }
+
+    // Dashboard link
+    lines.push('');
+    lines.push(`Full report: https://atlas.gainpropertygroup.com/missions/${mission.id}`);
+
+    return lines.join('\n');
+  } catch (err) {
+    return `Error: ${err}`;
+  }
 }
 
 // --- Helper functions ---

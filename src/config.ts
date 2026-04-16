@@ -84,3 +84,19 @@ export const TIMEZONE =
 // Atlas governance state directory (host-level, not mounted into containers)
 // Containers see this at /workspace/extra/atlas-state via mounts
 export const ATLAS_STATE_DIR = path.join(HOME_DIR, '.atlas');
+
+// Atlas Operations directory — bridge, swarm, entities, security
+// Post three-repo split: operations state lives separately from engineering
+export const ATLAS_OPS_DIR =
+  process.env.ATLAS_OPS_DIR || path.join(HOME_DIR, '.atlas-operations');
+
+// Bridge callback port — bridge_server.py listens here for mission callbacks
+export const BRIDGE_CALLBACK_PORT = parseInt(
+  process.env.BRIDGE_CALLBACK_PORT || '3002',
+  10,
+);
+
+// CEO Telegram user ID — gates dangerous commands (approve, pause, reset-mode)
+// This is ctx.from.id (user ID), NOT ctx.chat.id (chat ID)
+export const TELEGRAM_CEO_USER_ID =
+  process.env.TELEGRAM_CEO_USER_ID || '';

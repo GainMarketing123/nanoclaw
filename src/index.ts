@@ -673,7 +673,7 @@ async function main(): Promise<void> {
 
       // Atlas commands — intercept from main group before storage (zero LLM cost)
       if (registeredGroups[chatJid]?.isMain && trimmed.startsWith('/')) {
-        const result = handleCommand(trimmed);
+        const result = handleCommand(trimmed, msg.sender);
         if (result.handled && result.response) {
           const channel = findChannel(channels, chatJid);
           if (channel) {

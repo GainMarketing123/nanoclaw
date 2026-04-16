@@ -240,14 +240,32 @@ export async function processTaskIpc(
         data.schedule_value &&
         data.targetJid
       ) {
-        // Resolve the target group from JID
-        const targetJid = data.targetJid as string;
-        const targetGroupEntry = registeredGroups[targetJid];
+        // Resolve the target group from JID — supports both real Telegram JIDs
+        // and logical dispatch: JIDs from the bridge (e.g. "dispatch:atlas_gpg")
+        let targetJid = data.targetJid as string;
+        let targetGroupEntry = registeredGroups[targetJid];
+
+        // Dispatch JID resolution: bridge uses "dispatch:{folder}" format.
+        // Map to the real channel JID by matching the group folder name.
+        if (!targetGroupEntry && targetJid.startsWith('dispatch:')) {
+          const dispatchFolder = targetJid.slice('dispatch:'.length);
+          for (const [jid, group] of Object.entries(registeredGroups)) {
+            if (group.folder === dispatchFolder) {
+              targetJid = jid;
+              targetGroupEntry = group;
+              logger.info(
+                { dispatch: data.targetJid, resolved: jid, folder: dispatchFolder },
+                'Dispatch JID resolved to registered group',
+              );
+              break;
+            }
+          }
+        }
 
         if (!targetGroupEntry) {
           logger.warn(
-            { targetJid },
-            'Cannot schedule task: target group not registered',
+            { targetJid, original: data.targetJid },
+            'Cannot schedule task: target group not registered (dispatch resolution failed)',
           );
           break;
         }
@@ -502,6 +520,79 @@ export async function processTaskIpc(
         );
       }
       break;
+
+    case 'create_mission': {
+      // NL detection: main group agent proposes a mission from conversation
+      const { createMission, createMissionRole, logMissionEvent } = await import('./db.js');
+      const templateType = (data as any).templateType as string;
+      const entity = (data as any).entity as string || 'gpg';
+      const title = (data as any).title as string || `Mission: ${templateType}`;
+      const brief = (data as any).brief as string || '';
+
+      if (!templateType) {
+        logger.warn('create_mission IPC missing templateType');
+        break;
+      }
+
+      // Load template to get roles
+      const { ATLAS_OPS_DIR } = await import('./config.js');
+      const templatesPath = path.join(ATLAS_OPS_DIR, 'swarm', 'mission-templates.json');
+      let template: any = null;
+      try {
+        const tmplData = JSON.parse(fs.readFileSync(templatesPath, 'utf-8'));
+        template = tmplData.templates?.[templateType];
+      } catch { /* template not found */ }
+
+      if (!template) {
+        logger.warn({ templateType }, 'create_mission: template not found');
+        break;
+      }
+
+      const missionId = `m-${Date.now()}`;
+      createMission({
+        id: missionId,
+        entity,
+        template_type: templateType,
+        title: template.name || title,
+        brief: brief || template.brief_template,
+        roster: JSON.stringify(template.roles),
+        cost_estimate_usd: template.estimated_cost,
+        correlation_id: `${entity.toUpperCase().slice(0, 3)}-${missionId.slice(2, 10)}-${Math.floor(Date.now() / 1000)}`,
+      });
+
+      for (const [roleName, roleConfig] of Object.entries(template.roles)) {
+        const rc = roleConfig as { model: string; task: string };
+        createMissionRole({
+          mission_id: missionId,
+          role_name: roleName,
+          model: rc.model || 'sonnet',
+          task: rc.task,
+        });
+      }
+
+      logMissionEvent(missionId, 'created', undefined,
+        `NL detection: ${(data as any).source || 'ipc'}, template: ${templateType}`);
+
+      // Notify CEO via main group channel with the mission proposal
+      const mainJid = Object.entries(registeredGroups).find(([, g]) => g.isMain)?.[0];
+      if (mainJid) {
+        const roleNames = Object.keys(template.roles).join(', ');
+        const msg = `📋 Mission: ${template.name}\n` +
+          `Entity: ${entity.toUpperCase()}\n\n` +
+          `Roster:\n${Object.entries(template.roles).map(([n, c]) => `  • ${n} (${(c as any).model})`).join('\n')}\n\n` +
+          `Est. cost: ~$${template.estimated_cost}  |  Est. time: ~${template.estimated_minutes}min\n\n` +
+          `⏳ ID: ${missionId}\nApprove: /mission approve ${missionId}`;
+        try {
+          await deps.sendMessage(mainJid, msg);
+        } catch (err) {
+          logger.error({ err, missionId }, 'Failed to send mission proposal to main group');
+        }
+      }
+
+      logger.info({ missionId, templateType, entity, source: (data as any).source },
+        'Mission created via NL detection IPC');
+      break;
+    }
 
     default:
       logger.warn({ type: data.type }, 'Unknown IPC task type');
