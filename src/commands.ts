@@ -18,10 +18,7 @@ import {
   BRIDGE_CALLBACK_PORT,
   TELEGRAM_CEO_USER_ID,
 } from './config.js';
-import {
-  CONTAINER_RUNTIME_BIN,
-  stopContainer,
-} from './container-runtime.js';
+import { CONTAINER_RUNTIME_BIN, stopContainer } from './container-runtime.js';
 import {
   createMission,
   createMissionRole,
@@ -883,17 +880,29 @@ function missionStop(id?: string): string {
         try {
           execSync(stopContainer(name), { stdio: 'pipe', timeout: 15000 });
           killed++;
-          logger.info({ missionId: mission.id, container: name }, 'Stopped mission container');
+          logger.info(
+            { missionId: mission.id, container: name },
+            'Stopped mission container',
+          );
         } catch {
           // Container may have already exited
-          logger.warn({ missionId: mission.id, container: name }, 'Container already stopped');
+          logger.warn(
+            { missionId: mission.id, container: name },
+            'Container already stopped',
+          );
         }
       }
     } catch (err) {
-      logger.error({ missionId: mission.id, error: err }, 'Failed to list/stop mission containers');
+      logger.error(
+        { missionId: mission.id, error: err },
+        'Failed to list/stop mission containers',
+      );
     }
 
-    logger.info({ missionId: mission.id, killed }, 'Mission stopped via /mission stop');
+    logger.info(
+      { missionId: mission.id, killed },
+      'Mission stopped via /mission stop',
+    );
     return `🛑 Mission stopped: ${mission.title}\n${killed} container${killed !== 1 ? 's' : ''} terminated.`;
   } catch (err) {
     return `Error: ${err}`;
