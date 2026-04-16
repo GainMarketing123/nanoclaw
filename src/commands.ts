@@ -527,7 +527,15 @@ function missionList(): string {
       lines.push('Recent:');
       for (const m of completed.slice(0, 7)) {
         const emoji =
-          m.status === 'complete' ? '✅' : m.status === 'failed' ? '❌' : '⏸️';
+          m.status === 'complete'
+            ? '✅'
+            : m.status === 'failed'
+              ? '❌'
+              : m.status === 'rejected'
+                ? '🚫'
+                : m.status === 'stopped'
+                  ? '⏹️'
+                  : '⏸️';
         const date = m.completed_at
           ? new Date(m.completed_at).toLocaleDateString('en-US', {
               month: 'short',
@@ -803,14 +811,20 @@ function missionHistory(): string {
   try {
     const missions = getRecentMissions(20);
     const completed = missions.filter((m) =>
-      ['complete', 'failed', 'stopped'].includes(m.status),
+      ['complete', 'failed', 'stopped', 'rejected'].includes(m.status),
     );
     if (completed.length === 0) return 'No completed missions yet.';
 
     const lines = ['Mission History (last 20):'];
     for (const m of completed) {
       const emoji =
-        m.status === 'complete' ? '✅' : m.status === 'failed' ? '❌' : '⏸️';
+        m.status === 'complete'
+          ? '✅'
+          : m.status === 'failed'
+            ? '❌'
+            : m.status === 'rejected'
+              ? '🚫'
+              : '⏸️';
       const date = m.completed_at
         ? new Date(m.completed_at).toLocaleDateString('en-US', {
             month: 'short',
