@@ -6,15 +6,22 @@
  * Commands: /pause, /resume, /status, /approve, /reject, /quota
  */
 
+import { execSync } from 'child_process';
 import fs from 'fs';
+import http from 'http';
 import path from 'path';
 
 import { getPauseStatus, resumeGroup } from './auto-pause.js';
 import {
   ATLAS_STATE_DIR,
   ATLAS_OPS_DIR,
+  BRIDGE_CALLBACK_PORT,
   TELEGRAM_CEO_USER_ID,
 } from './config.js';
+import {
+  CONTAINER_RUNTIME_BIN,
+  stopContainer,
+} from './container-runtime.js';
 import {
   createMission,
   createMissionRole,
@@ -684,7 +691,7 @@ function missionApprove(id?: string): string {
       return `Mission ${mission.id} is ${mission.status}, not proposed.`;
     }
 
-    // Update status to approved — bridge server will pick it up and spawn roles
+    // Flip status in SQLite (single source of truth)
     updateMission(mission.id, {
       status: 'approved',
       approved_at: new Date().toISOString(),
@@ -701,7 +708,68 @@ function missionApprove(id?: string): string {
       'Mission approved via /mission approve',
     );
 
+    // POST full mission+roles to bridge so it can spawn containers
     const roles = getMissionRoles(mission.id);
+    const payload = JSON.stringify({
+      missionId: mission.id,
+      entity: mission.entity,
+      templateType: mission.template_type,
+      title: mission.title,
+      brief: mission.brief || '',
+      correlationId: mission.correlation_id || '',
+      costEstimate: mission.cost_estimate_usd || 0,
+      roles: roles.map((r) => ({
+        name: r.role_name,
+        model: r.model,
+        task: r.task || '',
+      })),
+    });
+
+    const req = http.request(
+      {
+        hostname: '127.0.0.1',
+        port: BRIDGE_CALLBACK_PORT,
+        path: '/mission/approved',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(payload),
+        },
+        timeout: 10000,
+      },
+      (res) => {
+        let body = '';
+        res.on('data', (chunk: Buffer) => {
+          body += chunk.toString();
+        });
+        res.on('end', () => {
+          if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+            logger.info(
+              { missionId: mission.id },
+              'Bridge accepted approved mission',
+            );
+          } else {
+            logger.error(
+              { missionId: mission.id, status: res.statusCode, body },
+              'Bridge rejected approved mission',
+            );
+          }
+        });
+      },
+    );
+
+    req.on('error', (err) => {
+      // Bridge down — log but don't block the approve response.
+      // Bridge can poll for approved missions on restart.
+      logger.error(
+        { missionId: mission.id, error: err.message },
+        'Failed to notify bridge of approved mission — bridge may be down',
+      );
+    });
+
+    req.write(payload);
+    req.end();
+
     return `🚀 Mission approved: ${mission.title}\n\n${roles.length} roles spawning...\n${roles.map((r) => `  🔄 ${r.role_name} (${r.model})`).join('\n')}\n\nTrack: /mission status ${mission.id}`;
   } catch (err) {
     return `Error: ${err}`;
@@ -800,8 +868,33 @@ function missionStop(id?: string): string {
       }
     }
 
-    logger.info({ missionId: mission.id }, 'Mission stopped via /mission stop');
-    return `🛑 Mission stopped: ${mission.title}\nRunning containers will be terminated.`;
+    // Kill running containers for this mission's entity group.
+    // Dispatch groups (atlas_{entity}) are used exclusively for mission containers,
+    // so stopping all containers matching the pattern is safe.
+    let killed = 0;
+    try {
+      const groupPattern = `nanoclaw-atlas_${mission.entity.toLowerCase()}`;
+      const output = execSync(
+        `${CONTAINER_RUNTIME_BIN} ps --filter name=${groupPattern} --format '{{.Names}}'`,
+        { stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf-8', timeout: 10000 },
+      );
+      const containers = output.trim().split('\n').filter(Boolean);
+      for (const name of containers) {
+        try {
+          execSync(stopContainer(name), { stdio: 'pipe', timeout: 15000 });
+          killed++;
+          logger.info({ missionId: mission.id, container: name }, 'Stopped mission container');
+        } catch {
+          // Container may have already exited
+          logger.warn({ missionId: mission.id, container: name }, 'Container already stopped');
+        }
+      }
+    } catch (err) {
+      logger.error({ missionId: mission.id, error: err }, 'Failed to list/stop mission containers');
+    }
+
+    logger.info({ missionId: mission.id, killed }, 'Mission stopped via /mission stop');
+    return `🛑 Mission stopped: ${mission.title}\n${killed} container${killed !== 1 ? 's' : ''} terminated.`;
   } catch (err) {
     return `Error: ${err}`;
   }
