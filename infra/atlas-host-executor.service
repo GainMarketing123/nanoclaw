@@ -20,6 +20,13 @@ SyslogIdentifier=atlas-host-executor
 Environment=HOME=/home/atlas
 Environment=TZ=America/New_York
 Environment=PATH=/usr/local/bin:/usr/bin:/bin:/home/atlas/.local/bin
+# Explicit Atlas state + Nanoclaw repo paths so future User= migrations don't
+# silently re-resolve via the new user's $HOME. host-executor.py reads these
+# at module load with `Path.home() / ...` defaults if unset, so deployments
+# that haven't picked up the new unit (or that haven't run daemon-reload
+# after the unit lands) continue to behave as before.
+Environment=ATLAS_DIR=/home/atlas/.atlas
+Environment=NANOCLAW_DIR=/home/atlas/nanoclaw
 
 # Minimal hardening — claude -p needs broad filesystem access for hooks
 NoNewPrivileges=true

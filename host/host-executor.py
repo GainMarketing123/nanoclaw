@@ -26,16 +26,26 @@ import threading
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 # Paths
-ATLAS_DIR = Path.home() / ".atlas"
+#
+# ATLAS_DIR and NANOCLAW_DIR accept env-var overrides so the service can
+# migrate to a different POSIX user without the path resolution silently
+# changing under it (Path.home() resolves to the running user's $HOME, which
+# becomes a different tree the moment the systemd unit's User= field changes).
+# Defaults preserve historical behavior for laptops and any deployment that
+# hasn't set the env vars yet. Audit doc 1.A.6 condition (b) tracks this
+# decoupling — atlas-command (the live mission-control surface) already
+# uses this pattern; host-executor adopts it here so future user-account
+# migration work doesn't require simultaneous code + deploy changes.
+ATLAS_DIR = Path(os.environ.get("ATLAS_DIR") or str(Path.home() / ".atlas"))
+NANOCLAW_DIR = Path(os.environ.get("NANOCLAW_DIR") or str(Path.home() / "nanoclaw"))
 PENDING_DIR = ATLAS_DIR / "host-tasks" / "pending"
 COMPLETED_DIR = ATLAS_DIR / "host-tasks" / "completed"
 OUTPUTS_DIR = ATLAS_DIR / "host-tasks" / "outputs"
 AUDIT_DIR = ATLAS_DIR / "audit"
-NANOCLAW_DIR = Path.home() / "nanoclaw"
 IPC_DIR = NANOCLAW_DIR / "data" / "ipc" / "atlas_main" / "messages"
 
 # Config
@@ -276,7 +286,14 @@ def start_quality_check_server():
     a separate P0 follow-up — see plans/1-a-6-host-executor-mission-control-audit.md
     section 5.2. Port defaults to 3003 to keep clear of atlas-bridge on 3002.
     """
-    server = HTTPServer(("0.0.0.0", QUALITY_CHECK_PORT), QualityCheckHandler)
+    # ThreadingHTTPServer (not the single-threaded HTTPServer) so concurrent
+    # CEO-facing quality checks don't serialize behind a slow Haiku call.
+    # Cross-review of 0a8adb3 flagged that the single-thread server pinned
+    # other requests behind a 10s _call_haiku, and queued callers hit the
+    # container-side 12s timeout → checkerUnavailable → governance bypass.
+    # Each handler still respects its own per-request timeout (12s container
+    # side, 10s on the Anthropic call).
+    server = ThreadingHTTPServer(("0.0.0.0", QUALITY_CHECK_PORT), QualityCheckHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     log(f"Quality check server started on port {QUALITY_CHECK_PORT}")
@@ -554,7 +571,7 @@ def process_task(task_path: Path) -> None:
         if task.get("type") == "mission":
             try:
                 import sys as _m_sys
-                _m_sys.path.insert(0, str(Path.home() / ".atlas" / "lib"))
+                _m_sys.path.insert(0, str(ATLAS_DIR / "lib"))
                 # SSRF scan on mission prompts
                 import re as _mission_re
                 from ssrf import validate_endpoint_url as _m_validate
@@ -594,7 +611,7 @@ def process_task(task_path: Path) -> None:
         try:
             import re as _re
             import sys as _ssrf_sys
-            _ssrf_sys.path.insert(0, str(Path.home() / ".atlas" / "lib"))
+            _ssrf_sys.path.insert(0, str(ATLAS_DIR / "lib"))
             from ssrf import validate_endpoint_url
             urls_in_prompt = _re.findall(r'https?://[^\s\"\'<>]+', prompt)
             for url in urls_in_prompt:
@@ -626,7 +643,7 @@ def process_task(task_path: Path) -> None:
         if task_type in ROUTE_ELIGIBLE_TYPES:
             try:
                 import sys as _sys
-                _sys.path.insert(0, str(Path.home() / ".atlas" / "lib"))
+                _sys.path.insert(0, str(ATLAS_DIR / "lib"))
                 from providers import route as atlas_route
                 route_result = atlas_route(task_type, prompt, entity=entity)
                 if route_result.success:
@@ -751,7 +768,7 @@ def process_task(task_path: Path) -> None:
         # --- Performance tracking (GStack adoption #6) ---
         try:
             import sys as _perf_sys
-            _perf_sys.path.insert(0, str(Path.home() / ".atlas" / "lib"))
+            _perf_sys.path.insert(0, str(ATLAS_DIR / "lib"))
             from performance_tracker import track as perf_track
             perf_track("task", task_id, duration_ms / 1000.0, entity=entity, model=model)
         except Exception as e:
