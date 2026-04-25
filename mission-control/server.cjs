@@ -29,42 +29,39 @@ const NANOCLAW_DB = path.join(__dirname, '..', 'store', 'messages.db');
 // --- Basic Auth ---------------------------------------------------------------
 
 // Strip dotenv-style wrapping quotes and trailing inline comments from a
-// .env value. NOT a full dotenv parser (no escape sequences, no multi-line)
-// but it covers the cases that broke real-world setups:
+// .env value. NOT a full dotenv parser (no multi-line, no $VAR expansion)
+// — covers the common operator-typed cases:
 //   MISSION_CONTROL_PASS="secret"           -> 'secret'
 //   MISSION_CONTROL_PASS='secret'           -> 'secret'
 //   MISSION_CONTROL_PASS=secret  # note     -> 'secret'
 //   MISSION_CONTROL_PASS=secret#hashpw      -> 'secret#hashpw'  (no leading space)
 //   MISSION_CONTROL_PASS="secret" # rotated -> 'secret'         (comment after quotes)
 //   MISSION_CONTROL_PASS="abc # def"        -> 'abc # def'      (# inside quotes is literal)
+//   MISSION_CONTROL_PASS="abc\"def"         -> 'abc"def'        (escaped quote unescaped)
+//   MISSION_CONTROL_PASS='o\'connor'        -> "o'connor"       (escaped same-quote)
 //
-// Order of operations matters: if the value starts with a quote, we must
-// find the matching closing quote FIRST and return the inner content
-// verbatim (no comment-stripping inside the quoted region). Only bare
-// unquoted values get the inline-comment trim.
+// On quoted values: walk past `\<quote>` sequences when searching for the
+// closing quote, then unescape `\<quote>` sequences in the returned inner.
+// This matches standard dotenv semantics (and matches what every dotenv
+// library does). Operators using the OPPOSITE quote character don't need
+// to escape (e.g. `'abc"def'` returns `abc"def` directly with no escape).
 function _cleanEnvValue(raw) {
   const v = raw.trim();
   if (v.length >= 2 && (v[0] === '"' || v[0] === "'")) {
     const quoteChar = v[0];
-    // Find the closing quote, skipping past escaped instances (`\"` inside
-    // a double-quoted value, `\'` inside a single-quoted value). Without
-    // this, a value like "abc\"def" would be truncated at the first
-    // internal quote.
     let closingIdx = -1;
     for (let i = 1; i < v.length; i++) {
       if (v[i] === '\\' && v[i + 1] === quoteChar) { i++; continue; }
       if (v[i] === quoteChar) { closingIdx = i; break; }
     }
     if (closingIdx > 0) {
-      // Matched quote pair — return inner content with the same-quote
-      // backslash escapes resolved. Preserves spaces, preserves `#`,
-      // ignores anything after the closing quote (e.g. ` # note`).
+      // Unescape the same-quote backslash sequences inside the matched pair.
+      // Standard dotenv behavior: `\"` inside double-quoted -> `"`.
       const inner = v.slice(1, closingIdx);
       return inner.split('\\' + quoteChar).join(quoteChar);
     }
     // Unbalanced opening quote — fall through to bare-value handling
   }
-  // Bare unquoted value — strip trailing " #..." inline comment
   const commentIdx = v.search(/\s#/);
   if (commentIdx !== -1) {
     return v.slice(0, commentIdx).trimEnd();
@@ -79,13 +76,33 @@ function loadEnvAuth() {
   if (!user || !pass) {
     try {
       const envContent = fs.readFileSync(envPath, 'utf-8');
+      // Two-pass scan so duplicate keys in .env follow last-wins semantics
+      // (standard env-file behavior — supports rotation by appending a new
+      // line). After the scan, process.env still takes precedence over .env
+      // — that order keeps fresh systemd-supplied credentials from being
+      // shadowed by stale .env entries.
+      let envUser, envPass;
       for (const line of envContent.split('\n')) {
         const [key, ...rest] = line.split('=');
         const val = _cleanEnvValue(rest.join('='));
-        if (key.trim() === 'MISSION_CONTROL_USER') user = val;
-        if (key.trim() === 'MISSION_CONTROL_PASS') pass = val;
+        if (key.trim() === 'MISSION_CONTROL_USER') envUser = val;
+        if (key.trim() === 'MISSION_CONTROL_PASS') envPass = val;
       }
-    } catch { /* no .env file — creds remain whatever process.env supplied */ }
+      if (!user && envUser !== undefined) user = envUser;
+      if (!pass && envPass !== undefined) pass = envPass;
+    } catch (err) {
+      // Surface the real I/O / parse error to stderr so a permission denied
+      // or unreadable .env doesn't get misdiagnosed as missing credentials
+      // by the fail-closed gate further down. ENOENT (no .env at all) is
+      // expected and routine — only log unexpected errors.
+      if (err && err.code !== 'ENOENT') {
+        process.stderr.write(
+          `mission-control: .env read failed (${envPath}): ${err.message}\n` +
+          `  Falling through to process-env credentials. If both creds are ` +
+          `unset the fail-closed gate will refuse to start.\n`
+        );
+      }
+    }
   }
   return { user, pass };
 }
