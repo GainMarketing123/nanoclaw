@@ -530,7 +530,11 @@ async function runQuery(
       // into the conversation for one rewrite attempt.
       if (isCeoSession && textResult && !interceptRetried) {
         const qualityResult = await checkResponseQuality(textResult);
-        log(`Quality check: score=${qualityResult.score} pass=${qualityResult.pass} violations=${qualityResult.violations.length}`);
+        // Log the unavailable signal explicitly so an outage of the host-side
+        // checker is visible in container logs even though the response still
+        // ships (per response-interceptor.ts unavailable() sentinel design).
+        const unavailMark = qualityResult.checkerUnavailable ? ' UNAVAILABLE' : '';
+        log(`Quality check: score=${qualityResult.score} pass=${qualityResult.pass} violations=${qualityResult.violations.length}${unavailMark}`);
 
         if (!qualityResult.pass) {
           const criticals = qualityResult.violations.filter(v => v.severity === 'critical');

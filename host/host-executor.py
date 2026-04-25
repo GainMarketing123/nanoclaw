@@ -16,6 +16,7 @@ This runs on the VPS host (not in a container) so full Python hooks fire.
 Systemd service: atlas-host-executor.service
 """
 
+import hmac
 import json
 import os
 import subprocess
@@ -82,6 +83,37 @@ def _load_anthropic_api_key() -> str:
     except FileNotFoundError:
         pass
     return ""
+
+
+def _load_quality_check_token() -> str:
+    """Read QUALITY_CHECK_TOKEN from ~/.atlas/.env.
+
+    File-only by design — the container-side reader has no env-propagation
+    channel, so allowing host-side env-overrides would cause silent host/
+    container mismatches (host endpoint requires the env-token while every
+    container POST sends an empty/old-file token and gets 401, silently
+    disabling the gate). Single source of truth: ~/.atlas/.env.
+
+    Direct-parse is intentional (vs systemd EnvironmentFile=) because
+    git-sync.sh restarts services without daemon-reload, so any new
+    EnvironmentFile= directive would silently fail to apply on first deploy.
+    """
+    env_path = ATLAS_DIR / ".env"
+    try:
+        for line in env_path.read_text().splitlines():
+            if line.startswith("QUALITY_CHECK_TOKEN="):
+                return line.split("=", 1)[1].strip()
+    except (FileNotFoundError, PermissionError, OSError):
+        # Treat any read failure (missing file, permission denied, broken
+        # filesystem) as "no token configured". main() handles the empty-
+        # token case by starting in DEGRADED mode rather than crashing.
+        pass
+    return ""
+
+
+# Loaded once at startup by main(); referenced by QualityCheckHandler.do_POST
+# for constant-time auth comparison. See main() for the fail-closed gate.
+QUALITY_CHECK_TOKEN: str = ""
 
 
 def _call_haiku(response_text: str) -> dict:
@@ -192,6 +224,20 @@ class QualityCheckHandler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
             self.wfile.write(b'{"error": "not found"}')
+            return
+
+        # Bearer-token auth. Constant-time compare against QUALITY_CHECK_TOKEN
+        # (loaded at startup; main() refuses to start if it's missing). The
+        # token is endpoint hardening only — it blocks external callers, not
+        # compromised containers (which can read the token off the .env
+        # mount). Don't log the header value on auth failure.
+        auth_header = self.headers.get("Authorization", "")
+        expected = "Bearer " + QUALITY_CHECK_TOKEN
+        if not QUALITY_CHECK_TOKEN or not hmac.compare_digest(auth_header, expected):
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"error": "unauthorized"}')
             return
 
         try:
@@ -878,12 +924,30 @@ def check_escalations() -> None:
 
 
 def main() -> None:
-    global health_check_attempt
+    global health_check_attempt, QUALITY_CHECK_TOKEN
     log("Atlas Host-Executor starting")
     log(f"  Watching: {PENDING_DIR}")
     log(f"  Output:   {COMPLETED_DIR}")
     log(f"  Escalations: {SHARED_DIR}/*/escalations/")
     log(f"  Timeout:  {TASK_TIMEOUT}s per task")
+
+    # Quality-check token: load best-effort. Unlike the mission-control auth
+    # gate (which guards an exposed dashboard), this token only guards the
+    # /quality-check endpoint — an optional governance feature. The rest of
+    # host-executor (task processing, escalations, auto-push) does not depend
+    # on it. So we DON'T fail-closed at startup; instead, the endpoint itself
+    # returns 401 for every request when the token is empty, which the
+    # container-side callHaiku() gracefully treats as checkerUnavailable
+    # (audit-honest, response still flows). This avoids a service-breaking
+    # regression on hosts that haven't yet provisioned the token.
+    QUALITY_CHECK_TOKEN = _load_quality_check_token()
+    if QUALITY_CHECK_TOKEN:
+        log(f"  Quality check auth: enabled (token len={len(QUALITY_CHECK_TOKEN)})")
+    else:
+        log("  Quality check auth: DEGRADED — QUALITY_CHECK_TOKEN missing from ~/.atlas/.env")
+        log("  Endpoint will 401 every request until token is set. Generate one with:")
+        log("    openssl rand -hex 32")
+        log("  and add it to ~/.atlas/.env as QUALITY_CHECK_TOKEN=<value>, then restart.")
 
     # Start quality check HTTP server (used by container response interceptor)
     try:

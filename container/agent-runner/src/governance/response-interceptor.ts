@@ -21,6 +21,15 @@ export interface QualityCheckResult {
   pass: boolean;
   violations: QualityViolation[];
   score: number; // 0-100, higher = better quality
+
+  // True when the host-side checker was unreachable (transport error, non-200,
+  // JSON parse failure, timeout, or auth failure). Distinguishes "Haiku judged
+  // the content and decided it failed" from "we could not get a judgment". When
+  // true, downstream callers should treat the result as audit-only — the
+  // response still flows through (the index.ts retry loop only fires on
+  // critical violations, and we ship empty violations here intentionally) but
+  // the audit log records that the gate did not actually run.
+  checkerUnavailable?: boolean;
 }
 
 export interface QualityViolation {
@@ -86,6 +95,29 @@ Scoring:
  * - Containers don't have API keys (security: credential proxy handles SDK auth)
  * - Host-executor runs on the VPS host with access to ~/.atlas/.env
  */
+/**
+ * Read QUALITY_CHECK_TOKEN from /home/node/.atlas/.env (the read-only mount
+ * of the host's ~/.atlas/.env). Mirrors the host-side _load_quality_check_token
+ * direct-parse pattern — file-only, no process.env check. The host side is
+ * also file-only by design, so the host endpoint and the container caller
+ * read from the same single source of truth and cannot drift. Cached at
+ * module load — restart the container after rotating the token.
+ */
+function loadQualityCheckToken(): string {
+  const envPath = '/home/node/.atlas/.env';
+  try {
+    const content = fs.readFileSync(envPath, 'utf-8');
+    for (const line of content.split('\n')) {
+      if (line.startsWith('QUALITY_CHECK_TOKEN=')) {
+        return line.slice('QUALITY_CHECK_TOKEN='.length).trim();
+      }
+    }
+  } catch { /* file missing or unreadable — return empty, callHaiku will treat as unavailable */ }
+  return '';
+}
+
+const QUALITY_CHECK_TOKEN = loadQualityCheckToken();
+
 async function callHaiku(responseText: string): Promise<QualityCheckResult> {
   // The host-executor runs a quality-check server on the host. Port 3003
   // (was 3002 historically — moved to avoid colliding with
@@ -102,6 +134,24 @@ async function callHaiku(responseText: string): Promise<QualityCheckResult> {
   const body = JSON.stringify({ response: responseText.slice(0, 4000) });
   const log = (msg: string) => console.error(`[response-interceptor] ${msg}`);
 
+  // Fail-closed sentinel: when the checker is unreachable for ANY reason
+  // (no token, transport error, non-200, JSON parse fail, timeout) we
+  // return pass=false with checkerUnavailable=true and an empty violations
+  // array. Per index.ts:535-545 the empty-violations path means the response
+  // still ships (we don't block CEO replies on infra outages), but the audit
+  // log is honest about whether the gate ran.
+  const unavailable = (score: number): QualityCheckResult => ({
+    pass: false,
+    violations: [],
+    score,
+    checkerUnavailable: true,
+  });
+
+  if (!QUALITY_CHECK_TOKEN) {
+    log('Quality-check token missing — skipping host call (treated as checkerUnavailable)');
+    return unavailable(-5);
+  }
+
   return new Promise((resolve) => {
     const parsed = new URL(url);
     const req = http.request(
@@ -113,6 +163,10 @@ async function callHaiku(responseText: string): Promise<QualityCheckResult> {
         headers: {
           'Content-Type': 'application/json',
           'Content-Length': Buffer.byteLength(body),
+          // Bearer token shared with host-executor's QualityCheckHandler.
+          // Host-side compares with hmac.compare_digest so timing leaks are
+          // avoided. Don't log the header value here or in error paths.
+          'Authorization': `Bearer ${QUALITY_CHECK_TOKEN}`,
         },
         timeout: 12000,
       },
@@ -123,7 +177,7 @@ async function callHaiku(responseText: string): Promise<QualityCheckResult> {
           try {
             if (res.statusCode !== 200) {
               log(`Host quality-check returned ${res.statusCode}: ${data.slice(0, 200)}`);
-              resolve({ pass: true, violations: [], score: -1 });
+              resolve(unavailable(-1));
               return;
             }
             const result = JSON.parse(data);
@@ -148,7 +202,7 @@ async function callHaiku(responseText: string): Promise<QualityCheckResult> {
           } catch (err) {
             log(`Quality-check parse error: ${err instanceof Error ? err.message : String(err)}`);
             log(`Raw response: ${data.slice(0, 300)}`);
-            resolve({ pass: true, violations: [], score: -2 });
+            resolve(unavailable(-2));
           }
         });
       },
@@ -156,13 +210,13 @@ async function callHaiku(responseText: string): Promise<QualityCheckResult> {
 
     req.on('error', (err) => {
       log(`Quality-check network error: ${err.message}`);
-      resolve({ pass: true, violations: [], score: -3 });
+      resolve(unavailable(-3));
     });
 
     req.on('timeout', () => {
       log('Quality-check timed out (12s)');
       req.destroy();
-      resolve({ pass: true, violations: [], score: -4 });
+      resolve(unavailable(-4));
     });
 
     req.write(body);
