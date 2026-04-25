@@ -11,6 +11,10 @@ WorkingDirectory=/home/atlas/nanoclaw
 ExecStart=/usr/bin/node /home/atlas/nanoclaw/mission-control/server.cjs
 Restart=on-failure
 RestartSec=10
+# Exit code 2 means "missing credentials" (server.cjs fail-closed path).
+# Don't restart in a tight loop — leave the unit failed so journalctl shows
+# one clean error instead of a spam of identical exits every 10 seconds.
+RestartPreventExitStatus=2
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=atlas-mission-control
@@ -19,6 +23,14 @@ SyslogIdentifier=atlas-mission-control
 Environment=HOME=/home/atlas
 Environment=TZ=America/New_York
 Environment=MC_PORT=8080
+
+# Load /home/atlas/nanoclaw/.env if present so MISSION_CONTROL_USER and
+# MISSION_CONTROL_PASS reach the service. The leading `-` makes systemd
+# tolerate a missing file (server.cjs also has a second .env-read fallback).
+# server.cjs is fail-closed — it refuses to start if either credential is
+# unset, so the dashboard will not run insecurely even if both load paths
+# come up empty.
+EnvironmentFile=-/home/atlas/nanoclaw/.env
 
 [Install]
 WantedBy=multi-user.target

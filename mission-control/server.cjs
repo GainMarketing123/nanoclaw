@@ -41,16 +41,28 @@ function loadEnvAuth() {
         if (key.trim() === 'MISSION_CONTROL_USER') user = val;
         if (key.trim() === 'MISSION_CONTROL_PASS') pass = val;
       }
-    } catch { /* no .env -- auth disabled */ }
+    } catch { /* no .env file — creds remain whatever process.env supplied */ }
   }
   return { user, pass };
 }
 
 const AUTH = loadEnvAuth();
-const AUTH_ENABLED = !!(AUTH.user && AUTH.pass);
+
+// Fail-closed: refuse to start without credentials. The historical behavior
+// silently disabled auth when MISSION_CONTROL_USER or MISSION_CONTROL_PASS
+// failed to load, which combined with the 0.0.0.0 listener exposed the full
+// dashboard (and ~/.atlas state it surfaces) to every host that could reach
+// MC_PORT. Surfaced as P0 must-fix-now item 5.3 in the 1.A.6 audit doc.
+if (!AUTH.user || !AUTH.pass) {
+  process.stderr.write(
+    'mission-control: refusing to start — MISSION_CONTROL_USER and ' +
+    'MISSION_CONTROL_PASS must both be set (via process env or .env). ' +
+    'Auth-disabled mode was removed; set credentials and retry.\n'
+  );
+  process.exit(2);
+}
 
 function checkAuth(req, res) {
-  if (!AUTH_ENABLED) return true;
   const header = req.headers['authorization'];
   if (!header || !header.startsWith('Basic ')) {
     res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="Atlas Mission Control"' });
@@ -936,7 +948,7 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`Atlas Mission Control v2 at http://0.0.0.0:${PORT}`);
-  console.log(`  Auth: ${AUTH_ENABLED ? 'enabled' : 'DISABLED'}`);
+  console.log(`  Auth: enabled (HTTP Basic, fail-closed)`);
   console.log(`  Database: ${NANOCLAW_DB}`);
   console.log(`  Atlas dir: ${ATLAS_DIR}`);
 });
