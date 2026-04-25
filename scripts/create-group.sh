@@ -55,6 +55,19 @@ while [[ $# -gt 0 ]]; do
 done
 
 # --- Validate ---
+# Reject --context-transfer up front so that a flag whose feature is currently
+# disabled never produces partially-applied onboarding state. See the long
+# comment block at Step 6 below for the architectural backstory and the
+# documented re-enable paths.
+if $CONTEXT_TRANSFER; then
+  echo "Error: --context-transfer is currently DISABLED pending architectural redesign." >&2
+  echo "  See scripts/create-group.sh Step 6 comment block for re-enable options" >&2
+  echo "  (container-runner route, host-side Python script, or .gitignore allowlist +" >&2
+  echo "  in-worktree commit). Re-run without --context-transfer to onboard the group" >&2
+  echo "  cleanly without context transfer." >&2
+  exit 2
+fi
+
 if [[ -z "$NAME" || -z "$FOLDER" || -z "$DEPARTMENT" || -z "$ENTITY" || -z "$JID" ]]; then
   echo "Error: --name, --folder, --department, --entity, and --jid are required"
   echo ""
@@ -276,52 +289,41 @@ echo "Step 5: Clearing stale sessions..."
 sqlite3 "${DB_PATH}" "DELETE FROM sessions WHERE group_folder = '${FOLDER}';"
 echo "  Cleared sessions for ${FOLDER}"
 
-# --- Step 6: Context transfer (optional) ---
-if $CONTEXT_TRANSFER; then
-  echo "Step 6: Running context transfer..."
-
-  TRANSFER_PROMPT="You are Atlas running a context transfer for the new '${NAME}' group (${DEPARTMENT} department, ${ENTITY_DISP} entity).
-
-Scan these sources for information relevant to ${DEPARTMENT}:
-1. /home/node/.atlas/memory/ — all entity memory files (read-only mount of ~/.atlas)
-2. /workspace/group/conversations/ — past conversation archives
-3. /workspace/extra/shared/ — existing shared workspace content
-
-Extract and write to /workspace/extra/shared/${DEPARTMENT}/:
-- directives/ — any CEO decisions relevant to ${DEPARTMENT} (one file per decision)
-- context.md — comprehensive briefing covering active projects, strategies, preferences
-
-REDACT from output: financial figures, acquisition terms, HR details, legal matters.
-Format each file as markdown. Include dates. Be comprehensive but concise.
-If you find nothing relevant, write a minimal context.md noting that."
-
-  # Write transfer task to host-executor pending
-  python3 -c "
-import json, uuid
-from pathlib import Path
-from datetime import datetime, timezone
-
-task = {
-    'task_id': str(uuid.uuid4()),
-    'project_dir': '${NANOCLAW_DIR}',
-    'entity': '${ENTITY}',
-    'prompt': '''${TRANSFER_PROMPT}''',
-    'tier': 1,
-    'model': 'sonnet',
-    'callback_group': 'atlas_main',
-    'requested_at': datetime.now(timezone.utc).isoformat()
-}
-
-pending_dir = Path('${ATLAS_DIR}/host-tasks/pending')
-pending_dir.mkdir(parents=True, exist_ok=True)
-task_path = pending_dir / f'{task[\"task_id\"]}.json'
-task_path.write_text(json.dumps(task, indent=2))
-print(f'  Context transfer task queued: {task[\"task_id\"]}')
-print(f'  Host-executor will process it in the background.')
-"
-else
-  echo "Step 6: Context transfer skipped (use --context-transfer to enable)"
-fi
+# --- Step 6: Context transfer (DISABLED — architectural redesign required) ---
+#
+# The --context-transfer flag is intentionally a no-op as of 2026-04-25.
+#
+# Background: the original prompt was written assuming container execution
+# (mounts at /workspace/extra/, /home/node/.atlas, etc.), but the task is
+# dispatched to host-executor.py which runs `claude -p` on the VPS HOST with
+# cwd=project_dir. Multiple architectural mismatches surfaced in cross-model
+# review and prevent a clean fix without re-architecting either the prompt
+# delivery channel or the output surfacing mechanism:
+#   1. Container paths do not exist on the host (/home/node/..., /workspace/...).
+#   2. Tier-1 read-only tools cannot satisfy a prompt that requires writes.
+#   3. The repo's .gitignore excludes groups/<folder>/* (everything except a
+#      tiny CLAUDE.md allowlist), so any in-repo output cannot be committed
+#      and surfaced via host-executor's auto-push pipeline.
+#   4. host-executor's merge_worktree_branches() only merges COMMITTED files,
+#      so outputs that aren't explicitly committed inside the worktree are
+#      lost when the worktree is pruned.
+#
+# To re-enable, choose one of:
+#   (A) Route context-transfer through the container runner so the original
+#       container-mount paths resolve, and write outputs to
+#       /workspace/extra/shared/${DEPARTMENT}/ which is a real bind mount.
+#   (B) Replace the claude-driven prompt with a pure host-side Python script
+#       that reads ~/.atlas/memory/ and writes ~/.atlas/shared/${DEPARTMENT}/
+#       directly. No subprocess, no worktree, no merge.
+#   (C) Add an explicit instruction to commit outputs inside the worktree,
+#       allowlist groups/${FOLDER}/context-transfer/ in .gitignore, and have
+#       the operator pull from main after the auto-push completes. This is
+#       the most invasive option.
+#
+# Tracked as a follow-up roadmap item.
+# NOTE: $CONTEXT_TRANSFER is always false here because --context-transfer is
+# rejected up front in the validation block at the top of the script.
+echo "Step 6: Context transfer skipped (--context-transfer is currently disabled — see comment block above)"
 
 # --- Step 7: Restart NanoClaw ---
 echo "Step 7: Restarting NanoClaw..."
