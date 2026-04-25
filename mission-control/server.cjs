@@ -28,6 +28,50 @@ const NANOCLAW_DB = path.join(__dirname, '..', 'store', 'messages.db');
 
 // --- Basic Auth ---------------------------------------------------------------
 
+// Strip dotenv-style wrapping quotes and trailing inline comments from a
+// .env value. NOT a full dotenv parser (no escape sequences, no multi-line)
+// but it covers the cases that broke real-world setups:
+//   MISSION_CONTROL_PASS="secret"           -> 'secret'
+//   MISSION_CONTROL_PASS='secret'           -> 'secret'
+//   MISSION_CONTROL_PASS=secret  # note     -> 'secret'
+//   MISSION_CONTROL_PASS=secret#hashpw      -> 'secret#hashpw'  (no leading space)
+//   MISSION_CONTROL_PASS="secret" # rotated -> 'secret'         (comment after quotes)
+//   MISSION_CONTROL_PASS="abc # def"        -> 'abc # def'      (# inside quotes is literal)
+//
+// Order of operations matters: if the value starts with a quote, we must
+// find the matching closing quote FIRST and return the inner content
+// verbatim (no comment-stripping inside the quoted region). Only bare
+// unquoted values get the inline-comment trim.
+function _cleanEnvValue(raw) {
+  const v = raw.trim();
+  if (v.length >= 2 && (v[0] === '"' || v[0] === "'")) {
+    const quoteChar = v[0];
+    // Find the closing quote, skipping past escaped instances (`\"` inside
+    // a double-quoted value, `\'` inside a single-quoted value). Without
+    // this, a value like "abc\"def" would be truncated at the first
+    // internal quote.
+    let closingIdx = -1;
+    for (let i = 1; i < v.length; i++) {
+      if (v[i] === '\\' && v[i + 1] === quoteChar) { i++; continue; }
+      if (v[i] === quoteChar) { closingIdx = i; break; }
+    }
+    if (closingIdx > 0) {
+      // Matched quote pair — return inner content with the same-quote
+      // backslash escapes resolved. Preserves spaces, preserves `#`,
+      // ignores anything after the closing quote (e.g. ` # note`).
+      const inner = v.slice(1, closingIdx);
+      return inner.split('\\' + quoteChar).join(quoteChar);
+    }
+    // Unbalanced opening quote — fall through to bare-value handling
+  }
+  // Bare unquoted value — strip trailing " #..." inline comment
+  const commentIdx = v.search(/\s#/);
+  if (commentIdx !== -1) {
+    return v.slice(0, commentIdx).trimEnd();
+  }
+  return v;
+}
+
 function loadEnvAuth() {
   const envPath = path.join(__dirname, '..', '.env');
   let user = process.env.MISSION_CONTROL_USER;
@@ -37,7 +81,7 @@ function loadEnvAuth() {
       const envContent = fs.readFileSync(envPath, 'utf-8');
       for (const line of envContent.split('\n')) {
         const [key, ...rest] = line.split('=');
-        const val = rest.join('=').trim();
+        const val = _cleanEnvValue(rest.join('='));
         if (key.trim() === 'MISSION_CONTROL_USER') user = val;
         if (key.trim() === 'MISSION_CONTROL_PASS') pass = val;
       }
