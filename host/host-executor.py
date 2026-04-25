@@ -54,7 +54,13 @@ outage_started_at = 0.0
 outage_alert_sent = False
 HEALTH_CHECK_BACKOFF = [30, 60, 120, 300]  # seconds: 30s → 1m → 2m → 5m cap
 health_check_attempt = 0
-QUALITY_CHECK_PORT = 3002
+# Port for the quality-check HTTP server (containers POST here for Haiku grading).
+# Hardcoded 3003 to avoid colliding with atlas-bridge.service which owns
+# 127.0.0.1:3002. Must stay in lockstep with the container-side constant in
+# container/agent-runner/src/governance/response-interceptor.ts — there is no
+# config channel to propagate an override into containers, so changing this
+# constant requires editing both files in the same commit.
+QUALITY_CHECK_PORT = 3003
 
 
 # --- Quality Check HTTP Server ---
@@ -217,7 +223,13 @@ class QualityCheckHandler(BaseHTTPRequestHandler):
 
 
 def start_quality_check_server():
-    """Start the quality check HTTP server in a background thread."""
+    """Start the quality check HTTP server in a background thread.
+
+    Binds 0.0.0.0 so containers can reach the host via the docker host gateway
+    (host.docker.internal / 172.17.0.1). Auth on the endpoint is tracked as
+    a separate P0 follow-up — see plans/1-a-6-host-executor-mission-control-audit.md
+    section 5.2. Port defaults to 3003 to keep clear of atlas-bridge on 3002.
+    """
     server = HTTPServer(("0.0.0.0", QUALITY_CHECK_PORT), QualityCheckHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()

@@ -87,10 +87,16 @@ Scoring:
  * - Host-executor runs on the VPS host with access to ~/.atlas/.env
  */
 async function callHaiku(responseText: string): Promise<QualityCheckResult> {
-  // The host-executor runs a quality-check server on port 3002.
-  // Containers reach the host via host.docker.internal.
+  // The host-executor runs a quality-check server on the host. Port 3003
+  // (was 3002 historically — moved to avoid colliding with
+  // atlas-bridge.service which now owns 127.0.0.1:3002 on the VPS).
+  // Hardcoded to keep the host and container constants in lockstep — no
+  // env-var propagation channel into containers exists today. Changing
+  // this number requires editing host/host-executor.py too.
+  // Containers reach the host via host.docker.internal (or the docker
+  // bridge IP on Linux).
   const hostGateway = process.env.CONTAINER_HOST_GATEWAY || 'host.docker.internal';
-  const port = 3002;
+  const port = 3003;
   const url = `http://${hostGateway}:${port}/quality-check`;
 
   const body = JSON.stringify({ response: responseText.slice(0, 4000) });
