@@ -47,6 +47,56 @@ const DEFAULT_BLOCKED_PATTERNS = [
 ];
 
 /**
+ * Container paths reserved for Atlas internals.
+ * Any user-supplied mount whose containerPath equals, contains, or is contained
+ * by one of these is rejected — remounting these would shadow the host-task
+ * IPC surface that the orchestrator depends on.
+ */
+const RESERVED_CONTAINER_PATHS = [
+  'atlas-state',
+  'atlas-state/host-tasks',
+] as const;
+
+/**
+ * Normalize a container-relative POSIX path for collision comparison.
+ * Collapses repeated slashes, resolves "." segments, and strips trailing
+ * slashes so equivalent inputs ("foo", "foo/", "./foo", "foo//") compare equal.
+ * Assumes isValidContainerPath has already rejected absolute paths and "..".
+ */
+function _normalizeContainerPath(p: string): string {
+  const normalized = path.posix.normalize(p);
+  if (normalized.length > 1 && normalized.endsWith('/')) {
+    return normalized.slice(0, -1);
+  }
+  return normalized;
+}
+
+/**
+ * Determine whether a user-supplied container path collides with a
+ * reserved system path. Returns the offending reserved path, or null.
+ *
+ * A collision occurs when the user mount's subtree overlaps with a
+ * reserved subtree under /workspace/extra/. That includes:
+ *  - exact match
+ *  - user path is descendant of reserved (would mount inside it)
+ *  - reserved path is descendant of user (user mount would shadow it)
+ *  - user mount is "." (root-of-extra, shadows everything)
+ */
+function collidesWithReservedPath(userPath: string): string | null {
+  const normalized = _normalizeContainerPath(userPath);
+  if (normalized === '.') {
+    return RESERVED_CONTAINER_PATHS[0];
+  }
+  for (const reserved of RESERVED_CONTAINER_PATHS) {
+    const normReserved = _normalizeContainerPath(reserved);
+    if (normalized === normReserved) return reserved;
+    if (normalized.startsWith(normReserved + '/')) return reserved;
+    if (normReserved.startsWith(normalized + '/')) return reserved;
+  }
+  return null;
+}
+
+/**
  * Load the mount allowlist from the external config location.
  * Returns null if the file doesn't exist or is invalid.
  * Result is cached in memory for the lifetime of the process.
@@ -252,6 +302,17 @@ export function validateMount(
     return {
       allowed: false,
       reason: `Invalid container path: "${containerPath}" - must be relative, non-empty, and not contain ".."`,
+    };
+  }
+
+  // Block collisions with system-reserved container paths (e.g. atlas-state).
+  // These are mounted by the orchestrator itself; a user mount overlapping them
+  // would shadow the host-task IPC surface.
+  const reservedCollision = collidesWithReservedPath(containerPath);
+  if (reservedCollision !== null) {
+    return {
+      allowed: false,
+      reason: `Container path "${containerPath}" collides with reserved system path "${reservedCollision}" — this path is used by Atlas internals and cannot be remounted`,
     };
   }
 

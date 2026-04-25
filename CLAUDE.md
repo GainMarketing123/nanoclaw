@@ -30,6 +30,7 @@ Mission control redesign (v2.0.0): bridge-first architecture with SQLite state f
 | `src/db.ts` | SQLite operations |
 | `host/host-executor.py` | VPS host bridge: watches pending tasks, runs `claude -p`, auto-pushes commits |
 | `mission-control/server.cjs` | CEO glance dashboard (server-rendered HTML, basic auth, auto-refresh) |
+| `DESIGN.md` | Atlas Command cockpit design system (Sprint 1P.5) — typography, color, layout source of truth |
 | `git-sync.sh` | VPS sync: pull updates, restart services on changes |
 | `groups/{name}/CLAUDE.md` | Per-group memory (isolated) |
 | `container/agent-runner/src/governance/` | Governance module: quota, tier-gate, canary, audit, response interceptor |

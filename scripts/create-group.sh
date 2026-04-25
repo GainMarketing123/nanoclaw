@@ -180,6 +180,16 @@ fi
 
 # Build container config JSON with proper mounts
 # Staff groups: department directives/briefs RO, updates/escalations RW
+#
+# NOTE: The 'atlas-state' container path is reserved for the orchestrator's
+# per-group writable governance directory (see container-runner.ts — govStateDir
+# at /workspace/extra/atlas-state) and the read-only ~/.atlas surface mounted at
+# /home/node/.atlas. Adding an additionalMount with containerPath 'atlas-state'
+# (or any path that overlaps it) is rejected by mount-security.ts and would
+# silently drop at runtime. This script intentionally does NOT generate that
+# mount anymore — the be97e23 migration moved governance state into a per-group
+# isolated directory specifically to keep groups from sharing write access to
+# the control plane.
 python3 -c "
 import sqlite3, json, sys
 
@@ -188,11 +198,6 @@ db = sqlite3.connect('${DB_PATH}')
 # Build container config with shared workspace mounts
 config = {
     'additionalMounts': [
-        {
-            'hostPath': '${ATLAS_DIR}',
-            'containerPath': 'atlas-state',
-            'readonly': False
-        },
         {
             'hostPath': '${DEPT_SHARED}',
             'containerPath': 'shared/${DEPARTMENT}',
@@ -278,7 +283,7 @@ if $CONTEXT_TRANSFER; then
   TRANSFER_PROMPT="You are Atlas running a context transfer for the new '${NAME}' group (${DEPARTMENT} department, ${ENTITY_DISP} entity).
 
 Scan these sources for information relevant to ${DEPARTMENT}:
-1. /workspace/extra/atlas-state/memory/ — all entity memory files
+1. /home/node/.atlas/memory/ — all entity memory files (read-only mount of ~/.atlas)
 2. /workspace/group/conversations/ — past conversation archives
 3. /workspace/extra/shared/ — existing shared workspace content
 
