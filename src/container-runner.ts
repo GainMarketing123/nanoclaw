@@ -99,6 +99,22 @@ interface MissionCallback {
 function notifyBridgeCallback(callback: MissionCallback): void {
   const payload = JSON.stringify(callback);
 
+  // Codex round-3 on 4d6e9fe finding 1 (SOFT, concurrency): use ONE terminal-
+  // state guard for ALL paths (success, non-2xx, error, timeout). Pre-fix the
+  // round-2 spoolOnce dedup only covered error/timeout; the success path
+  // logged-and-returned without marking settled, so a 2xx-headers-then-stall
+  // sequence let the timeout event fire later and double-spool the callback —
+  // bridge would see the same role-completion delivered + replayed from the
+  // spool. Plus the response body was never drained, so Node's http client
+  // could leave the request in a half-settled state where timeout fires
+  // even though headers + 2xx already arrived.
+  let terminal = false;
+  const enterTerminal = (action: () => void) => {
+    if (terminal) return;
+    terminal = true;
+    action();
+  };
+
   const req = http.request(
     {
       hostname: '127.0.0.1',
@@ -112,48 +128,63 @@ function notifyBridgeCallback(callback: MissionCallback): void {
       timeout: 5000,
     },
     (res) => {
-      if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
-        logger.info(
-          { missionId: callback.missionId, role: callback.role },
-          'Bridge callback delivered',
-        );
-      } else {
-        logger.warn(
-          { missionId: callback.missionId, status: res.statusCode },
-          'Bridge callback rejected, spooling for retry',
-        );
-        spoolCallback(callback);
-      }
+      // Drain body so Node fully settles the request (otherwise timeout can
+      // still fire even after a 2xx response arrives, per round-3 finding).
+      res.resume();
+      res.on('end', () => {
+        enterTerminal(() => {
+          if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+            logger.info(
+              { missionId: callback.missionId, role: callback.role },
+              'Bridge callback delivered',
+            );
+          } else {
+            logger.warn(
+              {
+                missionId: callback.missionId,
+                role: callback.role,
+                status: res.statusCode,
+              },
+              'Bridge callback rejected (non-2xx), spooling for retry',
+            );
+            spoolCallback(callback);
+          }
+        });
+      });
+      res.on('error', () => {
+        enterTerminal(() => {
+          logger.warn(
+            { missionId: callback.missionId, role: callback.role },
+            'Bridge response stream errored, spooling for retry',
+          );
+          spoolCallback(callback);
+        });
+      });
     },
   );
 
-  // Spool exactly once even if multiple failure paths fire (e.g. timeout
-  // followed by error). Without dedup, a slow-then-rejected bridge could
-  // double-spool the callback.
-  let spooled = false;
-  const spoolOnce = (reason: string) => {
-    if (spooled) return;
-    spooled = true;
-    logger.warn(
-      { missionId: callback.missionId, role: callback.role, reason },
-      'Bridge callback spooled for retry',
-    );
-    spoolCallback(callback);
-  };
-
   req.on('error', () => {
-    spoolOnce('error');
+    enterTerminal(() => {
+      logger.warn(
+        { missionId: callback.missionId, role: callback.role },
+        'Bridge unreachable, spooling callback for retry',
+      );
+      spoolCallback(callback);
+    });
   });
 
-  // Codex round-on-2702076 finding 2 (SOFT): Node http request `timeout`
-  // option fires the `timeout` event but does NOT auto-error or destroy the
-  // request. If the bridge accepts TCP but never responds, without this
-  // handler the request hangs, the callback is neither delivered nor
-  // persisted, and sockets accumulate. Destroying the request synthesizes an
-  // error event which routes through error handler; spoolOnce dedups so the
-  // callback is persisted exactly once across timeout + subsequent error.
+  // Codex round-on-2702076 finding 2 (SOFT): Node http `timeout` option fires
+  // the `timeout` event but does NOT auto-destroy or call error. We destroy
+  // the request to free the socket; enterTerminal+the body-drain above
+  // jointly prevent double-action.
   req.on('timeout', () => {
-    spoolOnce('timeout');
+    enterTerminal(() => {
+      logger.warn(
+        { missionId: callback.missionId, role: callback.role },
+        'Bridge callback timed out, spooling for retry',
+      );
+      spoolCallback(callback);
+    });
     req.destroy(new Error('bridge callback timeout'));
   });
 
