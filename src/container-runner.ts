@@ -56,6 +56,14 @@ export interface ContainerOutput {
   error?: string;
   /** Path to the container log file, when available (for scope expansion detection) */
   logPath?: string;
+  /**
+   * True when the hard timeout fired and the container had to be reaped.
+   * Codex round-2 on 7447453 finding 2 (SOFT, if_completeness): bridge needs
+   * to distinguish hung-container timeouts from ordinary agent failures so it
+   * can retry-with-longer-timeout / alert separately. The mission callback
+   * status='timeout' value depends on this flag being threaded through.
+   */
+  timedOut?: boolean;
 }
 
 interface VolumeMount {
@@ -241,10 +249,7 @@ function rewriteHookCommand(command: string): string {
       /[A-Za-z]:[\\/][^"'\s]*[\\/]\.atlas[\\/]lib[\\/]/g,
       '/home/node/.atlas/lib/',
     )
-    .replace(
-      /[A-Za-z]:[\\/][^"'\s]*[\\/]\.claude[\\/]/g,
-      '/home/node/.claude/',
-    )
+    .replace(/[A-Za-z]:[\\/][^"'\s]*[\\/]\.claude[\\/]/g, '/home/node/.claude/')
     // Linux host paths: /home/<user>/.atlas/hooks/ → /home/node/.atlas/hooks/
     .replace(/\/home\/[^/]+\/\.atlas\/hooks\//g, '/home/node/.atlas/hooks/')
     .replace(/\/home\/[^/]+\/\.atlas\/lib\//g, '/home/node/.atlas/lib/')
@@ -712,6 +717,17 @@ export async function runContainerAgent(
     let newSessionId: string | undefined;
     let outputChain = Promise.resolve();
 
+    // Codex round-2 on 7447453 finding 1 (BLOCKING, concurrency): the round-1
+    // chain-isolation fix swallowed onOutput failures and resolved success
+    // anyway. But onOutput is load-bearing — task-scheduler.ts uses it to send
+    // the streamed result to the user, and index.ts uses it to persist session
+    // IDs via setSession()/deleteSession(). A swallowed failure produces
+    // false-positive success: tasks recorded complete though delivery or
+    // persistence failed. Capture the FIRST callback error in outer scope so
+    // the chain stays alive (subsequent outputs still process) but the close
+    // path can resolve { status: 'error' } reflecting the real outcome.
+    let firstCallbackError: Error | null = null;
+
     container.stdout.on('data', (data) => {
       const chunk = data.toString();
 
@@ -768,9 +784,20 @@ export async function runContainerAgent(
                 try {
                   await onOutput(parsed);
                 } catch (callbackErr) {
+                  // Round-2 fix: capture the FIRST error so the close path
+                  // can resolve { status: 'error' } instead of false-positive
+                  // success. Subsequent callbacks still run (chain stays
+                  // alive), but only the first failure is reported in the
+                  // resolved error message — the rest go to the warn log.
+                  if (!firstCallbackError) {
+                    firstCallbackError =
+                      callbackErr instanceof Error
+                        ? callbackErr
+                        : new Error(String(callbackErr));
+                  }
                   logger.warn(
                     { group: group.name, error: callbackErr },
-                    'onOutput callback threw — chain isolation prevents poisoning',
+                    'onOutput callback threw — captured for close-path error propagation',
                   );
                 }
               })
@@ -869,17 +896,33 @@ export async function runContainerAgent(
             { group: group.name, containerName, duration, code },
             'Container timed out after output (idle cleanup)',
           );
-          // Codex round-on-2702076 finding 1: defense-in-depth .catch so a
-          // rejected outputChain never strands resolve(). Producer-side fix at
-          // L719 already isolates rejections, but the .catch here means even a
-          // future regression cannot re-introduce the hang.
-          outputChain.catch(() => {}).then(() => {
-            resolve({
-              status: 'success',
-              result: null,
-              newSessionId,
+          // Codex round-on-2702076 finding 1 + round-2 on 7447453 finding 1:
+          // defense-in-depth .catch keeps resolve() reachable, AND on
+          // settlement we check firstCallbackError so a swallowed callback
+          // failure (delivery to user, session persistence) propagates as
+          // status:'error' rather than false-positive success.
+          outputChain
+            .catch(() => {})
+            .then(() => {
+              if (firstCallbackError) {
+                logger.error(
+                  { group: group.name, error: firstCallbackError },
+                  'Container completed but onOutput callback failed — propagating as error',
+                );
+                resolve({
+                  status: 'error',
+                  result: null,
+                  newSessionId,
+                  error: `onOutput callback failed: ${firstCallbackError.message}`,
+                });
+              } else {
+                resolve({
+                  status: 'success',
+                  result: null,
+                  newSessionId,
+                });
+              }
             });
-          });
           return;
         }
 
@@ -888,10 +931,14 @@ export async function runContainerAgent(
           'Container timed out with no output',
         );
 
+        // Codex round-2 on 7447453 finding 2: thread timedOut so the bridge
+        // can distinguish hung-container timeouts from ordinary errors and
+        // route to retry-with-longer-timeout / separate alert.
         resolve({
           status: 'error',
           result: null,
           error: `Container timed out after ${configTimeout}ms`,
+          timedOut: true,
         });
         return;
       }
@@ -978,21 +1025,44 @@ export async function runContainerAgent(
 
       // Streaming mode: wait for output chain to settle, return completion marker
       if (onOutput) {
-        // Codex round-on-2702076 finding 1: defense-in-depth .catch — see L719
-        // and L812 fixes. Producer wraps rejections; this guarantees resolve()
-        // even if a future producer-path change re-introduces a poisoned chain.
-        outputChain.catch(() => {}).then(() => {
-          logger.info(
-            { group: group.name, duration, newSessionId },
-            'Container completed (streaming mode)',
-          );
-          resolve({
-            status: 'success',
-            result: null,
-            newSessionId,
-            logPath: logFile,
+        // Codex round-on-2702076 finding 1 + round-2 on 7447453 finding 1:
+        // defense-in-depth .catch keeps resolve() reachable; on settlement we
+        // check firstCallbackError so a swallowed delivery/persistence
+        // failure propagates as status:'error' rather than false-positive
+        // success on the normal close path too.
+        outputChain
+          .catch(() => {})
+          .then(() => {
+            if (firstCallbackError) {
+              logger.error(
+                {
+                  group: group.name,
+                  duration,
+                  newSessionId,
+                  error: firstCallbackError,
+                },
+                'Container completed but onOutput callback failed — propagating as error',
+              );
+              resolve({
+                status: 'error',
+                result: null,
+                newSessionId,
+                error: `onOutput callback failed: ${firstCallbackError.message}`,
+                logPath: logFile,
+              });
+            } else {
+              logger.info(
+                { group: group.name, duration, newSessionId },
+                'Container completed (streaming mode)',
+              );
+              resolve({
+                status: 'success',
+                result: null,
+                newSessionId,
+                logPath: logFile,
+              });
+            }
           });
-        });
         return;
       }
 
@@ -1064,10 +1134,20 @@ export async function runContainerAgent(
   const missionCtx = parseMissionContext(input.prompt);
   if (missionCtx) {
     const duration = Date.now() - startTime;
+    // Codex round-2 on 7447453 finding 2 (SOFT, if_completeness): map the
+    // ContainerOutput.timedOut flag to MissionCallback.status='timeout' so
+    // the bridge can retry hung-container timeouts with a longer deadline /
+    // alert separately. Pre-fix all non-success was collapsed to 'error',
+    // and the declared 'timeout' status enum was never produced.
+    const callbackStatus: 'success' | 'error' | 'timeout' = result.timedOut
+      ? 'timeout'
+      : result.status === 'success'
+        ? 'success'
+        : 'error';
     notifyBridgeCallback({
       missionId: missionCtx.missionId,
       role: missionCtx.role,
-      status: result.status === 'success' ? 'success' : 'error',
+      status: callbackStatus,
       completedAt: new Date().toISOString(),
       error: result.error,
       logPath: result.logPath,
