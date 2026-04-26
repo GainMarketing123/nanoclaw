@@ -128,34 +128,42 @@ function notifyBridgeCallback(callback: MissionCallback): void {
       timeout: 5000,
     },
     (res) => {
-      // Drain body so Node fully settles the request (otherwise timeout can
-      // still fire even after a 2xx response arrives, per round-3 finding).
+      // Codex round-4 on 2891bef finding 1 (SOFT, concurrency): make the
+      // delivery decision on RESPONSE HEADERS, not on body-end. Pre-fix the
+      // round-3 logic gated success on res.on('end'), so a slow-streaming
+      // body could let the 5s request timeout fire BEFORE EOF — bridge had
+      // already received and processed the POST (sent 2xx headers), but our
+      // timeout handler would spool a duplicate. Headers-arrival is the
+      // earliest unambiguous delivery signal; cancel the timeout immediately
+      // and call enterTerminal based on statusCode. Body still drained via
+      // res.resume() so Node frees the socket.
+      req.setTimeout(0);
       res.resume();
-      res.on('end', () => {
-        enterTerminal(() => {
-          if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
-            logger.info(
-              { missionId: callback.missionId, role: callback.role },
-              'Bridge callback delivered',
-            );
-          } else {
-            logger.warn(
-              {
-                missionId: callback.missionId,
-                role: callback.role,
-                status: res.statusCode,
-              },
-              'Bridge callback rejected (non-2xx), spooling for retry',
-            );
-            spoolCallback(callback);
-          }
-        });
+      enterTerminal(() => {
+        if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+          logger.info(
+            { missionId: callback.missionId, role: callback.role },
+            'Bridge callback delivered',
+          );
+        } else {
+          logger.warn(
+            {
+              missionId: callback.missionId,
+              role: callback.role,
+              status: res.statusCode,
+            },
+            'Bridge callback rejected (non-2xx), spooling for retry',
+          );
+          spoolCallback(callback);
+        }
       });
+      // Body-stream errors after the terminal decision are logged but cannot
+      // change delivery outcome (enterTerminal would no-op on a re-entry).
       res.on('error', () => {
         enterTerminal(() => {
           logger.warn(
             { missionId: callback.missionId, role: callback.role },
-            'Bridge response stream errored, spooling for retry',
+            'Bridge response stream errored after headers, spooling for retry',
           );
           spoolCallback(callback);
         });
