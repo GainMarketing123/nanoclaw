@@ -193,9 +193,10 @@ function rewriteHookCommand(command: string): string {
   // Cross-review F1 fix on 3193244: pre-fix the regex was built from the raw
   // backslash string, so Windows operators with ATLAS_DIR set saw rewrites
   // silently no-op — container ran hooks pointing at host-only paths.
-  const overrideRoot = ATLAS_STATE_DIR
-    .replace(/[\\/]+$/, '')
-    .replace(/\\/g, '/');
+  const overrideRoot = ATLAS_STATE_DIR.replace(/[\\/]+$/, '').replace(
+    /\\/g,
+    '/',
+  );
   const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
   // Normalize the COMMAND too: convert backslashes to forward slashes so the
