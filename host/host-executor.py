@@ -159,7 +159,7 @@ QUALITY_CHECK_INFLIGHT_COUNT = 0
 # but NOT alerted — they'd drown legitimate signals.
 ALERT_DEDUP_PATH = ATLAS_DIR / "state" / "quality-check-alert-dedup.json"
 ALERT_DEDUP_LOCK = threading.Lock()
-ALERT_HARD_REASONS = frozenset({"billing", "auth", "token_missing"})
+ALERT_HARD_REASONS = frozenset({"billing", "auth", "token_missing", "prompt_missing"})
 ALERT_SOFT_REASONS = frozenset({"timeout", "network"})
 ALERT_DEDUP_WINDOW_S = 1800   # 30 min
 ALERT_SOFT_THRESHOLD = 3      # consecutive failures
@@ -268,9 +268,16 @@ def _call_haiku(response_text: str) -> dict:
         return _unavailable("token_missing", False, "ANTHROPIC_API_KEY not in ~/.atlas/.env or env")
 
     if not QUALITY_CHECK_PROMPT:
-        # main() refuses to start when the prompt file is missing, so this
-        # branch is defensive only. If we somehow reach here, fail-closed.
-        return _unavailable("api_error", False, "QUALITY_CHECK_PROMPT not loaded — host startup misconfigured")
+        # Host runs in degraded mode when the prompt file is missing/invalid
+        # at startup (codex F2 fix on c839228: don't crash main() on a
+        # missing auxiliary asset). Return the canonical prompt_missing
+        # tri-state response so the container parser routes correctly and
+        # operator alert dedup fires on first hit.
+        return _unavailable(
+            "prompt_missing",
+            False,
+            f"Host prompt file unreadable at {QUALITY_CHECK_PROMPT_PATH}; restore + restart.",
+        )
 
     filled_prompt = QUALITY_CHECK_PROMPT.replace("{RESPONSE}", response_text[:4000])
 
@@ -1143,38 +1150,46 @@ def main() -> None:
         log("    openssl rand -hex 32")
         log("  and add it to ~/.atlas/.env as QUALITY_CHECK_TOKEN=<value>, then restart.")
 
-    # Quality-check prompt: fail-fast if missing. The prompt IS governance
-    # contract — running with a missing/silent-fallback prompt would be a
-    # second long-lived silent bypass mode (codex consult 2026-04-25 R5).
-    # Refuse to start until the file is present in the repo.
+    # Quality-check prompt: degrade THE FEATURE on missing/empty/malformed
+    # prompt — do NOT abort the whole service (codex F2 fix on c839228:
+    # main() must keep the poll loop alive for task processing, escalations,
+    # and auto-pushes; quality-check is one auxiliary feature). Operator
+    # alert via send_telegram_alert + the /quality-check endpoint reports
+    # status=unavailable+reason=prompt_missing on every request until fixed.
     try:
-        QUALITY_CHECK_PROMPT = QUALITY_CHECK_PROMPT_PATH.read_text()
-    except (FileNotFoundError, PermissionError, OSError) as e:
-        log(f"FATAL: Quality-check prompt not loadable from {QUALITY_CHECK_PROMPT_PATH}: {e}")
-        log("Refusing to start. Restore the prompt file in the repo and redeploy.")
-        log("File path is computed from NANOCLAW_DIR. Check that env var or default ~/nanoclaw is correct.")
-        sys.exit(1)
-    if not QUALITY_CHECK_PROMPT.strip():
-        log(f"FATAL: Quality-check prompt at {QUALITY_CHECK_PROMPT_PATH} is empty.")
-        log("Refusing to start. Restore content and redeploy.")
-        sys.exit(1)
-    if "{RESPONSE}" not in QUALITY_CHECK_PROMPT:
-        log(f"FATAL: Quality-check prompt at {QUALITY_CHECK_PROMPT_PATH} missing {{RESPONSE}} placeholder.")
-        log("Refusing to start. Without the placeholder the response text is never injected.")
-        sys.exit(1)
-    QUALITY_CHECK_PROMPT_SHA = hashlib.sha256(QUALITY_CHECK_PROMPT.encode("utf-8")).hexdigest()[:12]
-    log(f"  Quality check prompt: loaded ({len(QUALITY_CHECK_PROMPT)} chars, sha={QUALITY_CHECK_PROMPT_SHA})")
+        prompt_text = QUALITY_CHECK_PROMPT_PATH.read_text()
+        if not prompt_text.strip():
+            raise ValueError("prompt file is empty")
+        if "{RESPONSE}" not in prompt_text:
+            raise ValueError("prompt missing {RESPONSE} placeholder")
+        QUALITY_CHECK_PROMPT = prompt_text
+        QUALITY_CHECK_PROMPT_SHA = hashlib.sha256(QUALITY_CHECK_PROMPT.encode("utf-8")).hexdigest()[:12]
+        log(f"  Quality check prompt: loaded ({len(QUALITY_CHECK_PROMPT)} chars, sha={QUALITY_CHECK_PROMPT_SHA})")
+    except (FileNotFoundError, PermissionError, OSError, ValueError) as e:
+        QUALITY_CHECK_PROMPT = ""  # _call_haiku() returns prompt_missing if empty
+        QUALITY_CHECK_PROMPT_SHA = ""
+        log(f"  Quality check prompt: DEGRADED — {QUALITY_CHECK_PROMPT_PATH} unreadable/invalid: {e}")
+        log("  /quality-check endpoint will return status=unavailable,reason=prompt_missing on every request.")
+        log("  Other host-executor functions (task processing, escalations, auto-push) continue.")
+        try:
+            _maybe_send_operator_alert("prompt_missing", str(e)[:200])
+        except Exception:
+            pass  # alert best-effort
 
-    # Start quality check HTTP server. Bind failure is FATAL — the service
-    # cannot do its job and silently continuing degraded was an existing bug
-    # (host-executor.py:969-973 prior shape: WARNING + continue forever).
+    # Start quality check HTTP server. Bind failure DEGRADES the feature
+    # (containers will see host_unreachable / prompt_missing and report
+    # tri-state unavailable correctly) — main() continues so unrelated
+    # task processing keeps working. Codex F2 on c839228.
     try:
         start_quality_check_server()
     except Exception as e:
-        log(f"FATAL: Quality check server failed to start: {e}")
-        log("Refusing to start. Resolve the bind issue (likely port conflict on "
-            f"{QUALITY_CHECK_PORT}) and redeploy.")
-        sys.exit(1)
+        log(f"  Quality check server: DEGRADED — failed to bind on port {QUALITY_CHECK_PORT}: {e}")
+        log("  Containers will see network-unreachable on /quality-check; tri-state degraded mode handles it.")
+        log("  Resolve the bind issue (likely port conflict) and restart to re-enable quality checks.")
+        try:
+            _maybe_send_operator_alert("network", f"quality-check server bind failed on port {QUALITY_CHECK_PORT}: {e}")
+        except Exception:
+            pass  # alert best-effort
 
     # Ensure directories exist
     for d in [PENDING_DIR, COMPLETED_DIR, OUTPUTS_DIR]:

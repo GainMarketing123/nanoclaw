@@ -73,43 +73,86 @@ export interface InterceptionLog {
 // Bundled prompt path (Dockerfile COPY → /opt/nanoclaw/quality-check-prompt.md).
 // Source-of-truth file lives at container/agent-runner/src/governance/quality-check-prompt.md
 // in the repo. Host-executor reads the SAME file from the repo at startup so
-// host and container are guaranteed to use byte-identical prompt text. If the
-// COPY step is missing from a future Dockerfile rewrite, this module fails fast
-// at load — there is no silent fallback prompt anymore (codex R4: silent
-// fallback was a hidden contract change waiting to happen).
+// host and container are guaranteed to use byte-identical prompt text.
+//
+// LAZY-LOAD pattern (cross-review F1 fix on c839228): module load MUST NOT
+// crash on missing prompt — that would block scheduled-task and non-CEO
+// sessions from running at all even though the quality gate only fires on
+// the CEO path. Instead: cache after first successful read; on read failure,
+// the gate degrades to status='unavailable',reason='prompt_missing' for that
+// request only. Other code paths in the runner are unaffected.
 const QUALITY_CHECK_PROMPT_PATH = '/opt/nanoclaw/quality-check-prompt.md';
-const QUALITY_CHECK_PROMPT = ((): string => {
+
+// State for lazy initialization. Loaded on first checkResponseQuality()
+// call. Both fields are populated together (success path) or both null
+// (failure path; logged once to avoid stderr flood).
+let _qualityCheckPromptCache: string | null = null;
+let _qualityCheckPromptShaCache: string | null = null;
+let _qualityCheckPromptLoadFailed = false;
+
+interface PromptLoadResult {
+  ok: boolean;
+  prompt: string;
+  sha: string;
+  loadError?: string;
+}
+
+function loadQualityCheckPromptOnce(): PromptLoadResult {
+  if (_qualityCheckPromptCache !== null && _qualityCheckPromptShaCache !== null) {
+    return { ok: true, prompt: _qualityCheckPromptCache, sha: _qualityCheckPromptShaCache };
+  }
   let body: string;
   try {
     body = fs.readFileSync(QUALITY_CHECK_PROMPT_PATH, 'utf-8');
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    throw new Error(
-      `[response-interceptor] FATAL: quality-check prompt not found at ${QUALITY_CHECK_PROMPT_PATH}. ` +
-      `Container image is missing the Dockerfile COPY step or the source file was deleted. ` +
-      `Refusing to start. Underlying error: ${msg}`,
-    );
+    if (!_qualityCheckPromptLoadFailed) {
+      _qualityCheckPromptLoadFailed = true;
+      console.error(
+        `[response-interceptor] Quality-check prompt unreadable at ${QUALITY_CHECK_PROMPT_PATH}: ${msg}. ` +
+        `Bundled COPY step missing from Dockerfile or file deleted. ` +
+        `CEO quality checks will report status=unavailable,reason=prompt_missing until restored. ` +
+        `Other agent-runner code paths (scheduled tasks, non-CEO sessions) are unaffected.`,
+      );
+    }
+    return { ok: false, prompt: '', sha: '', loadError: msg };
   }
   if (!body.trim()) {
-    throw new Error(
-      `[response-interceptor] FATAL: quality-check prompt at ${QUALITY_CHECK_PROMPT_PATH} is empty.`,
-    );
+    if (!_qualityCheckPromptLoadFailed) {
+      _qualityCheckPromptLoadFailed = true;
+      console.error(`[response-interceptor] Quality-check prompt at ${QUALITY_CHECK_PROMPT_PATH} is empty.`);
+    }
+    return { ok: false, prompt: '', sha: '', loadError: 'empty' };
   }
   if (!body.includes('{RESPONSE}')) {
-    throw new Error(
-      `[response-interceptor] FATAL: quality-check prompt missing {RESPONSE} placeholder.`,
-    );
+    if (!_qualityCheckPromptLoadFailed) {
+      _qualityCheckPromptLoadFailed = true;
+      console.error(`[response-interceptor] Quality-check prompt missing {RESPONSE} placeholder.`);
+    }
+    return { ok: false, prompt: '', sha: '', loadError: 'missing_placeholder' };
   }
-  return body;
-})();
-// 12-char SHA-256 of the loaded prompt text. Emitted on quality-check audit
-// log lines so a host-vs-container drift (host updated, image not rebuilt) is
-// visible. Compute once at module load to avoid hashing per request.
-const QUALITY_CHECK_PROMPT_SHA = crypto
-  .createHash('sha256')
-  .update(QUALITY_CHECK_PROMPT, 'utf-8')
-  .digest('hex')
-  .slice(0, 12);
+  // Success: cache. SHA is 12-char prefix; emitted on quality-check audit
+  // lines so host-vs-container drift (host updated, image not rebuilt) is
+  // visible without poking at deployed files.
+  _qualityCheckPromptCache = body;
+  _qualityCheckPromptShaCache = crypto
+    .createHash('sha256')
+    .update(body, 'utf-8')
+    .digest('hex')
+    .slice(0, 12);
+  return { ok: true, prompt: _qualityCheckPromptCache, sha: _qualityCheckPromptShaCache };
+}
+
+/**
+ * Best-effort SHA accessor for audit log emission. Returns the cached
+ * SHA-12 if the prompt has been loaded successfully at least once; empty
+ * string otherwise. Never throws — the SHA is observability metadata,
+ * not a routing signal. Pairs with loadQualityCheckPromptOnce()'s lazy
+ * init in checkResponseQuality().
+ */
+function getQualityCheckPromptSha(): string {
+  return _qualityCheckPromptShaCache || '';
+}
 
 /**
  * Call Haiku to evaluate response quality.
@@ -314,7 +357,7 @@ function attemptQualityCheck(
               .filter((v): v is QualityViolation => {
                 return !!v && typeof v === 'object' && typeof (v as QualityViolation).rule === 'string' && typeof (v as QualityViolation).severity === 'string';
               });
-            log(`Haiku evaluated: status=${explicitStatus} score=${score} violations=${violations.length} sha=${QUALITY_CHECK_PROMPT_SHA}`);
+            log(`Haiku evaluated: status=${explicitStatus} score=${score} violations=${violations.length} sha=${getQualityCheckPromptSha()}`);
             resolve({
               result: { status: explicitStatus, score, violations },
               legacy: false,
@@ -325,7 +368,7 @@ function attemptQualityCheck(
             const reason = (typeof obj.reason === 'string' ? obj.reason : 'api_error') as UnavailableReason;
             const retryable = !!obj.retryable;
             const detail = typeof obj.detail === 'string' ? obj.detail : '';
-            log(`Host quality-check UNAVAILABLE: reason=${reason} retryable=${retryable} detail=${detail.slice(0, 200)} sha=${QUALITY_CHECK_PROMPT_SHA}`);
+            log(`Host quality-check UNAVAILABLE: reason=${reason} retryable=${retryable} detail=${detail.slice(0, 200)} sha=${getQualityCheckPromptSha()}`);
             resolve({
               result: { status: 'unavailable', reason, retryable, detail },
               legacy: false,
@@ -516,6 +559,22 @@ export async function checkResponseQuality(
     return { status: 'pass', score: 90, violations: [] };
   }
 
+  // Lazy load + validate the bundled prompt before the Haiku call. On
+  // first invocation: read /opt/nanoclaw/quality-check-prompt.md, cache,
+  // emit SHA-12 for audit. On failure: degrade THIS request to
+  // status='unavailable',reason='prompt_missing' (codex F1 fix on c839228).
+  // Critical: this only degrades the gate; scheduled tasks and non-CEO
+  // sessions never enter checkResponseQuality so they keep running normally.
+  const promptLoad = loadQualityCheckPromptOnce();
+  if (!promptLoad.ok) {
+    return {
+      status: 'unavailable',
+      reason: 'prompt_missing',
+      retryable: false,
+      detail: `Bundled quality-check prompt unreadable in container image: ${promptLoad.loadError || 'unknown'}`,
+    };
+  }
+
   return callHaiku(responseText);
 }
 
@@ -574,7 +633,7 @@ export function logInterceptionResult(
     reasonCoarse: coarseReason(originalResult),
     lintTriggered: audit?.lintTriggered ?? 'none',
     lintFired: audit?.lintFired ?? [],
-    promptSha: QUALITY_CHECK_PROMPT_SHA,
+    promptSha: getQualityCheckPromptSha(),
   });
 }
 
