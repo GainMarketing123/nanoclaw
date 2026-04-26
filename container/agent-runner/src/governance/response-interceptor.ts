@@ -258,9 +258,31 @@ function attemptQualityCheck(
             });
             return;
           }
-          // Any other non-200 is a transport-level fault; classify as network.
+          // Any other non-200: try to parse a tri-state body before falling
+          // back to a generic network classification. Host wraps handler
+          // exceptions in `{status:"unavailable", reason:"api_error", ...}`
+          // inside HTTP 500 (host-executor.py:444-451). Cross-review F2 on
+          // 1672f4c: prior code never parsed those bodies, so internal host
+          // faults were misclassified as `network/retryable` and spuriously
+          // retried. Fix: parse body if it looks like tri-state, regardless
+          // of status code; HTTP code is secondary signal.
           if (res.statusCode !== 200) {
             log(`Host quality-check returned ${res.statusCode}: ${data.slice(0, 200)}`);
+            try {
+              const parsedNon200 = JSON.parse(data);
+              if (
+                parsedNon200 &&
+                typeof parsedNon200 === 'object' &&
+                parsedNon200.status === 'unavailable' &&
+                typeof parsedNon200.reason === 'string'
+              ) {
+                resolve({
+                  result: parsedNon200 as QualityCheckResult,
+                  legacy: false,
+                });
+                return;
+              }
+            } catch { /* fall through to canonical network */ }
             resolve({
               result: unavailable('network', true, `Host HTTP ${res.statusCode}`),
               legacy: false,
@@ -366,11 +388,15 @@ function attemptQualityCheck(
 let LEGACY_HOST_WARNED = false;
 
 async function callHaiku(responseText: string): Promise<QualityCheckResult> {
-  // First attempt at 8s. If unavailable+retryable, one retry at 10s after
-  // a 200-300ms jittered delay. Hard cap on total wall <=20s, well inside
-  // the SDK envelope (<30s end-to-end CEO Telegram reply target).
-  // Codex consult R3+R5: original 12s+12s was too tight; 8+10 leaves margin.
-  const attempt1 = await attemptQualityCheck(responseText, 8000);
+  // Timeout ordering MUST satisfy container >= host. Host upstream Haiku
+  // call is 10s (host-executor.py:177). If container abandons earlier
+  // (e.g., 8s), the host keeps the in-flight slot open until its own
+  // timeout — a retry then briefly double-consumes capacity and can
+  // self-trigger HTTP 429 busy. Cross-review F1 on 1672f4c flagged this.
+  // Set container timeouts to host_timeout + 2s slack on both attempts.
+  // First 12s + ~250ms jitter + second 12s = ~24.3s worst case, still
+  // inside the <30s SDK Telegram-reply envelope.
+  const attempt1 = await attemptQualityCheck(responseText, 12000);
   if (attempt1.legacy && !LEGACY_HOST_WARNED) {
     LEGACY_HOST_WARNED = true;
     console.error(
@@ -383,7 +409,8 @@ async function callHaiku(responseText: string): Promise<QualityCheckResult> {
 
   const jitterMs = 200 + Math.floor(Math.random() * 100);
   await new Promise<void>((r) => setTimeout(r, jitterMs));
-  const attempt2 = await attemptQualityCheck(responseText, 10000);
+  // Second attempt also at 12s for the same host-slot-retention reason.
+  const attempt2 = await attemptQualityCheck(responseText, 12000);
   if (attempt2.legacy && !LEGACY_HOST_WARNED) {
     LEGACY_HOST_WARNED = true;
     console.error(

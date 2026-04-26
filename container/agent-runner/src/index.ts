@@ -394,9 +394,14 @@ async function runQuery(
 
   // Response quality interception state
   // Think of these like the copy editor's clipboard — tracking whether
-  // a rewrite was requested and what the original score was
+  // a rewrite was requested and what the original score was. Original
+  // lint result is persisted explicitly so the post-retry audit reflects
+  // the trigger that fired on the ORIGINAL response, not whatever the
+  // rewrite produced (which is usually clean by construction). Cross-review
+  // F3 on 1672f4c flagged the prior pattern (recompute lint on retry text).
   let interceptRetried = false;
   let interceptOriginalResult: QualityCheckResult | null = null;
+  let interceptOriginalLintFired: string[] = [];
 
   // Explicitly load system prompt files and inject into SDK.
   // Order: self-knowledge FIRST (who Atlas is), then global governance, then group persona.
@@ -554,6 +559,7 @@ async function runQuery(
             // see runLocalCriticalLint() comment for FP-safety reasoning.
             interceptRetried = true;
             interceptOriginalResult = qualityResult;
+            interceptOriginalLintFired = lint.fired;
             const correction = buildLocalDegradedCorrection(lint);
             log(`Local lint fired (${lint.fired.join(',')}). Injecting degraded correction prompt for retry.`);
             stream.push(correction);
@@ -603,8 +609,12 @@ async function runQuery(
         } else {
           log(`Retry quality check: status=${retryResult.status} score=${retryResult.score}`);
         }
-        // Determine lint state at the original failure for audit fidelity:
-        // if the retry was triggered by local lint (degraded mode), record it.
+        // Audit fidelity: degraded-mode retries were triggered by lint on
+        // the ORIGINAL response. Use the persisted firing list (set when
+        // the rewrite was scheduled), NOT a recomputation against the
+        // rewritten text — the rewrite is usually clean by construction
+        // and recomputing would silently erase the actual trigger from
+        // the audit log. Cross-review F3 on 1672f4c.
         const wasDegradedRetry = interceptOriginalResult.status === 'unavailable';
         logInterceptionResult(
           containerInput.groupFolder,
@@ -613,12 +623,13 @@ async function runQuery(
           retryResult,
           textResult.length,
           wasDegradedRetry
-            ? { lintTriggered: 'rewrite', lintFired: runLocalCriticalLint(textResult).fired }
+            ? { lintTriggered: 'rewrite', lintFired: interceptOriginalLintFired }
             : { lintTriggered: 'none', lintFired: [] },
         );
         // Reset for next result in this query
         interceptRetried = false;
         interceptOriginalResult = null;
+        interceptOriginalLintFired = [];
       }
 
       writeOutput({
