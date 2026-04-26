@@ -2,7 +2,12 @@ import { ChildProcess, spawnSync } from 'child_process';
 import { CronExpressionParser } from 'cron-parser';
 import fs from 'fs';
 
-import { ASSISTANT_NAME, SCHEDULER_POLL_INTERVAL, TIMEZONE } from './config.js';
+import {
+  ASSISTANT_NAME,
+  ATLAS_STATE_DIR,
+  SCHEDULER_POLL_INTERVAL,
+  TIMEZONE,
+} from './config.js';
 import {
   buildEscalationMessage,
   isGroupPaused,
@@ -298,7 +303,7 @@ function evaluateM2CleanRun(
   error: string | null,
 ): void {
   try {
-    const trackerPath = `${process.env.HOME || '/home/atlas'}/.atlas/lib/autonomy_tracker.py`;
+    const trackerPath = `${ATLAS_STATE_DIR}/lib/autonomy_tracker.py`;
     const args = [
       trackerPath,
       'm2-evaluate',

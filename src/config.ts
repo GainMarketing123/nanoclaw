@@ -83,7 +83,12 @@ export const TIMEZONE =
 
 // Atlas governance state directory (host-level, not mounted into containers)
 // Containers see this at /workspace/extra/atlas-state via mounts
-export const ATLAS_STATE_DIR = path.join(HOME_DIR, '.atlas');
+// ATLAS_DIR env-var override mirrors the Python host-executor pattern (same
+// audit doc 1.A.6 condition (b) decoupling): explicit path config so a future
+// user-account migration can repoint both services without simultaneous code +
+// deploy changes. Defaults to the historical home-relative location.
+export const ATLAS_STATE_DIR =
+  process.env.ATLAS_DIR || path.join(HOME_DIR, '.atlas');
 
 // Atlas Operations directory — bridge, swarm, entities, security
 // Post three-repo split: operations state lives separately from engineering

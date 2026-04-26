@@ -10,6 +10,7 @@ import path from 'path';
 import http from 'http';
 
 import {
+  ATLAS_STATE_DIR,
   BRIDGE_CALLBACK_PORT,
   CONTAINER_IMAGE,
   CONTAINER_MAX_OUTPUT_SIZE,
@@ -18,7 +19,6 @@ import {
   DATA_DIR,
   GROUPS_DIR,
   HOST_CLAUDE_DIR,
-  HOME_DIR,
   IDLE_TIMEOUT,
   TIMEZONE,
 } from './config.js';
@@ -351,7 +351,9 @@ function buildVolumeMounts(
   // queues, session tokens, or bridge config. Per adversarial review (Codex +
   // Claude cross-model consensus): "Remove writable ~/.atlas mounts from
   // containers before adding entity-scoped execution."
-  const atlasDir = path.join(HOME_DIR, '.atlas');
+  // ATLAS_STATE_DIR picks up process.env.ATLAS_DIR override when set, so this
+  // mount follows the same env-driven path as host-executor (1.A.6 decoupling).
+  const atlasDir = ATLAS_STATE_DIR;
   if (fs.existsSync(atlasDir)) {
     mounts.push({
       hostPath: atlasDir,
@@ -374,7 +376,7 @@ function buildVolumeMounts(
   // Writable host-tasks directory — containers can request host-executor work
   // by writing JSON to this directory. Separate mount so the RO ~/.atlas
   // doesn't block host-task delegation.
-  const hostTasksDir = path.join(HOME_DIR, '.atlas', 'host-tasks');
+  const hostTasksDir = path.join(ATLAS_STATE_DIR, 'host-tasks');
   fs.mkdirSync(path.join(hostTasksDir, 'pending'), { recursive: true });
   fs.mkdirSync(path.join(hostTasksDir, 'completed'), { recursive: true });
   mounts.push({
