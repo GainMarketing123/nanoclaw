@@ -184,13 +184,27 @@ function parseMissionContext(
  * non-existent /opt/atlas-state inside the container namespace.
  */
 function rewriteHookCommand(command: string): string {
-  // Build a regex that matches the configured override path. Escape regex
-  // metacharacters in case the path contains characters like '+' or '.'.
-  // Strip trailing slashes so we can append /hooks|/lib explicitly.
-  const overrideRoot = ATLAS_STATE_DIR.replace(/\/+$/, '');
+  // Build a regex that matches the configured override path. Three normalizations:
+  //   1. Strip trailing slashes (forward OR backslash) so we append /hooks|/lib explicitly.
+  //   2. Convert backslashes to forward slashes so a Windows ATLAS_DIR like
+  //      `D:\atlas-state` matches command strings spelled `D:/atlas-state` AND
+  //      `D:\atlas-state` after we normalize the command too.
+  //   3. Escape regex metacharacters so chars like '+' or '.' don't break matching.
+  // Cross-review F1 fix on 3193244: pre-fix the regex was built from the raw
+  // backslash string, so Windows operators with ATLAS_DIR set saw rewrites
+  // silently no-op — container ran hooks pointing at host-only paths.
+  const overrideRoot = ATLAS_STATE_DIR
+    .replace(/[\\/]+$/, '')
+    .replace(/\\/g, '/');
   const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-  let out = command
+  // Normalize the COMMAND too: convert backslashes to forward slashes so the
+  // Windows-style command `python D:\atlas-state\hooks\foo.py` matches
+  // alongside the forward-slashed form. Linux/macOS commands are unaffected
+  // (they don't contain backslashes in path positions).
+  const cmd = command.replace(/\\/g, '/');
+
+  let out = cmd
     // Normalize python → python3 (container has python3, not python)
     .replace(/^python\s/, 'python3 ')
     // Windows paths: C:/Users/xxx/.atlas/hooks/ → /home/node/.atlas/hooks/
@@ -209,11 +223,18 @@ function rewriteHookCommand(command: string): string {
   // than the home-relative default (e.g., the operator set ATLAS_DIR), also
   // map that root to the container's /home/node/.atlas. Skip when the
   // override resolves to an existing /home/<user>/.atlas because the
-  // earlier replace above already covers that case.
+  // earlier replace above already covers that case. Both override AND cmd
+  // are forward-slashed at this point so cross-platform match works.
   if (overrideRoot && !/^\/home\/[^/]+\/\.atlas$/.test(overrideRoot)) {
     out = out
-      .replace(new RegExp(`${escapeRe(overrideRoot)}/hooks/`, 'g'), '/home/node/.atlas/hooks/')
-      .replace(new RegExp(`${escapeRe(overrideRoot)}/lib/`, 'g'), '/home/node/.atlas/lib/');
+      .replace(
+        new RegExp(`${escapeRe(overrideRoot)}/hooks/`, 'g'),
+        '/home/node/.atlas/hooks/',
+      )
+      .replace(
+        new RegExp(`${escapeRe(overrideRoot)}/lib/`, 'g'),
+        '/home/node/.atlas/lib/',
+      );
   }
   return out;
 }

@@ -29,7 +29,20 @@ const PORT = process.env.MC_PORT || 8080;
 // MAJOR CORRECTION). This file is kept current as the in-repo source of
 // truth so any future re-alignment doesn't drift; the live atlas-command
 // has its own equivalent override at lib/atlas-data.ts:15.
-const ATLAS_DIR = process.env.ATLAS_DIR || path.join(require('os').homedir(), '.atlas');
+//
+// HOME resolution mirrors src/config.ts:26-29 — prefer process.env.HOME
+// on non-Windows so service users with explicit $HOME (atlas-svc, atlas-agent)
+// resolve to the shared Atlas account state tree, not the running OS user's
+// home. On Windows, fall back to os.homedir() because $HOME may carry an
+// MSYS-style /c/Users/... that breaks path.join. Cross-review F2 fix on
+// 3193244: previously this file always used os.homedir() while config.ts
+// preferred HOME, so the dashboard could silently read a different state
+// tree from the scheduler/commands when only HOME (not ATLAS_DIR) was set.
+const _HOME_DIR =
+  process.platform !== 'win32' && process.env.HOME
+    ? process.env.HOME
+    : require('os').homedir();
+const ATLAS_DIR = process.env.ATLAS_DIR || path.join(_HOME_DIR, '.atlas');
 const NANOCLAW_DB = path.join(__dirname, '..', 'store', 'messages.db');
 
 // --- Basic Auth ---------------------------------------------------------------
