@@ -119,13 +119,34 @@ function notifyBridgeCallback(callback: MissionCallback): void {
     },
   );
 
-  req.on('error', () => {
-    // Bridge is down — persist for retry
+  // Spool exactly once even if multiple failure paths fire (e.g. timeout
+  // followed by error). Without dedup, a slow-then-rejected bridge could
+  // double-spool the callback.
+  let spooled = false;
+  const spoolOnce = (reason: string) => {
+    if (spooled) return;
+    spooled = true;
     logger.warn(
-      { missionId: callback.missionId, role: callback.role },
-      'Bridge unreachable, spooling callback for retry',
+      { missionId: callback.missionId, role: callback.role, reason },
+      'Bridge callback spooled for retry',
     );
     spoolCallback(callback);
+  };
+
+  req.on('error', () => {
+    spoolOnce('error');
+  });
+
+  // Codex round-on-2702076 finding 2 (SOFT): Node http request `timeout`
+  // option fires the `timeout` event but does NOT auto-error or destroy the
+  // request. If the bridge accepts TCP but never responds, without this
+  // handler the request hangs, the callback is neither delivered nor
+  // persisted, and sockets accumulate. Destroying the request synthesizes an
+  // error event which routes through error handler; spoolOnce dedups so the
+  // callback is persisted exactly once across timeout + subsequent error.
+  req.on('timeout', () => {
+    spoolOnce('timeout');
+    req.destroy(new Error('bridge callback timeout'));
   });
 
   req.write(payload);
@@ -199,22 +220,31 @@ function rewriteHookCommand(command: string): string {
   );
   const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-  // Normalize the COMMAND too: convert backslashes to forward slashes so the
-  // Windows-style command `python D:\atlas-state\hooks\foo.py` matches
-  // alongside the forward-slashed form. Linux/macOS commands are unaffected
-  // (they don't contain backslashes in path positions).
-  const cmd = command.replace(/\\/g, '/');
+  // Codex round-on-2702076 finding 3 (SOFT): the pre-fix line
+  // `const cmd = command.replace(/\\/g, '/');` normalized backslashes
+  // GLOBALLY across the entire command, mutating non-path Windows args
+  // and quoted literals (any backslash anywhere in the command was rewritten,
+  // not just backslashes in path positions). We now leave the command intact
+  // and instead make each path regex accept BOTH separator styles via [\\/]
+  // character classes at separator positions. Linux/macOS paths only ever
+  // use forward slashes so those regexes are unchanged.
 
-  let out = cmd
+  let out = command
     // Normalize python → python3 (container has python3, not python)
     .replace(/^python\s/, 'python3 ')
-    // Windows paths: C:/Users/xxx/.atlas/hooks/ → /home/node/.atlas/hooks/
+    // Windows paths: accept C:\Users\xxx\.atlas\hooks\ OR C:/Users/xxx/.atlas/hooks/
     .replace(
-      /[A-Za-z]:\/[^"'\s]*\/\.atlas\/hooks\//g,
+      /[A-Za-z]:[\\/][^"'\s]*[\\/]\.atlas[\\/]hooks[\\/]/g,
       '/home/node/.atlas/hooks/',
     )
-    .replace(/[A-Za-z]:\/[^"'\s]*\/\.atlas\/lib\//g, '/home/node/.atlas/lib/')
-    .replace(/[A-Za-z]:\/[^"'\s]*\/\.claude\//g, '/home/node/.claude/')
+    .replace(
+      /[A-Za-z]:[\\/][^"'\s]*[\\/]\.atlas[\\/]lib[\\/]/g,
+      '/home/node/.atlas/lib/',
+    )
+    .replace(
+      /[A-Za-z]:[\\/][^"'\s]*[\\/]\.claude[\\/]/g,
+      '/home/node/.claude/',
+    )
     // Linux host paths: /home/<user>/.atlas/hooks/ → /home/node/.atlas/hooks/
     .replace(/\/home\/[^/]+\/\.atlas\/hooks\//g, '/home/node/.atlas/hooks/')
     .replace(/\/home\/[^/]+\/\.atlas\/lib\//g, '/home/node/.atlas/lib/')
@@ -224,16 +254,23 @@ function rewriteHookCommand(command: string): string {
   // than the home-relative default (e.g., the operator set ATLAS_DIR), also
   // map that root to the container's /home/node/.atlas. Skip when the
   // override resolves to an existing /home/<user>/.atlas because the
-  // earlier replace above already covers that case. Both override AND cmd
-  // are forward-slashed at this point so cross-platform match works.
+  // earlier replace above already covers that case.
+  //
+  // overrideRoot is forward-slashed; the command is NOT pre-normalized
+  // (codex finding 3 fix). Build the override regex with [\\/] character
+  // classes at separator positions so commands using either slash style
+  // (D:/atlas-state/hooks/foo.py OR D:\atlas-state\hooks\foo.py) match.
   if (overrideRoot && !/^\/home\/[^/]+\/\.atlas$/.test(overrideRoot)) {
+    // After escapeRe, '/' is still literal '/' (it's not a regex metachar).
+    // Swap each '/' for [\\/] so the regex tolerates either separator style.
+    const overrideAnyStyle = escapeRe(overrideRoot).replace(/\//g, '[\\\\/]');
     out = out
       .replace(
-        new RegExp(`${escapeRe(overrideRoot)}/hooks/`, 'g'),
+        new RegExp(`${overrideAnyStyle}[\\\\/]hooks[\\\\/]`, 'g'),
         '/home/node/.atlas/hooks/',
       )
       .replace(
-        new RegExp(`${escapeRe(overrideRoot)}/lib/`, 'g'),
+        new RegExp(`${overrideAnyStyle}[\\\\/]lib[\\\\/]`, 'g'),
         '/home/node/.atlas/lib/',
       );
   }
@@ -716,7 +753,30 @@ export async function runContainerAgent(
             resetTimeout();
             // Call onOutput for all markers (including null results)
             // so idle timers start even for "silent" query completions.
-            outputChain = outputChain.then(() => onOutput(parsed));
+            //
+            // Codex round-on-2702076 finding 1 (BLOCKING, concurrency): wrap
+            // the callback in try/catch INSIDE the chain so a rejected/throwing
+            // onOutput cannot poison the chain. Pre-fix a single rejected
+            // onOutput left outputChain in a rejected state, and the close
+            // handlers below at L812 and L917 used `outputChain.then(() =>
+            // resolve(...))` with no rejection branch — runContainerAgent()
+            // hung forever. Wrapping here prevents the chain from ever seeing
+            // the rejection; the .catch at the end is defense-in-depth in case
+            // the wrapper itself synchronously throws.
+            outputChain = outputChain
+              .then(async () => {
+                try {
+                  await onOutput(parsed);
+                } catch (callbackErr) {
+                  logger.warn(
+                    { group: group.name, error: callbackErr },
+                    'onOutput callback threw — chain isolation prevents poisoning',
+                  );
+                }
+              })
+              .catch(() => {
+                // Defense in depth: keep the chain healthy even if try/catch missed.
+              });
           } catch (err) {
             logger.warn(
               { group: group.name, error: err },
@@ -809,7 +869,11 @@ export async function runContainerAgent(
             { group: group.name, containerName, duration, code },
             'Container timed out after output (idle cleanup)',
           );
-          outputChain.then(() => {
+          // Codex round-on-2702076 finding 1: defense-in-depth .catch so a
+          // rejected outputChain never strands resolve(). Producer-side fix at
+          // L719 already isolates rejections, but the .catch here means even a
+          // future regression cannot re-introduce the hang.
+          outputChain.catch(() => {}).then(() => {
             resolve({
               status: 'success',
               result: null,
@@ -914,7 +978,10 @@ export async function runContainerAgent(
 
       // Streaming mode: wait for output chain to settle, return completion marker
       if (onOutput) {
-        outputChain.then(() => {
+        // Codex round-on-2702076 finding 1: defense-in-depth .catch — see L719
+        // and L812 fixes. Producer wraps rejections; this guarantees resolve()
+        // even if a future producer-path change re-introduces a poisoned chain.
+        outputChain.catch(() => {}).then(() => {
           logger.info(
             { group: group.name, duration, newSessionId },
             'Container completed (streaming mode)',
