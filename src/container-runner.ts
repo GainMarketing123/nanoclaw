@@ -140,6 +140,10 @@ function notifyBridgeCallback(callback: MissionCallback): void {
       timeout: 5000,
     },
     (res) => {
+      // Walk-back-fix on e362365 finding 2: cancel request timeout once
+      // headers arrive so a 2xx-delivered callback can't be re-spooled by a
+      // later timeout firing during body drain.
+      req.setTimeout(0);
       res.resume(); // drain body for socket cleanup
       if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
         logger.info(
@@ -156,7 +160,17 @@ function notifyBridgeCallback(callback: MissionCallback): void {
     },
   );
 
+  // Walk-back-fix on e362365 finding 1: req.destroy() in the timeout handler
+  // synthesizes an 'error' event; without this guard the error handler would
+  // spool a SECOND copy of the same callback. Minimal dedup — flag-on-
+  // timeout + skip-error-if-flag — covers the one specific cascade. NOT
+  // re-introducing the full enterTerminal pattern that spec-spiraled in
+  // rounds 3-5; bridge-side (missionId, role) idempotency remains the
+  // authority for cross-spool dedup.
+  let timedOutAlready = false;
+
   req.on('error', () => {
+    if (timedOutAlready) return; // cascade from req.destroy() in timeout handler
     logger.warn(
       { missionId: callback.missionId, role: callback.role },
       'Bridge unreachable, spooling callback for retry',
@@ -164,13 +178,11 @@ function notifyBridgeCallback(callback: MissionCallback): void {
     spoolCallback(callback);
   });
 
-  // Round-1 finding 2 (kept after walk-back): Node http `timeout` option
-  // fires the timeout event but does NOT auto-destroy or call error. Without
-  // explicit destroy, a stalled bridge leaves the request hanging and
-  // sockets accumulate. Spool + destroy on timeout. Bridge-side idempotency
-  // covers the duplicate-delivery case if bridge eventually responds after
-  // we've already spooled.
+  // Round-1 finding 2 (kept): Node http `timeout` option fires the timeout
+  // event but does NOT auto-destroy or call error. Without explicit destroy,
+  // a stalled bridge leaves the request hanging. Spool + destroy on timeout.
   req.on('timeout', () => {
+    timedOutAlready = true;
     logger.warn(
       { missionId: callback.missionId, role: callback.role },
       'Bridge callback timed out, spooling for retry',
