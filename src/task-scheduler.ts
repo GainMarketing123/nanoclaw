@@ -304,6 +304,18 @@ function evaluateM2CleanRun(
 ): void {
   try {
     const trackerPath = `${ATLAS_STATE_DIR}/lib/autonomy_tracker.py`;
+    // Existence pre-check: under ATLAS_DIR override, the tracker may not
+    // exist at the new path (operator forgot to mirror ~/.atlas/lib/, or
+    // override points at a state-only tree). Without this guard the
+    // spawnSync fails with python ENOENT exit code 2 every minute and
+    // the warn log fills up. Cross-review F3 fix on 3462d73.
+    if (!fs.existsSync(trackerPath)) {
+      logger.warn(
+        { taskId, trackerPath },
+        'M2 evaluation skipped — autonomy_tracker.py not found at configured ATLAS_DIR. Mirror ~/.atlas/lib/ to the override path or unset ATLAS_DIR.',
+      );
+      return;
+    }
     const args = [
       trackerPath,
       'm2-evaluate',

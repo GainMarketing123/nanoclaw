@@ -173,25 +173,49 @@ function parseMissionContext(
  * Host settings.json may use:
  *   Windows: "python C:/Users/ttle0/.atlas/hooks/foo.py"
  *   Linux:   "python3 /home/atlas/.atlas/hooks/foo.py"
+ *   Override: "python3 /opt/atlas-state/hooks/foo.py" (ATLAS_DIR set)
  * Container needs: "python3 /home/node/.atlas/hooks/foo.py"
+ *
+ * Cross-review F1 fix on 3462d73: when ATLAS_STATE_DIR is overridden via
+ * the ATLAS_DIR env var, the override path must also rewrite to the
+ * container's /home/node/.atlas. Pre-fix the regex only matched HOME-
+ * relative literal paths; an override like /opt/atlas-state would slip
+ * through unchanged and the container would run hooks pointing at a
+ * non-existent /opt/atlas-state inside the container namespace.
  */
 function rewriteHookCommand(command: string): string {
-  return (
-    command
-      // Normalize python → python3 (container has python3, not python)
-      .replace(/^python\s/, 'python3 ')
-      // Windows paths: C:/Users/xxx/.atlas/hooks/ → /home/node/.atlas/hooks/
-      .replace(
-        /[A-Za-z]:\/[^"'\s]*\/\.atlas\/hooks\//g,
-        '/home/node/.atlas/hooks/',
-      )
-      .replace(/[A-Za-z]:\/[^"'\s]*\/\.atlas\/lib\//g, '/home/node/.atlas/lib/')
-      .replace(/[A-Za-z]:\/[^"'\s]*\/\.claude\//g, '/home/node/.claude/')
-      // Linux host paths: /home/<user>/.atlas/hooks/ → /home/node/.atlas/hooks/
-      .replace(/\/home\/[^/]+\/\.atlas\/hooks\//g, '/home/node/.atlas/hooks/')
-      .replace(/\/home\/[^/]+\/\.atlas\/lib\//g, '/home/node/.atlas/lib/')
-      .replace(/\/home\/[^/]+\/\.claude\//g, '/home/node/.claude/')
-  );
+  // Build a regex that matches the configured override path. Escape regex
+  // metacharacters in case the path contains characters like '+' or '.'.
+  // Strip trailing slashes so we can append /hooks|/lib explicitly.
+  const overrideRoot = ATLAS_STATE_DIR.replace(/\/+$/, '');
+  const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+  let out = command
+    // Normalize python → python3 (container has python3, not python)
+    .replace(/^python\s/, 'python3 ')
+    // Windows paths: C:/Users/xxx/.atlas/hooks/ → /home/node/.atlas/hooks/
+    .replace(
+      /[A-Za-z]:\/[^"'\s]*\/\.atlas\/hooks\//g,
+      '/home/node/.atlas/hooks/',
+    )
+    .replace(/[A-Za-z]:\/[^"'\s]*\/\.atlas\/lib\//g, '/home/node/.atlas/lib/')
+    .replace(/[A-Za-z]:\/[^"'\s]*\/\.claude\//g, '/home/node/.claude/')
+    // Linux host paths: /home/<user>/.atlas/hooks/ → /home/node/.atlas/hooks/
+    .replace(/\/home\/[^/]+\/\.atlas\/hooks\//g, '/home/node/.atlas/hooks/')
+    .replace(/\/home\/[^/]+\/\.atlas\/lib\//g, '/home/node/.atlas/lib/')
+    .replace(/\/home\/[^/]+\/\.claude\//g, '/home/node/.claude/');
+
+  // Override-aware rewrite: if ATLAS_STATE_DIR resolves to something OTHER
+  // than the home-relative default (e.g., the operator set ATLAS_DIR), also
+  // map that root to the container's /home/node/.atlas. Skip when the
+  // override resolves to an existing /home/<user>/.atlas because the
+  // earlier replace above already covers that case.
+  if (overrideRoot && !/^\/home\/[^/]+\/\.atlas$/.test(overrideRoot)) {
+    out = out
+      .replace(new RegExp(`${escapeRe(overrideRoot)}/hooks/`, 'g'), '/home/node/.atlas/hooks/')
+      .replace(new RegExp(`${escapeRe(overrideRoot)}/lib/`, 'g'), '/home/node/.atlas/lib/');
+  }
+  return out;
 }
 
 /**

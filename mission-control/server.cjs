@@ -23,7 +23,13 @@ const { execSync } = require('child_process');
 const Database = require('better-sqlite3');
 
 const PORT = process.env.MC_PORT || 8080;
-const ATLAS_DIR = path.join(require('os').homedir(), '.atlas');
+// ATLAS_DIR env-var override mirrors host-executor.py and src/config.ts.
+// NOTE: production atlas-mission-control.service runs the SEPARATE
+// atlas-command Next.js repo, not this server.cjs (audit doc 1.A.6 §2
+// MAJOR CORRECTION). This file is kept current as the in-repo source of
+// truth so any future re-alignment doesn't drift; the live atlas-command
+// has its own equivalent override at lib/atlas-data.ts:15.
+const ATLAS_DIR = process.env.ATLAS_DIR || path.join(require('os').homedir(), '.atlas');
 const NANOCLAW_DB = path.join(__dirname, '..', 'store', 'messages.db');
 
 // --- Basic Auth ---------------------------------------------------------------
