@@ -46,6 +46,16 @@ RUN npm install
 # Copy source code
 COPY agent-runner/ ./
 
+# Bundle the quality-check prompt at a stable path. response-interceptor.ts
+# reads from /opt/nanoclaw/quality-check-prompt.md at module load. The host
+# (host-executor.py) reads the SAME file from the repo at
+# NANOCLAW_DIR/container/agent-runner/src/governance/quality-check-prompt.md.
+# Single source of truth, PR-reviewable, no runtime TS scraping. If this COPY
+# is removed from a future Dockerfile rewrite, the container module fails fast
+# at load — there is no silent fallback prompt anymore.
+RUN mkdir -p /opt/nanoclaw
+COPY agent-runner/src/governance/quality-check-prompt.md /opt/nanoclaw/quality-check-prompt.md
+
 # Build TypeScript
 RUN npm run build
 

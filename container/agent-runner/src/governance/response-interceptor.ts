@@ -12,25 +12,35 @@
  */
 
 import http from 'http';
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
 const ATLAS_STATE_DIR = '/workspace/extra/atlas-state';
 
-export interface QualityCheckResult {
-  pass: boolean;
-  violations: QualityViolation[];
-  score: number; // 0-100, higher = better quality
+// Tri-state quality-check contract (codex consult 2026-04-25, 5 rounds).
+// Replaces the prior `pass: boolean + checkerUnavailable?: boolean + score` shape,
+// which conflated "host returned a judgment of fail" with "host couldn't render
+// a judgment" and silently routed both to ship-the-response when violations was
+// empty. Discriminated union forces the routing decision in index.ts to be made
+// on `status` rather than guessed from `criticals.length`.
+export type UnavailableReason =
+  | 'billing'        // credit/quota exhausted; not retryable; operator alert.
+  | 'timeout'        // request timeout; retryable; soft-window alert.
+  | 'network'        // 5xx/URLError/transport; retryable; soft-window alert.
+  | 'auth'           // 401/unauthorized; not retryable; operator alert.
+  | 'parse'          // Haiku returned unparseable text; not retryable; loud-log only.
+  | 'token_missing'  // ANTHROPIC_API_KEY absent on host; not retryable; operator alert.
+  | 'api_error'      // unclassified upstream/handler fault; not retryable.
+  | 'busy'           // host in-flight cap reached; retryable.
+  | 'prompt_missing' // bundled prompt asset missing in image; not retryable.
+  | 'host_unreachable' // container couldn't reach host endpoint at all (network).
+  | 'host_unauthorized'; // bearer token rejected by host (auth fail at endpoint).
 
-  // True when the host-side checker was unreachable (transport error, non-200,
-  // JSON parse failure, timeout, or auth failure). Distinguishes "Haiku judged
-  // the content and decided it failed" from "we could not get a judgment". When
-  // true, downstream callers should treat the result as audit-only — the
-  // response still flows through (the index.ts retry loop only fires on
-  // critical violations, and we ship empty violations here intentionally) but
-  // the audit log records that the gate did not actually run.
-  checkerUnavailable?: boolean;
-}
+export type QualityCheckResult =
+  | { status: 'pass'; score: number; violations: QualityViolation[] }
+  | { status: 'fail'; score: number; violations: QualityViolation[] }
+  | { status: 'unavailable'; reason: UnavailableReason; retryable: boolean; detail?: string };
 
 export interface QualityViolation {
   rule: string;
@@ -38,6 +48,11 @@ export interface QualityViolation {
   description: string;
 }
 
+// Audit log shape v2. Sink-split (R5): the JSONL audit emits a coarse
+// reason='infra_unavailable' so non-operator readers don't see exact billing/
+// auth/token state. Exact reason still goes to container stderr (operator log)
+// and host-side Telegram alert. Old fields preserved for back-compat with any
+// directory-level digest readers.
 export interface InterceptionLog {
   timestamp: string;
   entity: string;
@@ -46,44 +61,55 @@ export interface InterceptionLog {
   finalScore: number;
   violations: string[];
   responseLength: number;
+  // v2 additions
+  schemaVersion?: 2;
+  status?: 'pass' | 'fail' | 'unavailable';
+  reasonCoarse?: 'infra_unavailable' | null;  // coarsened — see comment above
+  lintTriggered?: 'rewrite' | 'warn' | 'none';
+  lintFired?: string[];
+  promptSha?: string;
 }
 
-const QUALITY_CHECK_PROMPT = `You are a strict quality checker for an AI assistant talking to a CEO who is NOT a developer. The CEO runs a property management and landscaping business. Technical explanations MUST start with plain-language analogies.
-
-NON-NEGOTIABLE RULE: Every technical term or concept MUST be preceded by a plain-language analogy or "think of it like..." sentence. This applies EVEN WHEN the CEO asks a technical question. Asking about "how X works" does NOT mean they want raw jargon — they want the explanation in plain language FIRST, then optional technical detail.
-
-FAIL EXAMPLES (should score < 60):
-- "interceptMessage() filters for assistant type with tool_use blocks" → NO analogy before the jargon
-- "Appends one JSON line to the audit pipeline" → What is JSON? What is a pipeline? Explain first.
-- "The credential proxy swaps tokens via OAuth refresh_token grant" → CEO doesn't know what any of this means
-
-PASS EXAMPLES (should score 85+):
-- "Think of it like a security camera — it watches every action but never stops anything. In code terms, that's an audit interceptor." → Analogy FIRST, then term.
-- "Like a copy editor checking your work before it goes to print — that's what the quality checker does." → Plain language leads.
-
-Check the response below. Return ONLY raw JSON, no markdown fences.
-
-{"score": 0-100, "violations": [
-  {"rule": "layman_first", "severity": "critical", "description": "quote the specific jargon that lacks a preceding analogy"},
-  {"rule": "non_answer", "severity": "critical", "description": "quote the deflection, pointer, or meta-commentary instead of an answer"},
-  {"rule": "decision_confirmation", "severity": "critical", "description": "what decision was presented as final without CEO approval"},
-  {"rule": "assumptions", "severity": "warning", "description": "what business assumption was unstated"}
-]}
-
-Scoring:
-- 85+ = pass. Every technical concept has a preceding analogy. Full answer provided.
-- 70-84 = borderline. Some analogies present but gaps remain.
-- < 70 = fail. Multiple technical terms without plain-language lead-ins. MUST be rewritten.
-- "layman_first" is CRITICAL if ANY technical term (function names, protocol names, data formats, code concepts) appears without a preceding plain-language explanation in the same response.
-- "non_answer" is CRITICAL if the response does ANY of these: references a previous answer instead of providing one ("scroll up", "already covered", "as I said", "see above", "answer is above"); suggests the user has a problem instead of answering ("is something wrong on your end?", "client glitch", "messages not loading?"); gives meta-commentary about the question instead of answering ("you've asked this X times", "same question again"); responds with attitude or sarcasm instead of substance; provides a summary or pointer instead of the full explanation asked for; answers a DIFFERENT question than what was asked; says anything other than a direct, complete, helpful answer to the exact question; references or defers to a previous response in ANY way instead of answering fully right now. The test: if the CEO read ONLY this response, would they have the full answer without needing to scroll, search, or ask again? If no = CRITICAL violation. REPEATED QUESTIONS: If the same question appears multiple times, EVERY response must be complete. Never reference previous answers. Never suggest device issues. Treat every message as the first time it was ever asked.
-- "decision_confirmation" is CRITICAL if decisions are presented as final without noting CEO approval needed.
-- "assumptions" is WARNING if business assumptions aren't stated explicitly.
-- Short responses (<100 chars) or code-only output: score 90+.
-- The question topic does NOT excuse jargon. Even if the CEO asks "how does the interceptor work," the answer must start with an analogy.
-
-<response>
-{RESPONSE}
-</response>`;
+// Bundled prompt path (Dockerfile COPY → /opt/nanoclaw/quality-check-prompt.md).
+// Source-of-truth file lives at container/agent-runner/src/governance/quality-check-prompt.md
+// in the repo. Host-executor reads the SAME file from the repo at startup so
+// host and container are guaranteed to use byte-identical prompt text. If the
+// COPY step is missing from a future Dockerfile rewrite, this module fails fast
+// at load — there is no silent fallback prompt anymore (codex R4: silent
+// fallback was a hidden contract change waiting to happen).
+const QUALITY_CHECK_PROMPT_PATH = '/opt/nanoclaw/quality-check-prompt.md';
+const QUALITY_CHECK_PROMPT = ((): string => {
+  let body: string;
+  try {
+    body = fs.readFileSync(QUALITY_CHECK_PROMPT_PATH, 'utf-8');
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `[response-interceptor] FATAL: quality-check prompt not found at ${QUALITY_CHECK_PROMPT_PATH}. ` +
+      `Container image is missing the Dockerfile COPY step or the source file was deleted. ` +
+      `Refusing to start. Underlying error: ${msg}`,
+    );
+  }
+  if (!body.trim()) {
+    throw new Error(
+      `[response-interceptor] FATAL: quality-check prompt at ${QUALITY_CHECK_PROMPT_PATH} is empty.`,
+    );
+  }
+  if (!body.includes('{RESPONSE}')) {
+    throw new Error(
+      `[response-interceptor] FATAL: quality-check prompt missing {RESPONSE} placeholder.`,
+    );
+  }
+  return body;
+})();
+// 12-char SHA-256 of the loaded prompt text. Emitted on quality-check audit
+// log lines so a host-vs-container drift (host updated, image not rebuilt) is
+// visible. Compute once at module load to avoid hashing per request.
+const QUALITY_CHECK_PROMPT_SHA = crypto
+  .createHash('sha256')
+  .update(QUALITY_CHECK_PROMPT, 'utf-8')
+  .digest('hex')
+  .slice(0, 12);
 
 /**
  * Call Haiku to evaluate response quality.
@@ -118,15 +144,49 @@ function loadQualityCheckToken(): string {
 
 const QUALITY_CHECK_TOKEN = loadQualityCheckToken();
 
-async function callHaiku(responseText: string): Promise<QualityCheckResult> {
-  // The host-executor runs a quality-check server on the host. Port 3003
-  // (was 3002 historically — moved to avoid colliding with
-  // atlas-bridge.service which now owns 127.0.0.1:3002 on the VPS).
-  // Hardcoded to keep the host and container constants in lockstep — no
-  // env-var propagation channel into containers exists today. Changing
-  // this number requires editing host/host-executor.py too.
-  // Containers reach the host via host.docker.internal (or the docker
-  // bridge IP on Linux).
+// Classify a legacy host response (pre-tri-state). Old hosts return
+// {score: -N, error: "...", raw_text?: "..."} wrapped in HTTP 200. Inspect
+// numeric score and error text to choose the closest UnavailableReason.
+// Used only when body lacks a valid `status` field.
+function classifyLegacyError(score: number | undefined, errorText: string): UnavailableReason {
+  const err = (errorText || '').toLowerCase();
+  if (/insufficient_quota|credit balance/.test(err)) return 'billing';
+  if (/\b401\b|unauthorized/.test(err)) return 'auth';
+  if (/api_key not found|token missing|key not found/.test(err)) return 'token_missing';
+  if (/json|parse/.test(err)) return 'parse';
+  if (/timeout/.test(err)) return 'timeout';
+  if (/network|url|connection/.test(err)) return 'network';
+  // Numeric fallbacks (host-executor pre-tri-state used -2 parse, -3 network, -4 timeout)
+  if (score === -2) return 'parse';
+  if (score === -3) return 'network';
+  if (score === -4) return 'timeout';
+  return 'api_error';
+}
+
+const QUALITY_CHECK_RETRYABLE: ReadonlySet<UnavailableReason> = new Set<UnavailableReason>([
+  'timeout',
+  'network',
+  'busy',
+  'host_unreachable',
+]);
+
+interface AttemptOutcome {
+  result: QualityCheckResult;
+  legacy: boolean;  // true if host responded without `status` field — used for one-time DEPRECATED log
+}
+
+// Single HTTP attempt at the /quality-check endpoint. Returns a tri-state
+// result and a legacy flag indicating whether the host body was schema-v1.
+// Retry policy lives in callHaiku() above this — keeps attempt logic linear.
+function attemptQualityCheck(
+  responseText: string,
+  attemptTimeoutMs: number,
+): Promise<AttemptOutcome> {
+  // Port 3003 (was 3002 historically — moved to avoid colliding with
+  // atlas-bridge.service which owns 127.0.0.1:3002 on the VPS). Hardcoded
+  // to keep host and container constants in lockstep — no env-var
+  // propagation channel into containers exists today. Changing the port
+  // requires editing host/host-executor.py too.
   const hostGateway = process.env.CONTAINER_HOST_GATEWAY || 'host.docker.internal';
   const port = 3003;
   const url = `http://${hostGateway}:${port}/quality-check`;
@@ -134,25 +194,21 @@ async function callHaiku(responseText: string): Promise<QualityCheckResult> {
   const body = JSON.stringify({ response: responseText.slice(0, 4000) });
   const log = (msg: string) => console.error(`[response-interceptor] ${msg}`);
 
-  // Fail-closed sentinel: when the checker is unreachable for ANY reason
-  // (no token, transport error, non-200, JSON parse fail, timeout) we
-  // return pass=false with checkerUnavailable=true and an empty violations
-  // array. Per index.ts:535-545 the empty-violations path means the response
-  // still ships (we don't block CEO replies on infra outages), but the audit
-  // log is honest about whether the gate ran.
-  const unavailable = (score: number): QualityCheckResult => ({
-    pass: false,
-    violations: [],
-    score,
-    checkerUnavailable: true,
-  });
+  const unavailable = (
+    reason: UnavailableReason,
+    retryable: boolean,
+    detail: string,
+  ): QualityCheckResult => ({ status: 'unavailable', reason, retryable, detail: detail.slice(0, 300) });
 
   if (!QUALITY_CHECK_TOKEN) {
-    log('Quality-check token missing — skipping host call (treated as checkerUnavailable)');
-    return unavailable(-5);
+    log('Quality-check token missing — skipping host call (treated as host_unauthorized)');
+    return Promise.resolve({
+      result: unavailable('token_missing', false, 'QUALITY_CHECK_TOKEN missing in container .env mount'),
+      legacy: false,
+    });
   }
 
-  return new Promise((resolve) => {
+  return new Promise<AttemptOutcome>((resolve) => {
     const parsed = new URL(url);
     const req = http.request(
       {
@@ -168,61 +224,178 @@ async function callHaiku(responseText: string): Promise<QualityCheckResult> {
           // avoided. Don't log the header value here or in error paths.
           'Authorization': `Bearer ${QUALITY_CHECK_TOKEN}`,
         },
-        timeout: 12000,
+        timeout: attemptTimeoutMs,
       },
       (res) => {
         let data = '';
         res.on('data', (chunk) => { data += chunk; });
         res.on('end', () => {
-          try {
-            if (res.statusCode !== 200) {
-              log(`Host quality-check returned ${res.statusCode}: ${data.slice(0, 200)}`);
-              resolve(unavailable(-1));
-              return;
-            }
-            const result = JSON.parse(data);
-            const score = typeof result.score === 'number' ? result.score : 50;
-
-            // If host-executor returned an error (score < 0), log the raw detail
-            if (score < 0 && result.raw_text) {
-              log(`Host-executor error: ${result.error}`);
-              log(`Raw Haiku text (first 300): ${result.raw_text.slice(0, 300)}`);
-            }
-
-            const violations: QualityViolation[] = Array.isArray(result.violations)
-              ? result.violations.filter((v: QualityViolation) => v.rule && v.severity)
-              : [];
-
-            log(`Haiku evaluated: score=${score} violations=${violations.length}`);
+          // HTTP 401: host rejected our token. Not retryable (token wouldn't
+          // change between attempts). Distinct from host-internal auth fail
+          // upstream — this is the bearer check on the endpoint itself.
+          if (res.statusCode === 401) {
+            log(`Host quality-check 401 — bearer token rejected by host endpoint`);
             resolve({
-              pass: score >= 85,
-              violations,
-              score,
+              result: unavailable('host_unauthorized', false, 'Host endpoint returned 401'),
+              legacy: false,
             });
-          } catch (err) {
-            log(`Quality-check parse error: ${err instanceof Error ? err.message : String(err)}`);
-            log(`Raw response: ${data.slice(0, 300)}`);
-            resolve(unavailable(-2));
+            return;
           }
+          // HTTP 429: host in-flight cap reached. Retryable (the cap is
+          // momentary; another attempt may land in slack capacity).
+          if (res.statusCode === 429) {
+            log(`Host quality-check 429 — busy (in-flight cap)`);
+            try {
+              const parsed429 = JSON.parse(data);
+              if (parsed429 && parsed429.status === 'unavailable') {
+                resolve({ result: parsed429 as QualityCheckResult, legacy: false });
+                return;
+              }
+            } catch { /* fall through to canonical busy */ }
+            resolve({
+              result: unavailable('busy', true, 'Host reported in-flight cap reached'),
+              legacy: false,
+            });
+            return;
+          }
+          // Any other non-200 is a transport-level fault; classify as network.
+          if (res.statusCode !== 200) {
+            log(`Host quality-check returned ${res.statusCode}: ${data.slice(0, 200)}`);
+            resolve({
+              result: unavailable('network', true, `Host HTTP ${res.statusCode}`),
+              legacy: false,
+            });
+            return;
+          }
+          // HTTP 200: parse body. Tri-state contract requires `status` field.
+          // If absent, fall back to legacy {score, violations, error?} shape
+          // and synthesize an unavailable on score<0.
+          let body: unknown;
+          try {
+            body = JSON.parse(data);
+          } catch (err) {
+            log(`Quality-check JSON parse failure: ${err instanceof Error ? err.message : String(err)}`);
+            log(`Raw response (first 300): ${data.slice(0, 300)}`);
+            resolve({
+              result: unavailable('parse', false, 'Container could not parse host JSON body'),
+              legacy: false,
+            });
+            return;
+          }
+          const obj = (body && typeof body === 'object') ? (body as Record<string, unknown>) : {};
+          const explicitStatus = typeof obj.status === 'string' ? obj.status : '';
+          if (explicitStatus === 'pass' || explicitStatus === 'fail') {
+            const rawScore = obj.score;
+            const score = typeof rawScore === 'number' ? rawScore : 50;
+            const rawViolations = Array.isArray(obj.violations) ? obj.violations : [];
+            const violations: QualityViolation[] = rawViolations
+              .filter((v): v is QualityViolation => {
+                return !!v && typeof v === 'object' && typeof (v as QualityViolation).rule === 'string' && typeof (v as QualityViolation).severity === 'string';
+              });
+            log(`Haiku evaluated: status=${explicitStatus} score=${score} violations=${violations.length} sha=${QUALITY_CHECK_PROMPT_SHA}`);
+            resolve({
+              result: { status: explicitStatus, score, violations },
+              legacy: false,
+            });
+            return;
+          }
+          if (explicitStatus === 'unavailable') {
+            const reason = (typeof obj.reason === 'string' ? obj.reason : 'api_error') as UnavailableReason;
+            const retryable = !!obj.retryable;
+            const detail = typeof obj.detail === 'string' ? obj.detail : '';
+            log(`Host quality-check UNAVAILABLE: reason=${reason} retryable=${retryable} detail=${detail.slice(0, 200)} sha=${QUALITY_CHECK_PROMPT_SHA}`);
+            resolve({
+              result: { status: 'unavailable', reason, retryable, detail },
+              legacy: false,
+            });
+            return;
+          }
+          // Legacy fallback (status field missing). Inspect score+error.
+          const rawScore = typeof obj.score === 'number' ? obj.score : undefined;
+          const errorText = typeof obj.error === 'string' ? obj.error : '';
+          if (rawScore === undefined || rawScore < 0) {
+            const reason = classifyLegacyError(rawScore, errorText);
+            log(`Legacy host body (no status field): score=${rawScore} error=${errorText.slice(0, 200)} → reason=${reason}`);
+            resolve({
+              result: unavailable(reason, QUALITY_CHECK_RETRYABLE.has(reason), errorText),
+              legacy: true,
+            });
+            return;
+          }
+          // Legacy success path — score>=0, derive pass/fail by threshold.
+          const rawViolations = Array.isArray(obj.violations) ? obj.violations : [];
+          const violations: QualityViolation[] = rawViolations
+            .filter((v): v is QualityViolation => {
+              return !!v && typeof v === 'object' && typeof (v as QualityViolation).rule === 'string' && typeof (v as QualityViolation).severity === 'string';
+            });
+          const status = rawScore >= 85 ? 'pass' : 'fail';
+          log(`Legacy host body (no status field): score=${rawScore} violations=${violations.length} → status=${status}`);
+          resolve({
+            result: { status, score: rawScore, violations },
+            legacy: true,
+          });
         });
       },
     );
 
     req.on('error', (err) => {
       log(`Quality-check network error: ${err.message}`);
-      resolve(unavailable(-3));
+      resolve({
+        result: unavailable('host_unreachable', true, err.message),
+        legacy: false,
+      });
     });
 
     req.on('timeout', () => {
-      log('Quality-check timed out (12s)');
+      log(`Quality-check timed out after ${attemptTimeoutMs}ms`);
       req.destroy();
-      resolve(unavailable(-4));
+      resolve({
+        result: unavailable('timeout', true, `Container timed out after ${attemptTimeoutMs}ms`),
+        legacy: false,
+      });
     });
 
     req.write(body);
     req.end();
   });
 }
+
+// Module-level legacy-host warning latch — emit at most once per container
+// life so old hosts don't flood stderr. Cleared by container restart, which
+// is the same lifecycle as token rotation.
+let LEGACY_HOST_WARNED = false;
+
+async function callHaiku(responseText: string): Promise<QualityCheckResult> {
+  // First attempt at 8s. If unavailable+retryable, one retry at 10s after
+  // a 200-300ms jittered delay. Hard cap on total wall <=20s, well inside
+  // the SDK envelope (<30s end-to-end CEO Telegram reply target).
+  // Codex consult R3+R5: original 12s+12s was too tight; 8+10 leaves margin.
+  const attempt1 = await attemptQualityCheck(responseText, 8000);
+  if (attempt1.legacy && !LEGACY_HOST_WARNED) {
+    LEGACY_HOST_WARNED = true;
+    console.error(
+      '[response-interceptor] DEPRECATED: host returned legacy body (no `status` field). ' +
+      'Update host-executor to the tri-state contract; container is using legacy fallback parser.',
+    );
+  }
+  if (attempt1.result.status !== 'unavailable') return attempt1.result;
+  if (!attempt1.result.retryable) return attempt1.result;
+
+  const jitterMs = 200 + Math.floor(Math.random() * 100);
+  await new Promise<void>((r) => setTimeout(r, jitterMs));
+  const attempt2 = await attemptQualityCheck(responseText, 10000);
+  if (attempt2.legacy && !LEGACY_HOST_WARNED) {
+    LEGACY_HOST_WARNED = true;
+    console.error(
+      '[response-interceptor] DEPRECATED: host returned legacy body on retry too. ' +
+      'Update host-executor to the tri-state contract.',
+    );
+  }
+  return attempt2.result;
+}
+
+// (Old in-place callHaiku body fully replaced by attemptQualityCheck +
+// callHaiku one-retry orchestrator above; nothing else lives here.)
 
 /**
  * Build a correction prompt that tells the SDK to rewrite its response.
@@ -252,6 +425,21 @@ export function buildCorrectionPrompt(violations: QualityViolation[]): string {
         `Provide the complete answer as if this is the first time it was ever asked.`
       );
     }
+  }
+
+  // Fallback: status==='fail' may carry an empty violations array (host
+  // reported below-threshold score but Haiku didn't enumerate rules). We
+  // still need to rewrite — empty rules list would just emit a no-op
+  // correction. Emit a generic plain-language directive instead.
+  // Codex consult R3: "Status should still drive routing; empty violations
+  // should not suppress rewrite."
+  if (rules.length === 0) {
+    return (
+      `Quality check flagged the response as fail without specific rules. ` +
+      `Rewrite the entire answer in plain language first, fully self-contained, ` +
+      `no references to prior messages, and do not present unconfirmed decisions as final. ` +
+      `Do NOT say "here is the corrected version" — just give the corrected response directly.`
+    );
   }
 
   return (
@@ -286,23 +474,54 @@ function logInterception(entry: InterceptionLog): void {
 export async function checkResponseQuality(
   responseText: string,
 ): Promise<QualityCheckResult> {
-  // Skip check for very short responses (acknowledgments, confirmations)
+  // Skip check for very short responses (acknowledgments, confirmations).
+  // KNOWN GAP (audit doc 1.A.6 §5.4 E1): a deflection or unauthorized-decision
+  // reply <100 chars still bypasses; out of scope for this commit.
   if (!responseText || responseText.length < 100) {
-    return { pass: true, violations: [], score: 95 };
+    return { status: 'pass', score: 95, violations: [] };
   }
 
-  // Skip check for code-only responses (no prose to evaluate)
+  // Skip check for code-only responses (no prose to evaluate).
+  // Same KNOWN GAP — code-only escapes also bypass governance.
   const codeBlockRatio = (responseText.match(/```/g) || []).length / 2;
   const lines = responseText.split('\n').length;
   if (codeBlockRatio > 0 && codeBlockRatio * 10 > lines * 0.7) {
-    return { pass: true, violations: [], score: 90 };
+    return { status: 'pass', score: 90, violations: [] };
   }
 
   return callHaiku(responseText);
 }
 
+// Helpers for unioned-result accessors. Pass/fail variants carry score and
+// violations; unavailable carries reason+retryable+detail. Callers that need
+// a generic numeric "did the gate run successfully" surrogate use scoreOf().
+function scoreOf(r: QualityCheckResult): number {
+  return r.status === 'unavailable' ? -1 : r.score;
+}
+
+function violationsOf(r: QualityCheckResult): QualityViolation[] {
+  return r.status === 'unavailable' ? [] : r.violations;
+}
+
+// Coarsen the exact unavailable reason for the JSONL audit log. Per codex R5:
+// non-operator readers may scan the audit dir; we don't want them seeing
+// `billing` / `auth` / `token_missing` which are operational state. Exact
+// reason still goes to container stderr (operator log) and host-side Telegram
+// alert. The coarse string is `infra_unavailable` regardless of cause.
+function coarseReason(r: QualityCheckResult): 'infra_unavailable' | null {
+  return r.status === 'unavailable' ? 'infra_unavailable' : null;
+}
+
 /**
  * Log the full interception lifecycle (original check, retry, final result).
+ *
+ * Sink-split (codex consult 2026-04-25 R5):
+ *   - JSONL audit gets coarse `reasonCoarse` (infra_unavailable | null) so
+ *     non-operator readers don't see exact billing/auth state.
+ *   - stderr gets the exact reason via separate log statements at the call
+ *     site (index.ts UNAVAILABLE log line, includes prompt SHA).
+ *   - Telegram alert gets exact reason via host-executor's
+ *     _maybe_send_operator_alert (host-side persistent dedup).
  */
 export function logInterceptionResult(
   entity: string,
@@ -310,14 +529,79 @@ export function logInterceptionResult(
   retried: boolean,
   finalResult: QualityCheckResult | null,
   responseLength: number,
+  audit?: {
+    lintTriggered?: 'rewrite' | 'warn' | 'none';
+    lintFired?: string[];
+  },
 ): void {
   logInterception({
     timestamp: new Date().toISOString(),
     entity,
-    originalScore: originalResult.score,
+    originalScore: scoreOf(originalResult),
     retried,
-    finalScore: finalResult?.score ?? originalResult.score,
-    violations: originalResult.violations.map((v) => `${v.rule}:${v.severity}`),
+    finalScore: finalResult ? scoreOf(finalResult) : scoreOf(originalResult),
+    violations: violationsOf(originalResult).map((v) => `${v.rule}:${v.severity}`),
     responseLength,
+    schemaVersion: 2,
+    status: originalResult.status,
+    reasonCoarse: coarseReason(originalResult),
+    lintTriggered: audit?.lintTriggered ?? 'none',
+    lintFired: audit?.lintFired ?? [],
+    promptSha: QUALITY_CHECK_PROMPT_SHA,
   });
+}
+
+/**
+ * Local critical-text lint for use ONLY in degraded mode (status==='unavailable').
+ *
+ * Narrow phrase regex on a normalized copy of the input. Normalization steps:
+ *   1. Unicode NFKC fold (collapses look-alike forms)
+ *   2. Lowercase
+ *   3. Strip zero-width chars (U+200B–U+200D, U+FEFF) that could split tokens
+ *
+ * Rule set is intentionally tiny — high-confidence non-answer markers only.
+ * Function-name / code-fence detection moved to WARN-class (audit-only) per
+ * codex R3 because false-positive risk on legitimate technical replies was
+ * too high to justify a one-shot rewrite trigger.
+ */
+const ZERO_WIDTH_RE = /[​-‍﻿]/g;
+
+const REWRITE_PHRASE_RULES: Array<{ name: string; re: RegExp }> = [
+  // "see above" but NOT "see above-ground"
+  { name: 'see_above', re: /\bsee above\b(?!-)/ },
+  { name: 'scroll_up', re: /\bscroll up\b/ },
+  // "as I said" but NOT "as I said to <someone>"
+  { name: 'as_i_said', re: /\bas i said\b(?!\s+to\b)/ },
+  { name: 'already_covered', re: /\balready covered\b/ },
+];
+
+export interface LocalLintResult {
+  fired: string[];      // rule names that matched (REWRITE-class only)
+}
+
+export function runLocalCriticalLint(text: string): LocalLintResult {
+  if (!text) return { fired: [] };
+  const normalized = text.normalize('NFKC').toLowerCase().replace(ZERO_WIDTH_RE, '');
+  const fired: string[] = [];
+  for (const rule of REWRITE_PHRASE_RULES) {
+    if (rule.re.test(normalized)) {
+      fired.push(rule.name);
+    }
+  }
+  return { fired };
+}
+
+/**
+ * Build a degraded-mode correction prompt referencing the matched anti-patterns.
+ * Used when local lint fires while quality-checker is unavailable. Static text;
+ * does NOT pass through Haiku (unavailable by definition in this branch).
+ */
+export function buildLocalDegradedCorrection(lint: LocalLintResult): string {
+  const fired = lint.fired.length > 0 ? lint.fired.join(', ') : 'unspecified';
+  return (
+    `Your previous response triggered local non-answer markers: [${fired}]. ` +
+    `Rewrite the entire response answering the question directly, in plain language, ` +
+    `with no references to prior messages ("see above", "as I said", "scroll up", "already covered"). ` +
+    `Do NOT say "here is the corrected version" — give the corrected response directly.`
+  );
 }

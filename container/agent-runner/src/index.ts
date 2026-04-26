@@ -31,7 +31,9 @@ import {
   recordRateLimit,
   checkResponseQuality,
   buildCorrectionPrompt,
+  buildLocalDegradedCorrection,
   logInterceptionResult,
+  runLocalCriticalLint,
   type GovernanceContainerInput,
   type QualityCheckResult,
 } from './governance/index.js';
@@ -526,47 +528,93 @@ async function runQuery(
 
       // --- Response Quality Interception ---
       // Think of this like a copy editor: check the response before it
-      // reaches the CEO. If quality fails, push a correction prompt back
-      // into the conversation for one rewrite attempt.
+      // reaches the CEO. Three-state contract (codex consult 2026-04-25):
+      //   pass        → ship + audit
+      //   fail        → one correction-prompt retry, then ship retry result
+      //   unavailable → degraded local lint; if lint fires, one rewrite attempt;
+      //                 otherwise ship + audit (with operator alert from host).
+      // Routing is on `qualityResult.status` — the prior shape used
+      // `criticals.length>0` which silently shipped on host outages.
       if (isCeoSession && textResult && !interceptRetried) {
         const qualityResult = await checkResponseQuality(textResult);
-        // Log the unavailable signal explicitly so an outage of the host-side
-        // checker is visible in container logs even though the response still
-        // ships (per response-interceptor.ts unavailable() sentinel design).
-        const unavailMark = qualityResult.checkerUnavailable ? ' UNAVAILABLE' : '';
-        log(`Quality check: score=${qualityResult.score} pass=${qualityResult.pass} violations=${qualityResult.violations.length}${unavailMark}`);
 
-        if (!qualityResult.pass) {
-          const criticals = qualityResult.violations.filter(v => v.severity === 'critical');
-          if (criticals.length > 0) {
-            // Send the response back for a rewrite — one attempt only
+        if (qualityResult.status === 'unavailable') {
+          // Operator alerts are emitted host-side with persistent dedup.
+          // Container stderr gets the EXACT reason (operator-only); the
+          // JSONL audit gets a coarse `infra_unavailable` (sink-split per R5).
+          log(
+            `Quality DEGRADED: reason=${qualityResult.reason} ` +
+            `retryable=${qualityResult.retryable} ` +
+            `detail=${(qualityResult.detail || '').slice(0, 200)}`
+          );
+          const lint = runLocalCriticalLint(textResult);
+          if (lint.fired.length > 0) {
+            // High-confidence non-answer marker → force one rewrite even
+            // without Haiku. Local lint scope is narrow phrase regex only;
+            // see runLocalCriticalLint() comment for FP-safety reasoning.
             interceptRetried = true;
             interceptOriginalResult = qualityResult;
-            const correction = buildCorrectionPrompt(qualityResult.violations);
-            log(`Quality FAILED (${criticals.map(v => v.rule).join(', ')}). Injecting correction prompt for retry.`);
+            const correction = buildLocalDegradedCorrection(lint);
+            log(`Local lint fired (${lint.fired.join(',')}). Injecting degraded correction prompt for retry.`);
             stream.push(correction);
-            continue; // Skip writeOutput — wait for the corrected response
+            continue; // Skip writeOutput — wait for corrected response
           }
+          // Lint clean → ship + audit. Coarse reason in JSONL; exact reason
+          // already in stderr above and in host-side Telegram alert.
+          logInterceptionResult(
+            containerInput.groupFolder,
+            qualityResult,
+            false,
+            null,
+            textResult.length,
+            { lintTriggered: 'none', lintFired: [] },
+          );
+        } else if (qualityResult.status === 'fail') {
+          // Status=fail routes to rewrite regardless of violations array
+          // contents (R3: empty violations must still trigger rewrite via
+          // the buildCorrectionPrompt fallback path).
+          interceptRetried = true;
+          interceptOriginalResult = qualityResult;
+          const correction = buildCorrectionPrompt(qualityResult.violations);
+          const criticalNames = qualityResult.violations
+            .filter((v) => v.severity === 'critical')
+            .map((v) => v.rule)
+            .join(', ');
+          log(`Quality FAILED (score=${qualityResult.score} criticals=[${criticalNames || 'none'}]). Injecting correction prompt for retry.`);
+          stream.push(correction);
+          continue; // Skip writeOutput — wait for the corrected response
+        } else {
+          // status === 'pass'
+          log(`Quality check: status=pass score=${qualityResult.score} violations=${qualityResult.violations.length}`);
+          logInterceptionResult(
+            containerInput.groupFolder,
+            qualityResult,
+            false,
+            null,
+            textResult.length,
+            { lintTriggered: 'none', lintFired: [] },
+          );
         }
-
-        // Log interception (passed first time or non-critical violations only)
-        logInterceptionResult(
-          containerInput.groupFolder,
-          qualityResult,
-          false,
-          null,
-          textResult.length,
-        );
       } else if (isCeoSession && textResult && interceptRetried && interceptOriginalResult) {
-        // This is the retry response — check it but send regardless
+        // This is the retry response — check it but send regardless.
         const retryResult = await checkResponseQuality(textResult);
-        log(`Retry quality check: score=${retryResult.score} pass=${retryResult.pass}`);
+        if (retryResult.status === 'unavailable') {
+          log(`Retry quality check: status=unavailable reason=${retryResult.reason}`);
+        } else {
+          log(`Retry quality check: status=${retryResult.status} score=${retryResult.score}`);
+        }
+        // Determine lint state at the original failure for audit fidelity:
+        // if the retry was triggered by local lint (degraded mode), record it.
+        const wasDegradedRetry = interceptOriginalResult.status === 'unavailable';
         logInterceptionResult(
           containerInput.groupFolder,
           interceptOriginalResult,
           true,
           retryResult,
           textResult.length,
+          wasDegradedRetry
+            ? { lintTriggered: 'rewrite', lintFired: runLocalCriticalLint(textResult).fired }
+            : { lintTriggered: 'none', lintFired: [] },
         );
         // Reset for next result in this query
         interceptRetried = false;

@@ -16,6 +16,7 @@ This runs on the VPS host (not in a container) so full Python hooks fire.
 Systemd service: atlas-host-executor.service
 """
 
+import hashlib
 import hmac
 import json
 import os
@@ -125,37 +126,153 @@ def _load_quality_check_token() -> str:
 # for constant-time auth comparison. See main() for the fail-closed gate.
 QUALITY_CHECK_TOKEN: str = ""
 
+# Quality-check prompt: repo-owned single source of truth. main() loads at startup
+# and refuses to run if missing. Container bundles the SAME file into its image
+# (Dockerfile COPY → /opt/nanoclaw/quality-check-prompt.md). Both sides read the
+# same content; PR review covers prompt changes. Replaces the old TS-scraping
+# pattern that silently fell back to a minimal prompt on parse failure.
+QUALITY_CHECK_PROMPT_PATH = (
+    NANOCLAW_DIR / "container" / "agent-runner" / "src" / "governance" / "quality-check-prompt.md"
+)
+QUALITY_CHECK_PROMPT: str = ""
+# 12-char SHA-256 of the loaded prompt text. Emitted at startup and on
+# unavailable-path log lines so stale-image deploys (host updated, container
+# image not rebuilt) are visible without poking at deployed files.
+QUALITY_CHECK_PROMPT_SHA: str = ""
+
+# In-flight cap protects the Anthropic budget from a runaway client. The
+# bearer token is shared across all containers (RO mount), so auth alone does
+# not stop a compromised container from flooding /quality-check. Over-cap
+# requests return HTTP 429 with status=unavailable+reason=busy immediately —
+# no upstream Haiku call.
+QUALITY_CHECK_INFLIGHT_CAP = 8
+QUALITY_CHECK_INFLIGHT_LOCK = threading.Lock()
+QUALITY_CHECK_INFLIGHT_COUNT = 0
+
+# Operator-alert dedup state lives on disk so the dedup window survives
+# host-executor restarts. Without persistence, a restart loop would re-fire
+# one alert per reason per restart. Atomic writes via tempfile + os.replace
+# under the lock prevent half-written JSON from disabling dedup. Hard reasons
+# (billing, auth, token_missing) alert immediately and dedupe 30 min. Soft
+# reasons (timeout, network) require N=3 in 5 min before alerting, then 30 min
+# dedup. Other reasons (busy, parse, api_error, prompt_missing) are loud-logged
+# but NOT alerted — they'd drown legitimate signals.
+ALERT_DEDUP_PATH = ATLAS_DIR / "state" / "quality-check-alert-dedup.json"
+ALERT_DEDUP_LOCK = threading.Lock()
+ALERT_HARD_REASONS = frozenset({"billing", "auth", "token_missing"})
+ALERT_SOFT_REASONS = frozenset({"timeout", "network"})
+ALERT_DEDUP_WINDOW_S = 1800   # 30 min
+ALERT_SOFT_THRESHOLD = 3      # consecutive failures
+ALERT_SOFT_WINDOW_S = 300     # 5 min rolling window
+
+
+def _unavailable(reason: str, retryable: bool, detail: str) -> dict:
+    """Build the canonical unavailable response dict. Detail is truncated to
+    keep the wire body bounded; container side does not need full upstream
+    error text (already in host stderr / Telegram alert)."""
+    return {
+        "status": "unavailable",
+        "reason": reason,
+        "retryable": bool(retryable),
+        "detail": (detail or "")[:300],
+    }
+
+
+def _load_alert_dedup_state() -> dict:
+    """Read dedup state from disk; return empty default on any read error.
+    Caller MUST hold ALERT_DEDUP_LOCK."""
+    try:
+        return json.loads(ALERT_DEDUP_PATH.read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {"reasons": {}}
+
+
+def _save_alert_dedup_state(state: dict) -> None:
+    """Atomic write: tmpfile + os.replace under the lock so a crash mid-write
+    cannot leave invalid JSON that disables dedup on next read.
+    Caller MUST hold ALERT_DEDUP_LOCK."""
+    try:
+        ALERT_DEDUP_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError:
+        pass  # parent already exists with different perms — proceed
+    tmp = ALERT_DEDUP_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state))
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp, ALERT_DEDUP_PATH)
+
+
+def _maybe_send_operator_alert(reason: str, detail: str) -> None:
+    """Decide whether to alert based on persistent dedup state, then send.
+    Lock is released BEFORE send_telegram_alert so file IPC + sqlite read
+    don't block other quality-check threads racing to update dedup."""
+    if reason not in ALERT_HARD_REASONS and reason not in ALERT_SOFT_REASONS:
+        return  # busy / parse / api_error / prompt_missing — loud-log only
+    now = time.time()
+    should_send = False
+    with ALERT_DEDUP_LOCK:
+        state = _load_alert_dedup_state()
+        rs = state.setdefault("reasons", {}).setdefault(
+            reason, {"last_sent": 0.0, "soft_window_start": 0.0, "soft_count": 0}
+        )
+        if reason in ALERT_HARD_REASONS:
+            if now - float(rs.get("last_sent", 0.0)) >= ALERT_DEDUP_WINDOW_S:
+                rs["last_sent"] = now
+                _save_alert_dedup_state(state)
+                should_send = True
+        else:  # SOFT
+            if now - float(rs.get("soft_window_start", 0.0)) > ALERT_SOFT_WINDOW_S:
+                rs["soft_window_start"] = now
+                rs["soft_count"] = 0
+            rs["soft_count"] = int(rs.get("soft_count", 0)) + 1
+            if (
+                rs["soft_count"] >= ALERT_SOFT_THRESHOLD
+                and now - float(rs.get("last_sent", 0.0)) >= ALERT_DEDUP_WINDOW_S
+            ):
+                rs["last_sent"] = now
+                rs["soft_count"] = 0
+                _save_alert_dedup_state(state)
+                should_send = True
+            else:
+                _save_alert_dedup_state(state)
+    if should_send:
+        try:
+            send_telegram_alert(
+                f"[OPS] quality-check {reason}: {detail[:200]} (sha={QUALITY_CHECK_PROMPT_SHA})"
+            )
+        except Exception as e:
+            log(f"Operator alert send failed (reason={reason}): {e}")
+
 
 def _call_haiku(response_text: str) -> dict:
-    """Call Haiku /v1/messages with direct API key. Returns parsed eval."""
+    """Call Haiku /v1/messages with direct API key. Returns tri-state dict.
+
+    Pass:        {"status":"pass", "score":N, "violations":[]}
+    Fail:        {"status":"fail", "score":N, "violations":[...]}
+    Unavailable: {"status":"unavailable", "reason":<R>, "retryable":bool, "detail":"..."}
+
+    Reason taxonomy (must stay in lockstep with response-interceptor.ts
+    UnavailableReason union and audit doc 1.A.6 §5.4):
+      billing       — credit/quota exhaustion. NOT retryable; operator alert.
+      auth          — 401/unauthorized. NOT retryable; operator alert.
+      token_missing — ANTHROPIC_API_KEY absent. NOT retryable; operator alert.
+      network       — 5xx/URLError. Retryable; soft-window alert (N=3 in 5min).
+      timeout       — request timeout. Retryable; soft-window alert.
+      parse         — Haiku JSON unparseable. NOT retryable; loud-log only.
+      api_error     — other 4xx / unclassified exception. NOT retryable; loud-log.
+    """
     api_key = _load_anthropic_api_key()
     if not api_key:
-        return {"score": -1, "error": "ANTHROPIC_API_KEY not found in ~/.atlas/.env or env"}
+        return _unavailable("token_missing", False, "ANTHROPIC_API_KEY not in ~/.atlas/.env or env")
 
-    # Import the quality check prompt from the container source if available,
-    # otherwise use a minimal fallback. The container source is the single
-    # source of truth for the prompt text.
-    prompt_file = NANOCLAW_DIR / "container" / "agent-runner" / "src" / "governance" / "response-interceptor.ts"
-    quality_prompt = None
-    try:
-        content = prompt_file.read_text()
-        # Extract the prompt between backtick-delimited string
-        start = content.find("const QUALITY_CHECK_PROMPT = `")
-        if start >= 0:
-            start = content.find("`", start) + 1
-            end = content.find("`;", start)
-            if end > start:
-                quality_prompt = content[start:end]
-    except Exception:
-        pass
+    if not QUALITY_CHECK_PROMPT:
+        # main() refuses to start when the prompt file is missing, so this
+        # branch is defensive only. If we somehow reach here, fail-closed.
+        return _unavailable("api_error", False, "QUALITY_CHECK_PROMPT not loaded — host startup misconfigured")
 
-    if not quality_prompt:
-        quality_prompt = (
-            "You are a quality checker. Score this response 0-100 on plain language. "
-            "Return JSON: {\"score\": N, \"violations\": []}\n\n<response>\n{RESPONSE}\n</response>"
-        )
-
-    filled_prompt = quality_prompt.replace("{RESPONSE}", response_text[:4000])
+    filled_prompt = QUALITY_CHECK_PROMPT.replace("{RESPONSE}", response_text[:4000])
 
     body = json.dumps({
         "model": "claude-haiku-4-5-20251001",
@@ -207,23 +324,42 @@ def _call_haiku(response_text: str) -> dict:
                     log(f"Haiku JSON parse failed even after salvage: {e2}")
                     log(f"Text length: {len(text)}, first 200: {repr(text[:200])}")
                     log(f"Last 200: {repr(text[-200:])}")
-                    return {"score": -2, "error": f"JSON parse: {str(e2)}", "raw_text": text[:500]}
-            return result
+                    return _unavailable("parse", False, f"Haiku JSON parse: {str(e2)}")
+            # Map Haiku's score+violations into the tri-state contract. Score
+            # threshold semantics preserved from prior versions (>=85 pass).
+            raw_score = result.get("score")
+            score = raw_score if isinstance(raw_score, (int, float)) else 50
+            raw_violations = result.get("violations", [])
+            violations = raw_violations if isinstance(raw_violations, list) else []
+            status = "pass" if score >= 85 else "fail"
+            return {"status": status, "score": score, "violations": violations}
     except urllib.error.HTTPError as e:
         err_body = ""
         try:
             err_body = e.read().decode("utf-8")[:500]
         except Exception:
             pass
-        return {"score": -1, "error": f"HTTP {e.code}: {err_body}"}
+        body_lower = err_body.lower()
+        # Anthropic returns the credit-balance error as 400 with body containing
+        # "credit balance is too low" or "insufficient_quota". Both signal a
+        # billing exhaustion; not retryable until topped up. Operator alert
+        # fires immediately because no in-band retry will recover.
+        if "insufficient_quota" in body_lower or "credit balance" in body_lower:
+            return _unavailable("billing", False, f"HTTP {e.code}: credit/quota exhausted")
+        if e.code == 401 or "unauthorized" in body_lower:
+            return _unavailable("auth", False, f"HTTP {e.code}: unauthorized")
+        if 500 <= e.code < 600:
+            # Upstream server error — retry might recover; classify as network.
+            return _unavailable("network", True, f"HTTP {e.code}: upstream error")
+        return _unavailable("api_error", False, f"HTTP {e.code}: {err_body[:200]}")
     except urllib.error.URLError as e:
-        return {"score": -3, "error": f"Network error: {e.reason}"}
+        return _unavailable("network", True, f"Network error: {e.reason}")
     except json.JSONDecodeError as e:
-        return {"score": -2, "error": f"JSON parse error: {str(e)}"}
+        return _unavailable("parse", False, f"JSON parse error: {str(e)}")
     except TimeoutError:
-        return {"score": -4, "error": "timeout"}
+        return _unavailable("timeout", True, "Anthropic request timed out (10s)")
     except Exception as e:
-        return {"score": -1, "error": str(e)}
+        return _unavailable("api_error", False, str(e))
 
 
 class QualityCheckHandler(BaseHTTPRequestHandler):
@@ -250,28 +386,72 @@ class QualityCheckHandler(BaseHTTPRequestHandler):
             self.wfile.write(b'{"error": "unauthorized"}')
             return
 
-        try:
-            length = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(length))
-            response_text = body.get("response", "")
-
-            if not response_text:
-                self.send_response(400)
+        # In-flight cap. Bearer auth doesn't help against a compromised
+        # container (token is in the shared RO .env mount), so cap concurrent
+        # handlers to bound the Anthropic spend surface. Over-cap requests
+        # return HTTP 429 + status=unavailable+reason=busy immediately —
+        # no upstream call. Container side classifies "busy" as retryable.
+        global QUALITY_CHECK_INFLIGHT_COUNT
+        with QUALITY_CHECK_INFLIGHT_LOCK:
+            if QUALITY_CHECK_INFLIGHT_COUNT >= QUALITY_CHECK_INFLIGHT_CAP:
+                busy = _unavailable(
+                    "busy", True,
+                    f"in-flight cap {QUALITY_CHECK_INFLIGHT_CAP} reached"
+                )
+                self.send_response(429)
+                self.send_header("Content-Type", "application/json")
                 self.end_headers()
-                self.wfile.write(b'{"error": "missing response field"}')
+                self.wfile.write(json.dumps(busy).encode("utf-8"))
+                # Loud-log only; no operator alert (cap saturation is a
+                # capacity signal, not an outage).
+                log(f"Quality-check BUSY: in-flight={QUALITY_CHECK_INFLIGHT_COUNT}/{QUALITY_CHECK_INFLIGHT_CAP}")
                 return
+            QUALITY_CHECK_INFLIGHT_COUNT += 1
 
-            result = _call_haiku(response_text)
+        try:
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length))
+                response_text = body.get("response", "")
 
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps(result).encode("utf-8"))
+                if not response_text:
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(b'{"error": "missing response field"}')
+                    return
 
-        except Exception as e:
-            self.send_response(500)
-            self.end_headers()
-            self.wfile.write(json.dumps({"score": -1, "error": str(e)}).encode("utf-8"))
+                result = _call_haiku(response_text)
+
+                # Operator alert + log on any unavailable. Loud-log on every
+                # unavailable; alert is dedup-gated inside _maybe_send_*.
+                if result.get("status") == "unavailable":
+                    reason = result.get("reason", "api_error")
+                    detail = result.get("detail", "")
+                    log(
+                        f"Quality-check UNAVAILABLE: reason={reason} "
+                        f"detail={detail[:200]} prompt_sha={QUALITY_CHECK_PROMPT_SHA}"
+                    )
+                    _maybe_send_operator_alert(reason, detail)
+
+                # Tri-state response always HTTP 200 (transitional). Old
+                # containers parse score+violations; new containers parse
+                # status. Both work.
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps(result).encode("utf-8"))
+
+            except Exception as e:
+                # Handler-level fault → still return tri-state shape so
+                # container parser can route as unavailable rather than
+                # falling into the legacy score-only branch.
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps(_unavailable("api_error", False, str(e))).encode("utf-8"))
+        finally:
+            with QUALITY_CHECK_INFLIGHT_LOCK:
+                QUALITY_CHECK_INFLIGHT_COUNT -= 1
 
     def log_message(self, format, *args):
         # Suppress default stderr logging — we use our own log()
@@ -941,7 +1121,7 @@ def check_escalations() -> None:
 
 
 def main() -> None:
-    global health_check_attempt, QUALITY_CHECK_TOKEN
+    global health_check_attempt, QUALITY_CHECK_TOKEN, QUALITY_CHECK_PROMPT, QUALITY_CHECK_PROMPT_SHA
     log("Atlas Host-Executor starting")
     log(f"  Watching: {PENDING_DIR}")
     log(f"  Output:   {COMPLETED_DIR}")
@@ -953,10 +1133,7 @@ def main() -> None:
     # /quality-check endpoint — an optional governance feature. The rest of
     # host-executor (task processing, escalations, auto-push) does not depend
     # on it. So we DON'T fail-closed at startup; instead, the endpoint itself
-    # returns 401 for every request when the token is empty, which the
-    # container-side callHaiku() gracefully treats as checkerUnavailable
-    # (audit-honest, response still flows). This avoids a service-breaking
-    # regression on hosts that haven't yet provisioned the token.
+    # returns 401 for every request when the token is empty.
     QUALITY_CHECK_TOKEN = _load_quality_check_token()
     if QUALITY_CHECK_TOKEN:
         log(f"  Quality check auth: enabled (token len={len(QUALITY_CHECK_TOKEN)})")
@@ -966,11 +1143,38 @@ def main() -> None:
         log("    openssl rand -hex 32")
         log("  and add it to ~/.atlas/.env as QUALITY_CHECK_TOKEN=<value>, then restart.")
 
-    # Start quality check HTTP server (used by container response interceptor)
+    # Quality-check prompt: fail-fast if missing. The prompt IS governance
+    # contract — running with a missing/silent-fallback prompt would be a
+    # second long-lived silent bypass mode (codex consult 2026-04-25 R5).
+    # Refuse to start until the file is present in the repo.
+    try:
+        QUALITY_CHECK_PROMPT = QUALITY_CHECK_PROMPT_PATH.read_text()
+    except (FileNotFoundError, PermissionError, OSError) as e:
+        log(f"FATAL: Quality-check prompt not loadable from {QUALITY_CHECK_PROMPT_PATH}: {e}")
+        log("Refusing to start. Restore the prompt file in the repo and redeploy.")
+        log("File path is computed from NANOCLAW_DIR. Check that env var or default ~/nanoclaw is correct.")
+        sys.exit(1)
+    if not QUALITY_CHECK_PROMPT.strip():
+        log(f"FATAL: Quality-check prompt at {QUALITY_CHECK_PROMPT_PATH} is empty.")
+        log("Refusing to start. Restore content and redeploy.")
+        sys.exit(1)
+    if "{RESPONSE}" not in QUALITY_CHECK_PROMPT:
+        log(f"FATAL: Quality-check prompt at {QUALITY_CHECK_PROMPT_PATH} missing {{RESPONSE}} placeholder.")
+        log("Refusing to start. Without the placeholder the response text is never injected.")
+        sys.exit(1)
+    QUALITY_CHECK_PROMPT_SHA = hashlib.sha256(QUALITY_CHECK_PROMPT.encode("utf-8")).hexdigest()[:12]
+    log(f"  Quality check prompt: loaded ({len(QUALITY_CHECK_PROMPT)} chars, sha={QUALITY_CHECK_PROMPT_SHA})")
+
+    # Start quality check HTTP server. Bind failure is FATAL — the service
+    # cannot do its job and silently continuing degraded was an existing bug
+    # (host-executor.py:969-973 prior shape: WARNING + continue forever).
     try:
         start_quality_check_server()
     except Exception as e:
-        log(f"WARNING: Quality check server failed to start: {e}")
+        log(f"FATAL: Quality check server failed to start: {e}")
+        log("Refusing to start. Resolve the bind issue (likely port conflict on "
+            f"{QUALITY_CHECK_PORT}) and redeploy.")
+        sys.exit(1)
 
     # Ensure directories exist
     for d in [PENDING_DIR, COMPLETED_DIR, OUTPUTS_DIR]:
