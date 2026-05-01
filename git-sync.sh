@@ -143,11 +143,18 @@ if [ -d "$ATLAS_CMD_DIR/.git" ]; then
             # Guard the restart on unit being installed — fresh / partially
             # bootstrapped hosts may have atlas-command source pulled but
             # the systemd unit not yet installed (which lives outside this
-            # repo's deploy artifacts). Cross-review of 83fd4aa raised this
-            # as F2 BLOCKING.
-            if systemctl list-unit-files atlas-mission-control.service >/dev/null 2>&1; then
-                echo "$TIMESTAMP | BUILD | atlas-command | Build succeeded, restarting" >> "$LOG"
-                sudo /usr/bin/systemctl restart atlas-mission-control
+            # repo's deploy artifacts). Cross-review of f23b1f7 caught
+            # that `list-unit-files` returns 0 even for missing units — use
+            # `systemctl cat` instead, which is a real existence probe (non-
+            # zero on missing). Also check the restart's own exit code so
+            # a failed restart logs FAIL rather than silently claiming
+            # success.
+            if systemctl cat atlas-mission-control.service >/dev/null 2>&1; then
+                if sudo /usr/bin/systemctl restart atlas-mission-control; then
+                    echo "$TIMESTAMP | BUILD | atlas-command | Build succeeded, restart OK" >> "$LOG"
+                else
+                    echo "$TIMESTAMP | FAIL | atlas-command | Build succeeded but restart failed" >> "$LOG"
+                fi
             else
                 echo "$TIMESTAMP | BUILD | atlas-command | Build succeeded, unit not installed — skipping restart" >> "$LOG"
             fi

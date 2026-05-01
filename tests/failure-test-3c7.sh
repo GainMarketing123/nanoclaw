@@ -156,8 +156,10 @@ test_6_watchdog_logging() {
 
     # Guard the stop on unit existence — environments without the unit
     # installed would otherwise fail set -e and abort the suite. Cross-
-    # review of 83fd4aa raised this as F3 SOFT.
-    if ! systemctl list-unit-files atlas-mission-control.service >/dev/null 2>&1; then
+    # review of f23b1f7 caught that `list-unit-files` returns 0 even for
+    # missing units; use `systemctl cat` instead which is a real existence
+    # probe (non-zero on missing).
+    if ! systemctl cat atlas-mission-control.service >/dev/null 2>&1; then
         log "TEST 6: skipped (atlas-mission-control unit not installed)"
         return 0
     fi
@@ -192,7 +194,16 @@ test_7_disk_alert() {
 test_8_full_recovery() {
     log "TEST 8: Full service verification"
 
-    SERVICES="nanoclaw atlas-host-executor atlas-mission-control caddy"
+    # Build the service list dynamically — environments without the
+    # atlas-mission-control unit installed would otherwise fail set -e
+    # on `sudo systemctl start atlas-mission-control` and abort the suite.
+    # Cross-review of f23b1f7 raised this as F3 BLOCKING.
+    SERVICES="nanoclaw atlas-host-executor caddy"
+    if systemctl cat atlas-mission-control.service >/dev/null 2>&1; then
+        SERVICES="$SERVICES atlas-mission-control"
+    else
+        log "INFO | atlas-mission-control: unit not installed — skipping in recovery check"
+    fi
     ALL_UP=true
     for svc in $SERVICES; do
         if systemctl is-active --quiet "$svc"; then
