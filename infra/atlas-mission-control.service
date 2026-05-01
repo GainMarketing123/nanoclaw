@@ -1,36 +1,50 @@
 [Unit]
-Description=Atlas Mission Control Dashboard
-Documentation=https://github.com/GainMarketing123/nanoclaw
+Description=Atlas Command Dashboard
+Documentation=https://github.com/GainMarketing123/atlas-command
 After=nanoclaw.service
+
+# NOTE: The deployed service runs `atlas-command` (Next.js) at
+# /home/atlas/atlas-command, not the legacy `mission-control/server.cjs`
+# in this nanoclaw repo. This unit file is the source-of-truth mirror
+# of the live VPS deployment per Wave 1.A.6 Phase 2 audit §10
+# (atlas-engineering plans/1-a-6-host-executor-mission-control-audit.md).
+# The 2026-05-01 split moved User= from `gateway` to `nanoclaw-mc` (a
+# dedicated unprivileged service user with no Docker group membership)
+# and bound port 8080 to loopback only behind the existing Caddy reverse
+# proxy. atlas-command lives in its own repo
+# (https://github.com/GainMarketing123/atlas-command) and reads ATLAS
+# state files via env-driven paths — see audit §10.1 for inventory.
 
 [Service]
 Type=simple
-User=atlas
-Group=atlas
-WorkingDirectory=/home/atlas/nanoclaw
-ExecStart=/usr/bin/node /home/atlas/nanoclaw/mission-control/server.cjs
+User=nanoclaw-mc
+Group=atlas-svc
+WorkingDirectory=/home/atlas/atlas-command
+ExecStart=/usr/bin/npm start -- -H 127.0.0.1
 Restart=on-failure
 RestartSec=10
-# Exit code 2 means "missing credentials" (server.cjs fail-closed path).
-# Don't restart in a tight loop — leave the unit failed so journalctl shows
-# one clean error instead of a spam of identical exits every 10 seconds.
-RestartPreventExitStatus=2
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=atlas-mission-control
+SyslogIdentifier=atlas-command
 
 # Environment
 Environment=HOME=/home/atlas
 Environment=TZ=America/New_York
-Environment=MC_PORT=8080
+Environment=PORT=8080
+Environment=ATLAS_DIR=/home/atlas/.atlas
+Environment=CLAUDE_DIR=/home/atlas/.claude
+Environment=NANOCLAW_DIR=/home/atlas/nanoclaw
+Environment=NODE_ENV=production
 
-# Load /home/atlas/nanoclaw/.env if present so MISSION_CONTROL_USER and
-# MISSION_CONTROL_PASS reach the service. The leading `-` makes systemd
-# tolerate a missing file (server.cjs also has a second .env-read fallback).
-# server.cjs is fail-closed — it refuses to start if either credential is
-# unset, so the dashboard will not run insecurely even if both load paths
-# come up empty.
-EnvironmentFile=-/home/atlas/nanoclaw/.env
+# Hardening — dashboard is mostly read-only
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/home/atlas/atlas-command/.next /home/atlas/atlas-command/node_modules/.cache /tmp
+ReadOnlyPaths=/home/atlas/.atlas /home/atlas/.claude
+NoNewPrivileges=true
+LimitNPROC=512
+ProtectKernelTunables=true
+ProtectControlGroups=true
 
 [Install]
 WantedBy=multi-user.target
