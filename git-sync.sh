@@ -61,18 +61,14 @@ if [ -d "$NANOCLAW_DIR/.git" ]; then
       echo "$TIMESTAMP | FAIL | atlas-host-executor | service failed to start after restart" >> "$LOG"
     fi
   fi
-  # --- atlas-mission-control restart (if infra/atlas-mission-control.service changed) ---
-  MC_CHANGED=$(git diff --name-only "$HEAD_BEFORE" "$HEAD_AFTER" -- infra/atlas-mission-control.service 2>/dev/null)
-  if [ -n "$MC_CHANGED" ]; then
-    echo "$TIMESTAMP | RESTART | atlas-mission-control | infra changed, restarting" >> "$LOG"
-    sudo /usr/bin/systemctl restart atlas-mission-control.service
-    sleep 3
-    if systemctl is-active --quiet atlas-mission-control.service; then
-      echo "$TIMESTAMP | RESTART | atlas-mission-control | service restarted successfully" >> "$LOG"
-    else
-      echo "$TIMESTAMP | FAIL | atlas-mission-control | service failed to start after restart" >> "$LOG"
-    fi
-  fi
+  # MC_CHANGED restart block removed 2026-05-01: the legacy
+  # mission-control/server.cjs deployment was deprecated, the
+  # infra/atlas-mission-control.service unit was deleted from this repo
+  # in the same commit, and the live atlas-mission-control deployment
+  # now points at /home/atlas/atlas-command (which has its own
+  # auto-pull + rebuild + restart block further down at the
+  # "Atlas Command" section). See ~/.atlas/plans/1-a-6-host-executor-mission-control-audit.md
+  # §11 (Wave 1.A.6 Phase 2 LANDED 2026-05-01) for full context.
     fi
 fi
 
@@ -144,8 +140,17 @@ if [ -d "$ATLAS_CMD_DIR/.git" ]; then
         echo "$TIMESTAMP | BUILD | atlas-command | Source changed, rebuilding..." >> "$LOG"
         BUILD_OUT=$(cd "$ATLAS_CMD_DIR" && npm run build 2>&1)
         if [ $? -eq 0 ]; then
-            echo "$TIMESTAMP | BUILD | atlas-command | Build succeeded, restarting" >> "$LOG"
-            sudo /usr/bin/systemctl restart atlas-mission-control
+            # Guard the restart on unit being installed — fresh / partially
+            # bootstrapped hosts may have atlas-command source pulled but
+            # the systemd unit not yet installed (which lives outside this
+            # repo's deploy artifacts). Cross-review of 83fd4aa raised this
+            # as F2 BLOCKING.
+            if systemctl list-unit-files atlas-mission-control.service >/dev/null 2>&1; then
+                echo "$TIMESTAMP | BUILD | atlas-command | Build succeeded, restarting" >> "$LOG"
+                sudo /usr/bin/systemctl restart atlas-mission-control
+            else
+                echo "$TIMESTAMP | BUILD | atlas-command | Build succeeded, unit not installed — skipping restart" >> "$LOG"
+            fi
         else
             echo "$TIMESTAMP | FAIL | atlas-command | Build failed: ${BUILD_OUT:0:200}" >> "$LOG"
         fi

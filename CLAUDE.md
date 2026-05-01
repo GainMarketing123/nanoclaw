@@ -29,7 +29,7 @@ Mission control redesign (v2.0.0): bridge-first architecture with SQLite state f
 | `src/task-scheduler.ts` | Runs scheduled tasks, M2 graduation evaluation |
 | `src/db.ts` | SQLite operations |
 | `host/host-executor.py` | VPS host bridge: watches pending tasks, runs `claude -p`, auto-pushes commits |
-| `mission-control/server.cjs` | CEO glance dashboard (server-rendered HTML, basic auth, auto-refresh) |
+| `mission-control/server.cjs` | DEPRECATED — legacy single-file dashboard. The live CEO dashboard is `atlas-command` (separate repo, Next.js 15.3) reverse-proxied behind Caddy at https://atlas.gainpropertygroup.com/. As of 2026-05-01 the systemd `atlas-mission-control.service` runs `atlas-command` under user `nanoclaw-mc` (Wave 1.A.6 Phase 2). The unit file is no longer tracked in this repo's `infra/` — live config lives on the VPS at `/etc/systemd/system/atlas-mission-control.service` with backup. |
 | `DESIGN.md` | Atlas Command cockpit design system (Sprint 1P.5) — typography, color, layout source of truth |
 | `git-sync.sh` | VPS sync: pull updates, restart services on changes |
 | `groups/{name}/CLAUDE.md` | Per-group memory (isolated) |

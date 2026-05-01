@@ -154,6 +154,14 @@ test_6_watchdog_logging() {
     WLOG=/home/atlas/nanoclaw/logs/watchdog.log
     BEFORE=$(wc -l < "$WLOG" 2>/dev/null || echo 0)
 
+    # Guard the stop on unit existence — environments without the unit
+    # installed would otherwise fail set -e and abort the suite. Cross-
+    # review of 83fd4aa raised this as F3 SOFT.
+    if ! systemctl list-unit-files atlas-mission-control.service >/dev/null 2>&1; then
+        log "TEST 6: skipped (atlas-mission-control unit not installed)"
+        return 0
+    fi
+
     sudo systemctl stop atlas-mission-control
     sleep 1
     sudo bash "$WATCHDOG"
