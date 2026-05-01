@@ -154,14 +154,24 @@ if [ -d "$ATLAS_CMD_DIR/.git" ]; then
                     # systemctl restart returns 0 when the COMMAND succeeded,
                     # not when the service came up healthy. A unit that
                     # crashes during ExecStart can still produce a restart
-                    # exit-code 0 within the first second. Sleep briefly,
-                    # then verify the service is actually active. Carry-over
-                    # SOFT item 7 from session d26591d8 round-5 review.
-                    sleep 2
-                    if systemctl is-active --quiet atlas-mission-control; then
+                    # exit-code 0 within the first second. Poll for is-active
+                    # with a bounded retry budget — fixed sleep would either
+                    # misclassify slow starters as failed (too short) or
+                    # waste cron-cycle time on fast starters (too long).
+                    # ~10s ceiling at 0.5s resolution. Round-1 codex SOFT
+                    # (27bc840) refinement of round-5 carry-over item 7.
+                    RESTART_OK=false
+                    for _ in $(seq 1 20); do
+                        if systemctl is-active --quiet atlas-mission-control; then
+                            RESTART_OK=true
+                            break
+                        fi
+                        sleep 0.5
+                    done
+                    if $RESTART_OK; then
                         echo "$TIMESTAMP | BUILD | atlas-command | Build succeeded, restart OK" >> "$LOG"
                     else
-                        echo "$TIMESTAMP | FAIL | atlas-command | Build succeeded, restart returned 0 but service is not active post-restart" >> "$LOG"
+                        echo "$TIMESTAMP | FAIL | atlas-command | Build succeeded, restart returned 0 but service did not become active within 10s" >> "$LOG"
                     fi
                 else
                     echo "$TIMESTAMP | FAIL | atlas-command | Build succeeded but restart failed" >> "$LOG"

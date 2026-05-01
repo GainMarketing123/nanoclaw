@@ -14,6 +14,7 @@ TIMESTAMP=$(date +%Y-%m-%dT%H:%M:%S%z)
 log() { echo "$(date +%Y-%m-%dT%H:%M:%S%z) | $1" | tee -a "$LOG"; }
 pass() { log "PASS | Test $1: $2"; }
 fail() { log "FAIL | Test $1: $2"; FAILURES=$((FAILURES+1)); }
+skip() { log "SKIP | Test $1: $2"; }
 
 FAILURES=0
 
@@ -22,7 +23,7 @@ test_1_nanoclaw_restart() {
     log "TEST 1: NanoClaw watchdog restart"
 
     if ! systemctl cat nanoclaw >/dev/null 2>&1; then
-        fail 1 "NanoClaw unit not installed — skipping"
+        skip 1 "NanoClaw unit not installed — environmental skip"
         return
     fi
     if ! systemctl is-active --quiet nanoclaw; then
@@ -55,7 +56,7 @@ test_2_executor_restart() {
     log "TEST 2: Host-executor watchdog restart"
 
     if ! systemctl cat atlas-host-executor >/dev/null 2>&1; then
-        fail 2 "Host-executor unit not installed — skipping"
+        skip 2 "Host-executor unit not installed — environmental skip"
         return
     fi
     if ! systemctl is-active --quiet atlas-host-executor; then
@@ -88,7 +89,7 @@ test_3_mission_control_restart() {
     log "TEST 3: Mission control watchdog restart"
 
     if ! systemctl cat atlas-mission-control >/dev/null 2>&1; then
-        fail 3 "Mission control unit not installed — skipping"
+        skip 3 "Mission control unit not installed — environmental skip"
         return
     fi
     if ! systemctl is-active --quiet atlas-mission-control; then
@@ -114,7 +115,7 @@ test_4_caddy_restart() {
     log "TEST 4: Caddy watchdog restart"
 
     if ! systemctl cat caddy >/dev/null 2>&1; then
-        fail 4 "Caddy unit not installed — skipping"
+        skip 4 "Caddy unit not installed — environmental skip"
         return
     fi
     if ! systemctl is-active --quiet caddy; then
