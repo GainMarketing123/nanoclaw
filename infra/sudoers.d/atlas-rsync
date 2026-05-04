@@ -1,0 +1,30 @@
+# Phase 3.0 (1.A.6) — atlas-rsync sudoers grant
+#
+# Allows the unprivileged atlas user to mirror atlas lib code into
+# root-owned /usr/local/lib/atlas via the rsync invocation in
+# nanoclaw/git-sync.sh. The grant is locked to the exact command line —
+# any deviation (other source/dest, other flags) requires a password.
+# Atlas user has no general sudo elsewhere; this is the narrowest grant
+# that lets the daily git-sync mirror the lib without opening the door
+# to broader privilege escalation.
+#
+# Why root-owned destination: Phase 3.1+ will chattr +i seal
+# /usr/local/lib/atlas to block tamper from a compromised atlas account.
+# The seal works only if the directory + contents are root-owned; rsync
+# under sudo writes as root, preserving that ownership invariant.
+#
+# Install on the VPS (one-time Phase 3.0 cutover step, requires real root):
+#
+#   sudo install -d -m 755 -o root -g root /usr/local/lib/atlas
+#   sudo install -m 440 -o root -g root \
+#       /home/atlas/nanoclaw/infra/sudoers.d/atlas-rsync \
+#       /etc/sudoers.d/atlas-rsync
+#   sudo visudo -c                              # validate, must report OK
+#   sudo -u atlas sudo -n rsync --version >/dev/null && echo OK   # smoke test
+#
+# Removal (rollback):
+#
+#   sudo rm /etc/sudoers.d/atlas-rsync
+#   sudo visudo -c
+#
+atlas ALL=(root) NOPASSWD: /usr/bin/rsync -a --delete /home/atlas/.atlas/lib/ /usr/local/lib/atlas/

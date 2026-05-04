@@ -79,6 +79,22 @@ if [ -d /home/atlas/.atlas/.git ]; then
     cd /home/atlas/.atlas
     git checkout -- autonomy/graduation-status.json 2>/dev/null
     sync_repo /home/atlas/.atlas atlas-core
+    # Phase 3.0 (1.A.6): mirror atlas lib to root-owned /usr/local/lib/atlas
+    # after every atlas-core pull. Pre-cutover (directory absent), the
+    # `[ -d ]` guard makes this a no-op so the script works on hosts that
+    # haven't been upgraded yet. Sudoers entry at /etc/sudoers.d/atlas-rsync
+    # (deployed as a Phase 3.0 cutover step from infra/sudoers.d/atlas-rsync)
+    # gates the sudo call to this exact rsync command — atlas user has no
+    # general sudo grant. host-executor.py prefers /usr/local/lib/atlas via
+    # _ATLAS_LIB_PATH; if rsync fails the fallback at ATLAS_DIR/lib keeps
+    # the service running while the failure is logged.
+    if [ -d /usr/local/lib/atlas ]; then
+        rsync_out=$(sudo rsync -a --delete /home/atlas/.atlas/lib/ /usr/local/lib/atlas/ 2>&1)
+        rsync_status=$?
+        if [ $rsync_status -ne 0 ]; then
+            echo "$TIMESTAMP | FAIL | atlas-lib-sync | exit=$rsync_status $rsync_out" >> "$LOG"
+        fi
+    fi
 fi
 
 # Claude config (CLAUDE.md, hooks registration, planning docs, skills)

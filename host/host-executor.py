@@ -41,8 +41,37 @@ from pathlib import Path
 # decoupling — atlas-command (the live mission-control surface) already
 # uses this pattern; host-executor adopts it here so future user-account
 # migration work doesn't require simultaneous code + deploy changes.
-ATLAS_DIR = Path(os.environ.get("ATLAS_DIR") or str(Path.home() / ".atlas"))
-NANOCLAW_DIR = Path(os.environ.get("NANOCLAW_DIR") or str(Path.home() / "nanoclaw"))
+#
+# Phase 3.0 (1.A.6): when the systemd unit sets ATLAS_HOST_MODE=production,
+# the Path.home() fallback is disabled — missing env vars become an explicit
+# RuntimeError at startup. This closes the "User= changed, path silently
+# moved" gap that motivated the env-var override pattern in the first place
+# (Path.home() under a different User= still resolves cleanly, just to the
+# wrong tree). Laptop / dev / manual `python3 host-executor.py --test` runs
+# without ATLAS_HOST_MODE set, so the dev fallback still works.
+def _resolve_dir(env_var: str, dev_default: Path) -> Path:
+    val = os.environ.get(env_var)
+    if val:
+        return Path(val)
+    if os.environ.get("ATLAS_HOST_MODE") == "production":
+        raise RuntimeError(
+            f"{env_var} must be set when ATLAS_HOST_MODE=production. "
+            f"Add {env_var}=<absolute-path> to the systemd unit's "
+            f"EnvironmentFile= or remove ATLAS_HOST_MODE for dev mode."
+        )
+    return dev_default
+
+ATLAS_DIR = _resolve_dir("ATLAS_DIR", Path.home() / ".atlas")
+NANOCLAW_DIR = _resolve_dir("NANOCLAW_DIR", Path.home() / "nanoclaw")
+# Phase 3.0 (1.A.6): on the VPS, atlas lib code lives at root-owned
+# /usr/local/lib/atlas (synced by git-sync.sh after every atlas-core pull;
+# chattr +i seal arrives in Phase 3.1+). On the laptop and on any pre-cutover
+# VPS, ATLAS_DIR/lib is the source. One-time path-existence check at module
+# import picks the prod path when present and falls back so this works
+# identically pre- and post-cutover. Resolution is one-shot at startup —
+# subsequent appearance / removal of the prod path takes effect on next
+# service restart, which matches the chattr +i seal/unseal cycle pattern.
+_ATLAS_LIB_PATH = "/usr/local/lib/atlas" if Path("/usr/local/lib/atlas").exists() else str(ATLAS_DIR / "lib")
 PENDING_DIR = ATLAS_DIR / "host-tasks" / "pending"
 COMPLETED_DIR = ATLAS_DIR / "host-tasks" / "completed"
 OUTPUTS_DIR = ATLAS_DIR / "host-tasks" / "outputs"
@@ -758,7 +787,7 @@ def process_task(task_path: Path) -> None:
         if task.get("type") == "mission":
             try:
                 import sys as _m_sys
-                _m_sys.path.insert(0, str(ATLAS_DIR / "lib"))
+                _m_sys.path.insert(0, _ATLAS_LIB_PATH)
                 # SSRF scan on mission prompts
                 import re as _mission_re
                 from ssrf import validate_endpoint_url as _m_validate
@@ -798,7 +827,7 @@ def process_task(task_path: Path) -> None:
         try:
             import re as _re
             import sys as _ssrf_sys
-            _ssrf_sys.path.insert(0, str(ATLAS_DIR / "lib"))
+            _ssrf_sys.path.insert(0, _ATLAS_LIB_PATH)
             from ssrf import validate_endpoint_url
             urls_in_prompt = _re.findall(r'https?://[^\s\"\'<>]+', prompt)
             for url in urls_in_prompt:
@@ -830,7 +859,7 @@ def process_task(task_path: Path) -> None:
         if task_type in ROUTE_ELIGIBLE_TYPES:
             try:
                 import sys as _sys
-                _sys.path.insert(0, str(ATLAS_DIR / "lib"))
+                _sys.path.insert(0, _ATLAS_LIB_PATH)
                 from providers import route as atlas_route
                 route_result = atlas_route(task_type, prompt, entity=entity)
                 if route_result.success:
@@ -955,7 +984,7 @@ def process_task(task_path: Path) -> None:
         # --- Performance tracking (GStack adoption #6) ---
         try:
             import sys as _perf_sys
-            _perf_sys.path.insert(0, str(ATLAS_DIR / "lib"))
+            _perf_sys.path.insert(0, _ATLAS_LIB_PATH)
             from performance_tracker import track as perf_track
             perf_track("task", task_id, duration_ms / 1000.0, entity=entity, model=model)
         except Exception as e:
@@ -973,7 +1002,7 @@ def process_task(task_path: Path) -> None:
         # Only Tier 1 tasks count toward M2 (Tier 1 = read-only autonomous ops).
         if tier == 1:
             try:
-                sys.path.insert(0, str(ATLAS_DIR / "lib"))
+                sys.path.insert(0, _ATLAS_LIB_PATH)
                 from autonomy_tracker import evaluate_m2_clean_run
                 m2_result = evaluate_m2_clean_run(
                     task_id=task_id,
