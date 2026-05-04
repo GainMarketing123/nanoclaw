@@ -27,6 +27,14 @@ Environment=PATH=/usr/local/bin:/usr/bin:/bin:/home/atlas/.local/bin
 # after the unit lands) continue to behave as before.
 Environment=ATLAS_DIR=/home/atlas/.atlas
 Environment=NANOCLAW_DIR=/home/atlas/nanoclaw
+# Phase 3.0 (1.A.6): activate the production fail-closed path in
+# host-executor.py — when ATLAS_HOST_MODE=production is set, missing
+# ATLAS_DIR / NANOCLAW_DIR env vars become an explicit RuntimeError at
+# module import instead of silently falling back to Path.home(). Without
+# this, the dev-mode fallback runs in production and the User= migration
+# hardening declared in the comment block at lines 23-29 is inactive.
+# Round-1 codex SOFT (e0b6fe0 F3) closure.
+Environment=ATLAS_HOST_MODE=production
 
 # Minimal hardening — claude -p needs broad filesystem access for hooks
 NoNewPrivileges=true

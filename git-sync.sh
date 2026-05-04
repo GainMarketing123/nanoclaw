@@ -49,17 +49,22 @@ if [ -d "$NANOCLAW_DIR/.git" ]; then
             fi
         fi
 
-  # --- atlas-host-executor restart (if host/ or infra/ changed) ---
+  # --- atlas-host-executor restart trigger (deferred) ---
+  # Round-1 codex BLOCKING (e0b6fe0 F2): restarting here, BEFORE the atlas-core
+  # pull + lib rsync below (line ~78+), would land the new host code against
+  # the OLD atlas-core lib snapshot. host-executor.py resolves _ATLAS_LIB_PATH
+  # ONCE at module import and then lazily imports atlas-lib modules during
+  # task execution; once any module is imported, sys.modules caches it for
+  # the process's lifetime. A restart here followed by an atlas-core lib
+  # update would leave the running process using stale lib modules until
+  # another restart. Defer the restart to AFTER atlas-core pull + rsync so
+  # the new process imports against the fresh lib (whether served from
+  # /usr/local/lib/atlas or ATLAS_DIR/lib fallback).
   HOST_CHANGED=$(git diff --name-only "$HEAD_BEFORE" "$HEAD_AFTER" -- host/ infra/ 2>/dev/null)
   if [ -n "$HOST_CHANGED" ]; then
-    echo "$TIMESTAMP | RESTART | atlas-host-executor | host/ or infra/ changed, restarting" >> "$LOG"
-    sudo /usr/bin/systemctl restart atlas-host-executor.service
-    sleep 3
-    if systemctl is-active --quiet atlas-host-executor.service; then
-      echo "$TIMESTAMP | RESTART | atlas-host-executor | service restarted successfully" >> "$LOG"
-    else
-      echo "$TIMESTAMP | FAIL | atlas-host-executor | service failed to start after restart" >> "$LOG"
-    fi
+    NEEDS_HOST_EXECUTOR_RESTART=1
+    NEEDS_HOST_EXECUTOR_RESTART_REASON="nanoclaw host/ or infra/ changed"
+    echo "$TIMESTAMP | DEFER_RESTART | atlas-host-executor | $NEEDS_HOST_EXECUTOR_RESTART_REASON" >> "$LOG"
   fi
   # MC_CHANGED restart block removed 2026-05-01: the legacy
   # mission-control/server.cjs deployment was deprecated, the
@@ -78,7 +83,9 @@ fi
 if [ -d /home/atlas/.atlas/.git ]; then
     cd /home/atlas/.atlas
     git checkout -- autonomy/graduation-status.json 2>/dev/null
+    HEAD_BEFORE_AC=$(git rev-parse HEAD 2>/dev/null)
     sync_repo /home/atlas/.atlas atlas-core
+    HEAD_AFTER_AC=$(git rev-parse HEAD 2>/dev/null)
     # Phase 3.0 (1.A.6): mirror atlas lib to root-owned /usr/local/lib/atlas
     # after every atlas-core pull. Pre-cutover (directory absent), the
     # `[ -d ]` guard makes this a no-op so the script works on hosts that
@@ -94,6 +101,42 @@ if [ -d /home/atlas/.atlas/.git ]; then
         if [ $rsync_status -ne 0 ]; then
             echo "$TIMESTAMP | FAIL | atlas-lib-sync | exit=$rsync_status $rsync_out" >> "$LOG"
         fi
+    fi
+    # Round-1 codex BLOCKING (e0b6fe0 F1): if atlas-core lib/ changed, the
+    # running atlas-host-executor process has cached old modules in
+    # sys.modules and will keep using them until restart. Detect lib/
+    # changes and set the deferred-restart flag so the consolidated restart
+    # block at the end picks up the fresh lib code.
+    if [ "$HEAD_BEFORE_AC" != "$HEAD_AFTER_AC" ] && [ -n "$HEAD_BEFORE_AC" ] && [ -n "$HEAD_AFTER_AC" ]; then
+        LIB_CHANGED=$(git diff --name-only "$HEAD_BEFORE_AC" "$HEAD_AFTER_AC" -- lib/ 2>/dev/null)
+        if [ -n "$LIB_CHANGED" ]; then
+            NEEDS_HOST_EXECUTOR_RESTART=1
+            if [ -n "${NEEDS_HOST_EXECUTOR_RESTART_REASON:-}" ]; then
+                NEEDS_HOST_EXECUTOR_RESTART_REASON="$NEEDS_HOST_EXECUTOR_RESTART_REASON; atlas-core lib/ changed"
+            else
+                NEEDS_HOST_EXECUTOR_RESTART_REASON="atlas-core lib/ changed"
+            fi
+            echo "$TIMESTAMP | DEFER_RESTART | atlas-host-executor | atlas-core lib/ changed" >> "$LOG"
+        fi
+    fi
+fi
+
+# --- Single deferred atlas-host-executor restart ---
+# Round-1 codex BLOCKING (e0b6fe0 F1+F2): consolidated restart point.
+# Triggers from BOTH nanoclaw host/infra changes AND atlas-core lib changes.
+# Running here (after both pulls + rsync) ensures the restarted process sees
+# fresh nanoclaw code AND fresh atlas-core lib in /usr/local/lib/atlas (or in
+# the ATLAS_DIR/lib fallback). Single restart per cron cycle even if both
+# repos changed — eliminates the mixed-version window where a restart on
+# nanoclaw changes alone cached old atlas-core lib modules.
+if [ "${NEEDS_HOST_EXECUTOR_RESTART:-0}" -eq 1 ]; then
+    echo "$TIMESTAMP | RESTART | atlas-host-executor | $NEEDS_HOST_EXECUTOR_RESTART_REASON" >> "$LOG"
+    sudo /usr/bin/systemctl restart atlas-host-executor.service
+    sleep 3
+    if systemctl is-active --quiet atlas-host-executor.service; then
+        echo "$TIMESTAMP | RESTART | atlas-host-executor | service restarted successfully" >> "$LOG"
+    else
+        echo "$TIMESTAMP | FAIL | atlas-host-executor | service failed to start after restart" >> "$LOG"
     fi
 fi
 
