@@ -66,12 +66,35 @@ NANOCLAW_DIR = _resolve_dir("NANOCLAW_DIR", Path.home() / "nanoclaw")
 # Phase 3.0 (1.A.6): on the VPS, atlas lib code lives at root-owned
 # /usr/local/lib/atlas (synced by git-sync.sh after every atlas-core pull;
 # chattr +i seal arrives in Phase 3.1+). On the laptop and on any pre-cutover
-# VPS, ATLAS_DIR/lib is the source. One-time path-existence check at module
-# import picks the prod path when present and falls back so this works
-# identically pre- and post-cutover. Resolution is one-shot at startup —
-# subsequent appearance / removal of the prod path takes effect on next
-# service restart, which matches the chattr +i seal/unseal cycle pattern.
-_ATLAS_LIB_PATH = "/usr/local/lib/atlas" if Path("/usr/local/lib/atlas").exists() else str(ATLAS_DIR / "lib")
+# VPS, ATLAS_DIR/lib is the source.
+#
+# Round-1 codex BLOCKING (d5711db): the prior bare-existence check was unsafe
+# during cutover — if /usr/local/lib/atlas was created but rsync was partial,
+# stale, or silently failing, every later import site would resolve against
+# the broken tree and never retry ATLAS_DIR/lib. Validation now requires
+# every host-executor-required module file to be present in the prod path
+# before selecting it; partial trees fall back to ATLAS_DIR/lib (which holds
+# the working code) until the next git-sync run completes the mirror.
+#
+# Resolution is one-shot at startup — subsequent appearance / removal of the
+# prod path takes effect on next service restart, which matches the chattr
+# +i seal/unseal cycle pattern. The required-module set MUST include every
+# atlas-lib module host-executor.py imports below; adding a new lib import
+# requires adding the module file name here too (otherwise the validator
+# false-passes on a partial tree that's missing the new module).
+_ATLAS_LIB_REQUIRED_MODULES = (
+    "ssrf.py",
+    "providers.py",
+    "performance_tracker.py",
+    "autonomy_tracker.py",
+    "mission_executor.py",
+)
+def _resolve_atlas_lib_path() -> str:
+    prod = Path("/usr/local/lib/atlas")
+    if prod.is_dir() and all((prod / m).is_file() for m in _ATLAS_LIB_REQUIRED_MODULES):
+        return str(prod)
+    return str(ATLAS_DIR / "lib")
+_ATLAS_LIB_PATH = _resolve_atlas_lib_path()
 PENDING_DIR = ATLAS_DIR / "host-tasks" / "pending"
 COMPLETED_DIR = ATLAS_DIR / "host-tasks" / "completed"
 OUTPUTS_DIR = ATLAS_DIR / "host-tasks" / "outputs"
@@ -841,8 +864,24 @@ def process_task(task_path: Path) -> None:
                          [], False)
             task_path.unlink()
             return
-        except ImportError:
-            log("  WARNING: ssrf module not found, skipping URL validation")
+        except ImportError as ssrf_import_err:
+            # Round-1 codex SOFT (d5711db): a broken /usr/local/lib/atlas
+            # state (directory present, ssrf.py absent or unimportable) used
+            # to silently disable URL validation here — log a WARNING and
+            # continue without SSRF protection. The F1 sibling fix at module-
+            # level _resolve_atlas_lib_path() prevents the partial-prod-tree
+            # state by validating required modules before selecting the prod
+            # path; this fail-closed reject is the structural backstop for
+            # any other path that lands ssrf in a half-imported state.
+            # Reject the task rather than process it with security-relevant
+            # validation disabled.
+            log(f"  ERROR: ssrf module unavailable ({ssrf_import_err}) — rejecting task")
+            write_result(task_id, entity, "rejected", 1,
+                         f"SSRF protection: ssrf module unavailable ({ssrf_import_err}); "
+                         f"task rejected for safety. Restore the lib path or fix the import.",
+                         [], False)
+            task_path.unlink()
+            return
 
         # --- MULTI-PROVIDER ROUTING ---
         # If the task specifies a task_type that matches the routing table,

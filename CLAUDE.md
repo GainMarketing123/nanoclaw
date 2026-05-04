@@ -10,6 +10,8 @@ Three execution layers: (1) NanoClaw orchestrator handles message routing and sc
 
 Mission control redesign (v2.0.0): bridge-first architecture with SQLite state for missions. Mission lifecycle: create -> pending_approval -> approved -> executing -> synthesis -> complete. Missions flow through Atlas Bridge (HTTP) for Paperclip integration, constraint enforcement, and security evaluation. Telegram inline keyboards for CEO approve/reject. CEO-only commands gated by TELEGRAM_CEO_USER_ID.
 
+Phase 3.0 (1.A.6) shipped 2026-05-04: `host/host-executor.py` paths block now production-fail-closes via `_resolve_dir` helper when `ATLAS_HOST_MODE=production`; new module-level `_ATLAS_LIB_PATH` (computed by `_resolve_atlas_lib_path`) prefers root-owned `/usr/local/lib/atlas` when all required modules exist there, falls back to `ATLAS_DIR/lib` otherwise. SSRF `ImportError` handler now fail-closes (rejects task) instead of logging-and-continuing. `git-sync.sh` mirrors `~/.atlas/lib` into `/usr/local/lib/atlas` after every atlas-core pull (sudo, guarded by directory-existence). Sudoers grant artifact at `infra/sudoers.d/atlas-rsync`. Phase 3.1 (`ANTHROPIC_API_KEY` LoadCredential cutover) is unblocked.
+
 ## Key Files
 
 | File | Purpose |
