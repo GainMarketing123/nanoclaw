@@ -363,23 +363,28 @@ fi
 
 # Regenerate self-knowledge if atlas-core or claude-config pulled new changes
 # (the regen script reads both repos' source files to build the summary)
-if [ -f $ATLAS_DIR/scripts/regen-self-knowledge.py ]; then
-    python3 $ATLAS_DIR/scripts/regen-self-knowledge.py >/dev/null 2>&1
+# Codex 4588f4e R3 F2 SOFT fix: quote $ATLAS_DIR expansions everywhere it
+# appears in test/argv positions. Pre-fix, an override containing
+# whitespace or shell metacharacters (rare but legitimate, e.g.
+# /opt/atlas\ checkout) would word-split the path under [ -f ... ] and
+# python3 invocations.
+if [ -f "$ATLAS_DIR/scripts/regen-self-knowledge.py" ]; then
+    python3 "$ATLAS_DIR/scripts/regen-self-knowledge.py" >/dev/null 2>&1
 fi
 
 # Auto-detect cross-project relationships (shared Supabase, shared deps)
-if [ -f $ATLAS_DIR/scripts/regen-project-graph.py ]; then
-    python3 $ATLAS_DIR/scripts/regen-project-graph.py >/dev/null 2>&1
+if [ -f "$ATLAS_DIR/scripts/regen-project-graph.py" ]; then
+    python3 "$ATLAS_DIR/scripts/regen-project-graph.py" >/dev/null 2>&1
 fi
 
 # System health staleness detection (agent checksums, hook accuracy, registry currency)
-if [ -f $ATLAS_DIR/scripts/regen-system-health.py ]; then
-    python3 $ATLAS_DIR/scripts/regen-system-health.py >/dev/null 2>&1
+if [ -f "$ATLAS_DIR/scripts/regen-system-health.py" ]; then
+    python3 "$ATLAS_DIR/scripts/regen-system-health.py" >/dev/null 2>&1
 fi
 
 # Environment parity check (laptop vs VPS drift detection)
-if [ -f $ATLAS_DIR/scripts/check-env-parity.py ]; then
-    python3 $ATLAS_DIR/scripts/check-env-parity.py >/dev/null 2>&1
+if [ -f "$ATLAS_DIR/scripts/check-env-parity.py" ]; then
+    python3 "$ATLAS_DIR/scripts/check-env-parity.py" >/dev/null 2>&1
 fi
 
 # Prune stale worktrees from all project repos
