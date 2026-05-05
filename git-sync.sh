@@ -44,7 +44,12 @@ NANOCLAW_DIR=/home/atlas/nanoclaw
 if [ -d "$NANOCLAW_DIR/.git" ]; then
     cd "$NANOCLAW_DIR"
     HEAD_BEFORE=$(git rev-parse HEAD 2>/dev/null)
-    sync_repo "$NANOCLAW_DIR" nanoclaw
+    # Codex 6282087 R3 F2 BLOCKING fix: gate HEAD_AFTER/diff/build/restart on
+    # successful pull. Pre-fix, a failed rebase could leave the repo mid-rebase
+    # or partially advanced, and HEAD_AFTER != HEAD_BEFORE would still run npm
+    # build + service restart from a conflicted/incomplete tree. Match the
+    # atlas-core pattern (`if sync_repo ...; then ... else log skip ... fi`).
+    if sync_repo "$NANOCLAW_DIR" nanoclaw; then
     HEAD_AFTER=$(git rev-parse HEAD 2>/dev/null)
 
     if [ "$HEAD_BEFORE" != "$HEAD_AFTER" ] && [ -n "$HEAD_BEFORE" ] && [ -n "$HEAD_AFTER" ]; then
@@ -93,6 +98,9 @@ if [ -d "$NANOCLAW_DIR/.git" ]; then
   # auto-pull + rebuild + restart block further down at the
   # "Atlas Command" section). See ~/.atlas/plans/1-a-6-host-executor-mission-control-audit.md
   # §11 (Wave 1.A.6 Phase 2 LANDED 2026-05-01) for full context.
+    fi
+    else
+        echo "$TIMESTAMP | SKIP | nanoclaw | sync_repo non-zero; skipping rebuild + host-executor restart trigger" >> "$LOG"
     fi
 fi
 
@@ -169,20 +177,35 @@ if [ -d /home/atlas/.atlas/.git ]; then
             fi
         fi
         # Restart trigger (A): HEAD advanced AND lib/ changed in this pull.
-        # Fires regardless of prod-tree presence — codex cb17ab2 R2 F1
-        # BLOCKING fix. Pre-fix, restart only fired on rsync success, leaving
-        # pre-cutover (no prod tree) and degraded-prod (resolver fallback)
-        # hosts with stale sys.modules indefinitely after lib changes.
+        # Codex 6282087 R3 F1 BLOCKING fix: trigger (A) only fires when the
+        # content the restarted process will see is fresh.
+        #   - prod tree absent → fallback gets the freshly-pulled lib → safe.
+        #   - prod tree present AND rsync succeeded → prod has fresh lib → safe.
+        #   - prod tree present AND rsync didn't succeed → prod is stale; the
+        #     resolver (probe-import passes on stale-but-valid trees) would
+        #     pick prod over fallback, leaving the restarted process on old
+        #     code while new host code expects new library APIs. Skip restart
+        #     this cycle; trigger (B) will fire on a later cycle whose rsync
+        #     succeeds (marker-advance).
+        # Per spec-spiral cap on this architectural area (R3 walk-back limit
+        # 2026-05-05), keeping the fix surgical: gate the trigger rather than
+        # introduce resolver-side freshness checks. Resolver-side check would
+        # be the broader fix but expands resolver scope past what this arc
+        # can converge on within the cap.
         if [ "$HEAD_BEFORE_AC" != "$HEAD_AFTER_AC" ] && [ -n "$HEAD_BEFORE_AC" ] && [ -n "$HEAD_AFTER_AC" ]; then
             LIB_CHANGED=$(git diff --name-only "$HEAD_BEFORE_AC" "$HEAD_AFTER_AC" -- lib/ 2>/dev/null)
             if [ -n "$LIB_CHANGED" ]; then
-                NEEDS_HOST_EXECUTOR_RESTART=1
-                if [ -n "${NEEDS_HOST_EXECUTOR_RESTART_REASON:-}" ]; then
-                    NEEDS_HOST_EXECUTOR_RESTART_REASON="$NEEDS_HOST_EXECUTOR_RESTART_REASON; atlas-core lib/ changed"
+                if [ ! -d /usr/local/lib/atlas ] || { [ "$rsync_attempted" -eq 1 ] && [ "$rsync_status" -eq 0 ]; }; then
+                    NEEDS_HOST_EXECUTOR_RESTART=1
+                    if [ -n "${NEEDS_HOST_EXECUTOR_RESTART_REASON:-}" ]; then
+                        NEEDS_HOST_EXECUTOR_RESTART_REASON="$NEEDS_HOST_EXECUTOR_RESTART_REASON; atlas-core lib/ changed"
+                    else
+                        NEEDS_HOST_EXECUTOR_RESTART_REASON="atlas-core lib/ changed"
+                    fi
+                    echo "$TIMESTAMP | DEFER_RESTART | atlas-host-executor | atlas-core lib/ changed (HEAD ${HEAD_BEFORE_AC:0:12} -> ${HEAD_AFTER_AC:0:12})" >> "$LOG"
                 else
-                    NEEDS_HOST_EXECUTOR_RESTART_REASON="atlas-core lib/ changed"
+                    echo "$TIMESTAMP | SKIP_RESTART | atlas-host-executor | atlas-core lib/ changed but prod tree not freshly synced (rsync_attempted=$rsync_attempted rsync_status=$rsync_status); deferring to a cycle whose rsync succeeds" >> "$LOG"
                 fi
-                echo "$TIMESTAMP | DEFER_RESTART | atlas-host-executor | atlas-core lib/ changed (HEAD ${HEAD_BEFORE_AC:0:12} -> ${HEAD_AFTER_AC:0:12})" >> "$LOG"
             fi
         fi
         # Restart trigger (B): marker advanced this cycle off a non-empty
@@ -276,7 +299,9 @@ ATLAS_CMD_DIR=/home/atlas/atlas-command
 if [ -d "$ATLAS_CMD_DIR/.git" ]; then
     cd "$ATLAS_CMD_DIR"
     HEAD_BEFORE=$(git rev-parse HEAD 2>/dev/null)
-    sync_repo "$ATLAS_CMD_DIR" atlas-command
+    # Codex 6282087 R3 F2 BLOCKING fix: gate HEAD_AFTER/diff/build/restart on
+    # successful pull. Same shape as the NanoClaw block above.
+    if sync_repo "$ATLAS_CMD_DIR" atlas-command; then
     HEAD_AFTER=$(git rev-parse HEAD 2>/dev/null)
     if [ "$HEAD_BEFORE" != "$HEAD_AFTER" ] && [ -n "$HEAD_BEFORE" ] && [ -n "$HEAD_AFTER" ]; then
         echo "$TIMESTAMP | BUILD | atlas-command | Source changed, rebuilding..." >> "$LOG"
@@ -324,6 +349,9 @@ if [ -d "$ATLAS_CMD_DIR/.git" ]; then
         else
             echo "$TIMESTAMP | FAIL | atlas-command | Build failed: ${BUILD_OUT:0:200}" >> "$LOG"
         fi
+    fi
+    else
+        echo "$TIMESTAMP | SKIP | atlas-command | sync_repo non-zero; skipping rebuild + restart" >> "$LOG"
     fi
 fi
 
