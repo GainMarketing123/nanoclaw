@@ -101,62 +101,75 @@ fi
 if [ -d /home/atlas/.atlas/.git ]; then
     cd /home/atlas/.atlas
     git checkout -- autonomy/graduation-status.json 2>/dev/null
-    HEAD_BEFORE_AC=$(git rev-parse HEAD 2>/dev/null)
-    # Phase 3.1 prereq #1+#2 (codex consult 2026-05-04): gate rsync + lib-changed
-    # restart trigger on a clean pull. Prior version always fell through to the
-    # rsync even when sync_repo failed, mirroring a conflicted/dirty worktree
-    # into the prod path. The lib-changed restart trigger now also requires
-    # rsync to have succeeded — otherwise we'd restart the host-executor
-    # against a stale prod tree (or force the resolver onto the fallback path
-    # mid-cycle, which codex flagged as risky if the autostash didn't fully
-    # clean the working tree). nanoclaw host/infra-driven restarts are still
-    # unconditional (they live in the block above and don't gate on rsync).
+    # Phase 3.1 prereq #1+#2 (codex 0c77411 R1 F1 fix): persistent tree-hash
+    # marker so a same-cycle pull-success+rsync-failure doesn't permanently
+    # lose the lib change. Without this marker, cycle-1 would advance HEAD but
+    # leave rsync failed; cycle-2's pull is a no-op so HEAD_BEFORE_AC ==
+    # HEAD_AFTER_AC, the lib-diff condition never re-evaluates, and no restart
+    # ever fires — host-executor stays on stale fallback indefinitely. The
+    # marker stores the lib/ tree hash currently mirrored to /usr/local/lib/atlas.
+    # Rsync re-runs on every cron cycle whose marker disagrees with the current
+    # lib tree hash (decoupling deploy attempts from pull-this-cycle outcomes).
+    # Restart fires when the marker advances off a non-empty prior value.
     if sync_repo /home/atlas/.atlas atlas-core; then
-        HEAD_AFTER_AC=$(git rev-parse HEAD 2>/dev/null)
-        # Phase 3.0 (1.A.6): mirror atlas lib to root-owned /usr/local/lib/atlas
-        # after every atlas-core pull. Pre-cutover (directory absent), the
-        # `[ -d ]` guard makes this a no-op so the script works on hosts that
-        # haven't been upgraded yet. Sudoers entry at /etc/sudoers.d/atlas-rsync
-        # (deployed as a Phase 3.0 cutover step from infra/sudoers.d/atlas-rsync)
-        # gates the sudo call to this exact rsync command — atlas user has no
-        # general sudo grant. host-executor.py prefers /usr/local/lib/atlas via
-        # _ATLAS_LIB_PATH; if rsync fails the fallback at ATLAS_DIR/lib keeps
-        # the service running while the failure is logged.
+        # Tree hash is content-addressed: any lib/ change yields a new hash;
+        # unrelated atlas-core changes don't. More precise than a commit-sha
+        # marker (decouples lib-deploy from atlas-core HEAD churn).
+        CURRENT_LIB_TREE=$(git rev-parse "HEAD:lib" 2>/dev/null || true)
+        # Marker lives under atlas-writable state/ — no sudo needed, distinct
+        # from the prod tree codex earlier consult ruled unsafe-to-write
+        # (sudoers grants only the rsync command, no separate marker write
+        # under /usr/local/lib/atlas).
+        RSYNC_STATE_FILE=/home/atlas/.atlas/state/atlas-lib-rsync-tree
+        LAST_RSYNCED_TREE=$(cat "$RSYNC_STATE_FILE" 2>/dev/null || true)
         rsync_status=0
-        if [ -d /usr/local/lib/atlas ]; then
+        rsync_attempted=0
+        # Phase 3.0 (1.A.6): mirror atlas lib to root-owned /usr/local/lib/atlas
+        # whenever the marker disagrees with the current lib tree hash. Pre-
+        # cutover (directory absent), the `[ -d ]` guard makes this a no-op so
+        # the script works on hosts that haven't been upgraded yet. Sudoers
+        # entry at /etc/sudoers.d/atlas-rsync (deployed as a Phase 3.0 cutover
+        # step from infra/sudoers.d/atlas-rsync) gates the sudo call to this
+        # exact rsync command — atlas user has no general sudo grant.
+        # host-executor.py prefers /usr/local/lib/atlas via _ATLAS_LIB_PATH;
+        # if rsync fails the fallback at ATLAS_DIR/lib keeps the service
+        # running while the failure is logged.
+        if [ -d /usr/local/lib/atlas ] && [ -n "$CURRENT_LIB_TREE" ] && [ "$LAST_RSYNCED_TREE" != "$CURRENT_LIB_TREE" ]; then
+            rsync_attempted=1
             rsync_out=$(sudo rsync -a --delete /home/atlas/.atlas/lib/ /usr/local/lib/atlas/ 2>&1)
             rsync_status=$?
-            if [ $rsync_status -ne 0 ]; then
+            if [ $rsync_status -eq 0 ]; then
+                # Persist the tree hash atomically — short single-line write,
+                # tmp + mv so a partial write can't leave a corrupt marker.
+                mkdir -p "$(dirname "$RSYNC_STATE_FILE")" 2>/dev/null
+                tmp_marker=$(mktemp "$RSYNC_STATE_FILE.XXXXXX") && \
+                    echo "$CURRENT_LIB_TREE" > "$tmp_marker" && \
+                    mv "$tmp_marker" "$RSYNC_STATE_FILE" || true
+            else
                 echo "$TIMESTAMP | FAIL | atlas-lib-sync | exit=$rsync_status $rsync_out" >> "$LOG"
+                # Marker NOT updated — next cron cycle's tree-hash comparison
+                # will see drift again and re-attempt automatically.
             fi
         fi
         # Round-1 codex BLOCKING (e0b6fe0 F1): if atlas-core lib/ changed, the
         # running atlas-host-executor process has cached old modules in
-        # sys.modules and will keep using them until restart. Detect lib/
-        # changes and set the deferred-restart flag so the consolidated restart
-        # block at the end picks up the fresh lib code.
-        if [ "$HEAD_BEFORE_AC" != "$HEAD_AFTER_AC" ] && [ -n "$HEAD_BEFORE_AC" ] && [ -n "$HEAD_AFTER_AC" ] && [ $rsync_status -eq 0 ]; then
-            LIB_CHANGED=$(git diff --name-only "$HEAD_BEFORE_AC" "$HEAD_AFTER_AC" -- lib/ 2>/dev/null)
-            if [ -n "$LIB_CHANGED" ]; then
-                NEEDS_HOST_EXECUTOR_RESTART=1
-                if [ -n "${NEEDS_HOST_EXECUTOR_RESTART_REASON:-}" ]; then
-                    NEEDS_HOST_EXECUTOR_RESTART_REASON="$NEEDS_HOST_EXECUTOR_RESTART_REASON; atlas-core lib/ changed"
-                else
-                    NEEDS_HOST_EXECUTOR_RESTART_REASON="atlas-core lib/ changed"
-                fi
-                echo "$TIMESTAMP | DEFER_RESTART | atlas-host-executor | atlas-core lib/ changed" >> "$LOG"
+        # sys.modules and will keep using them until restart. Trigger restart
+        # whenever the marker advances off a non-empty prior value (prior=""
+        # is bootstrap; the operator-side cutover step list handles the
+        # initial restart, not this cron). The marker advance signal subsumes
+        # both same-cycle deploys and recoveries from prior-cycle rsync
+        # failures, fixing codex 0c77411 F1.
+        if [ "$rsync_attempted" -eq 1 ] && [ "$rsync_status" -eq 0 ] && [ -n "$LAST_RSYNCED_TREE" ]; then
+            NEEDS_HOST_EXECUTOR_RESTART=1
+            if [ -n "${NEEDS_HOST_EXECUTOR_RESTART_REASON:-}" ]; then
+                NEEDS_HOST_EXECUTOR_RESTART_REASON="$NEEDS_HOST_EXECUTOR_RESTART_REASON; atlas-core lib/ tree advanced"
+            else
+                NEEDS_HOST_EXECUTOR_RESTART_REASON="atlas-core lib/ tree advanced"
             fi
-        elif [ "$HEAD_BEFORE_AC" != "$HEAD_AFTER_AC" ] && [ -n "$HEAD_BEFORE_AC" ] && [ -n "$HEAD_AFTER_AC" ] && [ $rsync_status -ne 0 ]; then
-            # Pull advanced HEAD but rsync failed: defer the lib-changed restart
-            # until a future cron cycle whose rsync succeeds. Logged loud so the
-            # state is visible in the operator log (no silent skip).
-            LIB_CHANGED=$(git diff --name-only "$HEAD_BEFORE_AC" "$HEAD_AFTER_AC" -- lib/ 2>/dev/null)
-            if [ -n "$LIB_CHANGED" ]; then
-                echo "$TIMESTAMP | SKIP_DEFER_RESTART | atlas-host-executor | lib/ changed but rsync failed (exit=$rsync_status); waiting for next clean cycle" >> "$LOG"
-            fi
+            echo "$TIMESTAMP | DEFER_RESTART | atlas-host-executor | atlas-core lib/ tree advanced ${LAST_RSYNCED_TREE:0:12} -> ${CURRENT_LIB_TREE:0:12}" >> "$LOG"
         fi
     else
-        echo "$TIMESTAMP | SKIP | atlas-lib-sync | atlas-core sync_repo non-zero; skipping rsync + lib-driven restart trigger" >> "$LOG"
+        echo "$TIMESTAMP | SKIP | atlas-lib-sync | atlas-core sync_repo non-zero; marker unchanged, will retry next cycle" >> "$LOG"
     fi
 fi
 

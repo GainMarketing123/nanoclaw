@@ -105,20 +105,41 @@ _ATLAS_LIB_REQUIRED_MODULES = (
     "autonomy_tracker.py",
     "mission_executor.py",
 )
-# Probe-import module set: the actual `import M` form callers issue
-# downstream. File-existence covers the .py path; subprocess probe covers
-# import-time correctness AND transitive dep presence (Python resolves
-# transitives during import). Keep this list a strict subset of the file
-# names above (sans .py) — drift means the subprocess could fail-open on
-# a missing module that file-existence didn't list.
-_ATLAS_LIB_PROBE_MODULES = (
-    "ssrf",
-    "providers",
-    "performance_tracker",
-    "autonomy_tracker",
-    "mission_executor",
+# Probe-import statement set: the actual `from X import Y` statements
+# callers issue downstream. Bare `import M` would false-pass when a same-
+# named package exists but doesn't re-export the called symbol — codex
+# cb3ae9c R1 F1 BLOCKING (lockstep finding from agent-runner.py review,
+# same shape applies here). Each statement is the literal call-site form
+# (mission SSRF validate, mission_executor entry, providers route,
+# performance_tracker track, autonomy_tracker M2 evaluation). Subprocess
+# executes them in order; the first one to fail surfaces as ImportError
+# on stderr.
+_ATLAS_LIB_PROBE_STATEMENTS = (
+    "from ssrf import validate_endpoint_url",
+    "from mission_executor import process_mission",
+    "from providers import route",
+    "from performance_tracker import track",
+    "from autonomy_tracker import evaluate_m2_clean_run",
 )
 def _resolve_atlas_lib_path() -> str:
+    """Pick the prod path only if it imports cleanly in an isolated subprocess.
+
+    Phase 3.1 prereqs (codex consult 2026-05-04 + cb3ae9c F1 + 4299a7e F1
+    follow-ups). Subprocess hardening:
+      - cwd='/' — Python's implicit `''` on sys.path can't shadow prod
+        modules with a same-named module from parent CWD (codex 4299a7e F1).
+      - PYTHONPATH narrows to prod tree only.
+      - PYTHONNOUSERSITE=1 disables `~/.local/lib/...` so a stale user-site
+        copy can't false-pass.
+      - PYTHONDONTWRITEBYTECODE=1 — no __pycache__ writes (defensive today,
+        no-op once chattr +i lands in Phase 3.1+).
+      - 15s timeout.
+
+    Probe statements are the literal `from M import X` callers issue (codex
+    cb3ae9c F1 fix; bare `import M` would false-pass on missing symbols).
+
+    On any failure: fall back to ATLAS_DIR/lib, loud-log to stderr.
+    """
     prod = Path("/usr/local/lib/atlas")
     fallback = str(ATLAS_DIR / "lib")
     if not prod.is_dir():
@@ -129,22 +150,16 @@ def _resolve_atlas_lib_path() -> str:
             f"falling back to {fallback}\n"
         )
         return fallback
-    # Subprocess probe — same interpreter (sys.executable), PYTHONPATH
-    # narrowed to the prod tree, no parent sys.path or sys.modules side
-    # effects. PYTHONDONTWRITEBYTECODE=1 prevents the probe from creating
-    # __pycache__ entries inside the prod tree (a no-op once chattr +i
-    # lands in Phase 3.1+ but defensive today while atlas writes go via
-    # sudo rsync). Bounded timeout — module init for these modules is
-    # sub-second; 15s catches a stuck import without hanging the unit
-    # start indefinitely.
-    probe_script = "; ".join(f"import {m}" for m in _ATLAS_LIB_PROBE_MODULES)
+    probe_script = "; ".join(_ATLAS_LIB_PROBE_STATEMENTS)
     probe_env = dict(os.environ)
     probe_env["PYTHONPATH"] = str(prod)
     probe_env["PYTHONDONTWRITEBYTECODE"] = "1"
+    probe_env["PYTHONNOUSERSITE"] = "1"
     try:
         result = subprocess.run(
             [sys.executable, "-c", probe_script],
             env=probe_env,
+            cwd="/",
             capture_output=True,
             text=True,
             timeout=15,
