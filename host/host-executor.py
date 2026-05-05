@@ -285,7 +285,14 @@ def _load_anthropic_api_key() -> str:
         for line in env_path.read_text().splitlines():
             if line.startswith("ANTHROPIC_API_KEY="):
                 return line.split("=", 1)[1].strip()
-    except FileNotFoundError:
+    except (FileNotFoundError, PermissionError, OSError):
+        # Codex 9285383 R1 SOFT fix: match the broader exception catch in
+        # _load_quality_check_token() below. Pre-fix, only FileNotFoundError
+        # was caught — a permission denial or unrelated OSError on .env
+        # would propagate and crash the quality-check call site instead of
+        # routing through the canonical token_missing response. Treat any
+        # read failure as "no key in this fallback" and let the empty-key
+        # path emit the operator-actionable error message.
         pass
     return ""
 
