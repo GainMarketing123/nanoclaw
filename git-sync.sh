@@ -5,6 +5,20 @@
 LOG=/home/atlas/nanoclaw/logs/git-sync.log
 TIMESTAMP=$(date +%Y-%m-%dT%H:%M:%S%z)
 
+# Codex 5e17091 R2 BLOCKING follow-up: parameterize ATLAS_DIR rather than
+# hardcoding /home/atlas/.atlas. host-executor.py uses ATLAS_DIR (its line 64,
+# `_resolve_dir("ATLAS_DIR", Path.home() / ".atlas")`) as the canonical
+# atlas-core checkout path, supporting an env-var override. This script
+# previously hardcoded /home/atlas/.atlas, which on any host where
+# ATLAS_DIR points elsewhere would cause: (a) atlas-core presence check
+# false-negative → ATLAS_CORE_PRESENT=0, (b) the bottom-gate restart fires
+# treating "absent" as safe even though the executor IS using a real
+# atlas-core checkout that wasn't synced this cycle. Default matches
+# host-executor.py's default ($HOME/.atlas → /home/atlas/.atlas for the
+# atlas user); allow the same env-var override host-executor.py honors so
+# both consumers resolve the same path on any deployment.
+ATLAS_DIR="${ATLAS_DIR:-$HOME/.atlas}"
+
 # C2 + R1 codex 5955b3c follow-up — atlas-core restart-safety tri-state.
 #
 # Original C2 problem (codex 0ba5abf R4 F2 BLOCKING): pre-C2 default of 1
@@ -151,15 +165,16 @@ fi
 # Atlas core — graduation-status.json is written by the autonomous loop on VPS.
 # Reset it before pull so upstream changes land cleanly. The autonomous loop
 # will re-write the correct VPS state on its next run (daily at 10AM).
-if [ -d /home/atlas/.atlas/.git ]; then
-    # Tri-state guard (codex 5955b3c R1 BLOCKING): mark atlas-core as
-    # PRESENT on this host so the bottom-gate restart logic distinguishes
-    # "atlas-core repo absent (legitimate pre-cutover host with overridden
-    # ATLAS_DIR)" from "atlas-core present-but-failed-to-sync (unsafe to
-    # restart against potentially-stale lib)". See top-of-script comment
-    # on ATLAS_CORE_PRESENT for full rationale.
+if [ -d "$ATLAS_DIR/.git" ]; then
+    # Tri-state guard (codex 5955b3c R1 + 5e17091 R2 BLOCKING): mark atlas-
+    # core as PRESENT on this host (resolved via $ATLAS_DIR — same source
+    # host-executor.py uses) so the bottom-gate restart logic distinguishes
+    # "atlas-core repo absent (no atlas-core at the resolved ATLAS_DIR)"
+    # from "atlas-core present-but-failed-to-sync (unsafe to restart against
+    # potentially-stale lib)". See top-of-script comment on ATLAS_DIR +
+    # ATLAS_CORE_PRESENT for full rationale.
     ATLAS_CORE_PRESENT=1
-    cd /home/atlas/.atlas
+    cd "$ATLAS_DIR"
     git checkout -- autonomy/graduation-status.json 2>/dev/null
     HEAD_BEFORE_AC=$(git rev-parse HEAD 2>/dev/null)
     # Phase 3.1 prereq (codex 0c77411 F1 + cb17ab2 R2 F1+F2 fixes): atlas lib
@@ -183,7 +198,7 @@ if [ -d /home/atlas/.atlas/.git ]; then
     #       the cycle-2 deferred-recovery case (cycle-1 pulled new lib AND
     #       rsync failed; cycle-2 pull is no-op so (A) doesn't fire, but
     #       rsync re-attempts and on success the marker advances).
-    if sync_repo /home/atlas/.atlas atlas-core; then
+    if sync_repo "$ATLAS_DIR" atlas-core; then
         ATLAS_CORE_SYNC_OK=1
         HEAD_AFTER_AC=$(git rev-parse HEAD 2>/dev/null)
         # Tree hash is content-addressed: any lib/ change yields a new hash;
@@ -194,7 +209,7 @@ if [ -d /home/atlas/.atlas/.git ]; then
         # from the prod tree codex earlier consult ruled unsafe-to-write
         # (sudoers grants only the rsync command, no separate marker write
         # under /usr/local/lib/atlas).
-        RSYNC_STATE_FILE=/home/atlas/.atlas/state/atlas-lib-rsync-tree
+        RSYNC_STATE_FILE="$ATLAS_DIR/state/atlas-lib-rsync-tree"
         LAST_RSYNCED_TREE=$(cat "$RSYNC_STATE_FILE" 2>/dev/null || true)
         rsync_status=0
         rsync_attempted=0
@@ -204,7 +219,7 @@ if [ -d /home/atlas/.atlas/.git ]; then
         # block and rely on trigger (A) below for restart on lib changes.
         if [ -d /usr/local/lib/atlas ] && [ -n "$CURRENT_LIB_TREE" ] && [ "$LAST_RSYNCED_TREE" != "$CURRENT_LIB_TREE" ]; then
             rsync_attempted=1
-            rsync_out=$(sudo rsync -a --delete /home/atlas/.atlas/lib/ /usr/local/lib/atlas/ 2>&1)
+            rsync_out=$(sudo rsync -a --delete "$ATLAS_DIR/lib/" /usr/local/lib/atlas/ 2>&1)
             rsync_status=$?
             if [ $rsync_status -eq 0 ]; then
                 # Codex cb17ab2 R2 F2 SOFT fix: each step checked. If any
@@ -348,23 +363,23 @@ fi
 
 # Regenerate self-knowledge if atlas-core or claude-config pulled new changes
 # (the regen script reads both repos' source files to build the summary)
-if [ -f /home/atlas/.atlas/scripts/regen-self-knowledge.py ]; then
-    python3 /home/atlas/.atlas/scripts/regen-self-knowledge.py >/dev/null 2>&1
+if [ -f $ATLAS_DIR/scripts/regen-self-knowledge.py ]; then
+    python3 $ATLAS_DIR/scripts/regen-self-knowledge.py >/dev/null 2>&1
 fi
 
 # Auto-detect cross-project relationships (shared Supabase, shared deps)
-if [ -f /home/atlas/.atlas/scripts/regen-project-graph.py ]; then
-    python3 /home/atlas/.atlas/scripts/regen-project-graph.py >/dev/null 2>&1
+if [ -f $ATLAS_DIR/scripts/regen-project-graph.py ]; then
+    python3 $ATLAS_DIR/scripts/regen-project-graph.py >/dev/null 2>&1
 fi
 
 # System health staleness detection (agent checksums, hook accuracy, registry currency)
-if [ -f /home/atlas/.atlas/scripts/regen-system-health.py ]; then
-    python3 /home/atlas/.atlas/scripts/regen-system-health.py >/dev/null 2>&1
+if [ -f $ATLAS_DIR/scripts/regen-system-health.py ]; then
+    python3 $ATLAS_DIR/scripts/regen-system-health.py >/dev/null 2>&1
 fi
 
 # Environment parity check (laptop vs VPS drift detection)
-if [ -f /home/atlas/.atlas/scripts/check-env-parity.py ]; then
-    python3 /home/atlas/.atlas/scripts/check-env-parity.py >/dev/null 2>&1
+if [ -f $ATLAS_DIR/scripts/check-env-parity.py ]; then
+    python3 $ATLAS_DIR/scripts/check-env-parity.py >/dev/null 2>&1
 fi
 
 # Prune stale worktrees from all project repos
