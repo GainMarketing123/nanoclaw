@@ -5,21 +5,22 @@
 LOG=/home/atlas/nanoclaw/logs/git-sync.log
 TIMESTAMP=$(date +%Y-%m-%dT%H:%M:%S%z)
 
-# Phase 3.1 prereq #2 (codex consult 2026-05-04): sync_repo now returns
-# the pull's exit status so callers can gate downstream effects on a
-# successful pull. Prior version logged FAIL but always fell through to
-# the caller's next statement, which let the atlas-core block below
-# proceed to the prod-tree rsync even when pull failed (mirroring a
-# conflicted/dirty worktree into /usr/local/lib/atlas). Return contract:
-#   0   = pull succeeded (or "Already up to date.")
-#   1   = no .git dir (treat as no-op, not failure-to-pull)
+# Phase 3.1 prereq #2 (codex consult 2026-05-04, refined by d6faf12 R2 F2 SOFT
+# 2026-05-05): sync_repo returns the pull's exit status so callers can gate
+# downstream effects on a successful pull. Missing .git is treated as a no-op
+# success (return 0) — codex named fix for d6faf12 F2: callers like the GPG
+# loop unconditionally invoke sync_repo even when the repo isn't cloned, and
+# returning failure for "no checkout" would make every cron cycle alarm even
+# though no sync was attempted. Real failures (cd, pull) still propagate.
+# Return contract:
+#   0   = pull succeeded, "Already up to date.", OR no .git dir (no-op)
 #   2   = cd failed (defensive — should never fire after .git guard)
 #   N>0 = pull exit code (network/conflict/etc.)
 sync_repo() {
     local dir="$1"
     local name="$2"
     if [ ! -d "$dir/.git" ]; then
-        return 1
+        return 0
     fi
     if ! cd "$dir"; then
         echo "$TIMESTAMP | FAIL | $name | cd failed" >> "$LOG"
@@ -101,20 +102,33 @@ fi
 if [ -d /home/atlas/.atlas/.git ]; then
     cd /home/atlas/.atlas
     git checkout -- autonomy/graduation-status.json 2>/dev/null
-    # Phase 3.1 prereq #1+#2 (codex 0c77411 R1 F1 fix): persistent tree-hash
-    # marker so a same-cycle pull-success+rsync-failure doesn't permanently
-    # lose the lib change. Without this marker, cycle-1 would advance HEAD but
-    # leave rsync failed; cycle-2's pull is a no-op so HEAD_BEFORE_AC ==
-    # HEAD_AFTER_AC, the lib-diff condition never re-evaluates, and no restart
-    # ever fires — host-executor stays on stale fallback indefinitely. The
-    # marker stores the lib/ tree hash currently mirrored to /usr/local/lib/atlas.
-    # Rsync re-runs on every cron cycle whose marker disagrees with the current
-    # lib tree hash (decoupling deploy attempts from pull-this-cycle outcomes).
-    # Restart fires when the marker advances off a non-empty prior value.
+    HEAD_BEFORE_AC=$(git rev-parse HEAD 2>/dev/null)
+    # Phase 3.1 prereq (codex 0c77411 F1 + cb17ab2 R2 F1+F2 fixes): atlas lib
+    # deployment with TWO independent restart triggers and a checked marker.
+    #
+    # Marker-based prod-tree mirroring: persistent tree-hash marker at
+    # /home/atlas/.atlas/state/atlas-lib-rsync-tree records the lib/ tree
+    # currently sitting in /usr/local/lib/atlas. Rsync runs whenever marker
+    # disagrees with `git rev-parse HEAD:lib` — decouples deploy attempts
+    # from pull-this-cycle outcomes (cycle-2 self-recovers if cycle-1's rsync
+    # failed). Marker writes are checked at every step; any failure logs loud
+    # and prevents the marker-advance restart from firing, so a stale marker
+    # can't cause cron-loop-style repeated restarts every 5 minutes.
+    #
+    # Restart triggers (OR'd, dedup'd at the consolidated block below):
+    #   (A) HEAD advanced AND lib/ changed in this cycle's pull. Fires
+    #       regardless of prod-tree presence — covers pre-cutover hosts and
+    #       degraded-prod hosts (resolver fell back to ATLAS_DIR/lib) where
+    #       the running process's lib source just got new content.
+    #   (B) Marker advanced this cycle off a non-empty prior value. Catches
+    #       the cycle-2 deferred-recovery case (cycle-1 pulled new lib AND
+    #       rsync failed; cycle-2 pull is no-op so (A) doesn't fire, but
+    #       rsync re-attempts and on success the marker advances).
     if sync_repo /home/atlas/.atlas atlas-core; then
+        HEAD_AFTER_AC=$(git rev-parse HEAD 2>/dev/null)
         # Tree hash is content-addressed: any lib/ change yields a new hash;
         # unrelated atlas-core changes don't. More precise than a commit-sha
-        # marker (decouples lib-deploy from atlas-core HEAD churn).
+        # marker.
         CURRENT_LIB_TREE=$(git rev-parse "HEAD:lib" 2>/dev/null || true)
         # Marker lives under atlas-writable state/ — no sudo needed, distinct
         # from the prod tree codex earlier consult ruled unsafe-to-write
@@ -124,49 +138,66 @@ if [ -d /home/atlas/.atlas/.git ]; then
         LAST_RSYNCED_TREE=$(cat "$RSYNC_STATE_FILE" 2>/dev/null || true)
         rsync_status=0
         rsync_attempted=0
-        # Phase 3.0 (1.A.6): mirror atlas lib to root-owned /usr/local/lib/atlas
-        # whenever the marker disagrees with the current lib tree hash. Pre-
-        # cutover (directory absent), the `[ -d ]` guard makes this a no-op so
-        # the script works on hosts that haven't been upgraded yet. Sudoers
-        # entry at /etc/sudoers.d/atlas-rsync (deployed as a Phase 3.0 cutover
-        # step from infra/sudoers.d/atlas-rsync) gates the sudo call to this
-        # exact rsync command — atlas user has no general sudo grant.
-        # host-executor.py prefers /usr/local/lib/atlas via _ATLAS_LIB_PATH;
-        # if rsync fails the fallback at ATLAS_DIR/lib keeps the service
-        # running while the failure is logged.
+        marker_advanced=0
+        # Marker-based mirroring (only runs when prod tree exists AND marker
+        # disagrees with current lib tree). Pre-cutover hosts skip this whole
+        # block and rely on trigger (A) below for restart on lib changes.
         if [ -d /usr/local/lib/atlas ] && [ -n "$CURRENT_LIB_TREE" ] && [ "$LAST_RSYNCED_TREE" != "$CURRENT_LIB_TREE" ]; then
             rsync_attempted=1
             rsync_out=$(sudo rsync -a --delete /home/atlas/.atlas/lib/ /usr/local/lib/atlas/ 2>&1)
             rsync_status=$?
             if [ $rsync_status -eq 0 ]; then
-                # Persist the tree hash atomically — short single-line write,
-                # tmp + mv so a partial write can't leave a corrupt marker.
-                mkdir -p "$(dirname "$RSYNC_STATE_FILE")" 2>/dev/null
-                tmp_marker=$(mktemp "$RSYNC_STATE_FILE.XXXXXX") && \
-                    echo "$CURRENT_LIB_TREE" > "$tmp_marker" && \
-                    mv "$tmp_marker" "$RSYNC_STATE_FILE" || true
+                # Codex cb17ab2 R2 F2 SOFT fix: each step checked. If any
+                # write step fails, log loud and DO NOT set marker_advanced
+                # — restart trigger (B) won't fire on a stale marker, which
+                # would otherwise cause every cron cycle to redo the rsync
+                # AND trigger a restart every 5 minutes.
+                tmp_marker=""
+                if mkdir -p "$(dirname "$RSYNC_STATE_FILE")" 2>/dev/null \
+                   && tmp_marker=$(mktemp "$RSYNC_STATE_FILE.XXXXXX") \
+                   && printf '%s\n' "$CURRENT_LIB_TREE" > "$tmp_marker" \
+                   && mv "$tmp_marker" "$RSYNC_STATE_FILE"; then
+                    marker_advanced=1
+                else
+                    echo "$TIMESTAMP | FAIL | atlas-lib-marker | failed to persist tree $CURRENT_LIB_TREE; rsync succeeded but marker not updated (next cycle will retry; rsync is idempotent)" >> "$LOG"
+                    [ -n "$tmp_marker" ] && rm -f "$tmp_marker" 2>/dev/null || true
+                fi
             else
                 echo "$TIMESTAMP | FAIL | atlas-lib-sync | exit=$rsync_status $rsync_out" >> "$LOG"
                 # Marker NOT updated — next cron cycle's tree-hash comparison
                 # will see drift again and re-attempt automatically.
             fi
         fi
-        # Round-1 codex BLOCKING (e0b6fe0 F1): if atlas-core lib/ changed, the
-        # running atlas-host-executor process has cached old modules in
-        # sys.modules and will keep using them until restart. Trigger restart
-        # whenever the marker advances off a non-empty prior value (prior=""
-        # is bootstrap; the operator-side cutover step list handles the
-        # initial restart, not this cron). The marker advance signal subsumes
-        # both same-cycle deploys and recoveries from prior-cycle rsync
-        # failures, fixing codex 0c77411 F1.
-        if [ "$rsync_attempted" -eq 1 ] && [ "$rsync_status" -eq 0 ] && [ -n "$LAST_RSYNCED_TREE" ]; then
+        # Restart trigger (A): HEAD advanced AND lib/ changed in this pull.
+        # Fires regardless of prod-tree presence — codex cb17ab2 R2 F1
+        # BLOCKING fix. Pre-fix, restart only fired on rsync success, leaving
+        # pre-cutover (no prod tree) and degraded-prod (resolver fallback)
+        # hosts with stale sys.modules indefinitely after lib changes.
+        if [ "$HEAD_BEFORE_AC" != "$HEAD_AFTER_AC" ] && [ -n "$HEAD_BEFORE_AC" ] && [ -n "$HEAD_AFTER_AC" ]; then
+            LIB_CHANGED=$(git diff --name-only "$HEAD_BEFORE_AC" "$HEAD_AFTER_AC" -- lib/ 2>/dev/null)
+            if [ -n "$LIB_CHANGED" ]; then
+                NEEDS_HOST_EXECUTOR_RESTART=1
+                if [ -n "${NEEDS_HOST_EXECUTOR_RESTART_REASON:-}" ]; then
+                    NEEDS_HOST_EXECUTOR_RESTART_REASON="$NEEDS_HOST_EXECUTOR_RESTART_REASON; atlas-core lib/ changed"
+                else
+                    NEEDS_HOST_EXECUTOR_RESTART_REASON="atlas-core lib/ changed"
+                fi
+                echo "$TIMESTAMP | DEFER_RESTART | atlas-host-executor | atlas-core lib/ changed (HEAD ${HEAD_BEFORE_AC:0:12} -> ${HEAD_AFTER_AC:0:12})" >> "$LOG"
+            fi
+        fi
+        # Restart trigger (B): marker advanced this cycle off a non-empty
+        # prior. Catches cycle-2 deferred-deploy recovery — codex 0c77411 R1 F1.
+        # Bootstrap (LAST_RSYNCED_TREE empty) writes the marker without
+        # restart; the operator-side Phase 3.0 cutover step list handles the
+        # initial restart per commit 48fa247's runbook.
+        if [ "$marker_advanced" -eq 1 ] && [ -n "$LAST_RSYNCED_TREE" ]; then
             NEEDS_HOST_EXECUTOR_RESTART=1
             if [ -n "${NEEDS_HOST_EXECUTOR_RESTART_REASON:-}" ]; then
-                NEEDS_HOST_EXECUTOR_RESTART_REASON="$NEEDS_HOST_EXECUTOR_RESTART_REASON; atlas-core lib/ tree advanced"
+                NEEDS_HOST_EXECUTOR_RESTART_REASON="$NEEDS_HOST_EXECUTOR_RESTART_REASON; atlas-core lib/ tree marker advanced"
             else
-                NEEDS_HOST_EXECUTOR_RESTART_REASON="atlas-core lib/ tree advanced"
+                NEEDS_HOST_EXECUTOR_RESTART_REASON="atlas-core lib/ tree marker advanced"
             fi
-            echo "$TIMESTAMP | DEFER_RESTART | atlas-host-executor | atlas-core lib/ tree advanced ${LAST_RSYNCED_TREE:0:12} -> ${CURRENT_LIB_TREE:0:12}" >> "$LOG"
+            echo "$TIMESTAMP | DEFER_RESTART | atlas-host-executor | atlas-core lib/ tree marker advanced ${LAST_RSYNCED_TREE:0:12} -> ${CURRENT_LIB_TREE:0:12}" >> "$LOG"
         fi
     else
         echo "$TIMESTAMP | SKIP | atlas-lib-sync | atlas-core sync_repo non-zero; marker unchanged, will retry next cycle" >> "$LOG"

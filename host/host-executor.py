@@ -150,14 +150,23 @@ def _resolve_atlas_lib_path() -> str:
             f"falling back to {fallback}\n"
         )
         return fallback
-    probe_script = "; ".join(_ATLAS_LIB_PROBE_STATEMENTS)
+    # Codex d6faf12 R2 F1 BLOCKING fix (lockstep with agent-runner.py):
+    # PYTHONPATH alone only PREPENDS to sys.path; the subprocess still
+    # searches global site-packages, so a transitive import satisfied by
+    # an installed third-party module would false-pass the probe. Switch
+    # to -I (isolated: ignores PYTHONPATH/user-site/cwd-prepend) + -S
+    # (skip site init) and set sys.path explicitly so ONLY stdlib paths
+    # plus the prod tree are importable during validation.
+    probe_script = "; ".join(
+        ["import sys", f"sys.path[:] = [{repr(str(prod))}] + [p for p in sys.path if p]"]
+        + list(_ATLAS_LIB_PROBE_STATEMENTS)
+    )
     probe_env = dict(os.environ)
-    probe_env["PYTHONPATH"] = str(prod)
+    probe_env.pop("PYTHONPATH", None)  # -I ignores it but be explicit
     probe_env["PYTHONDONTWRITEBYTECODE"] = "1"
-    probe_env["PYTHONNOUSERSITE"] = "1"
     try:
         result = subprocess.run(
-            [sys.executable, "-c", probe_script],
+            [sys.executable, "-I", "-S", "-c", probe_script],
             env=probe_env,
             cwd="/",
             capture_output=True,
