@@ -5,6 +5,21 @@
 LOG=/home/atlas/nanoclaw/logs/git-sync.log
 TIMESTAMP=$(date +%Y-%m-%dT%H:%M:%S%z)
 
+# C2 fix (codex 0ba5abf R4 F2 BLOCKING): atlas-core sync success flag,
+# fail-closed initialization. Pre-fix, the consolidated restart block at the
+# bottom of this script read `${ATLAS_CORE_SYNC_OK:-1}` — defaulting to 1
+# when the variable was unset. That meant a host WITHOUT atlas-core cloned
+# (the `[ -d /home/atlas/.atlas/.git ]` guard later in this script skips
+# the entire atlas-core block, never setting the flag) would still have
+# the consolidated restart fire, restarting host-executor against an
+# atlas-lib it cannot load. Initializing here to 0 fail-closes the
+# default: host-executor only restarts when atlas-core sync was
+# explicitly known-good this cycle. Setters on success at line ~136
+# (ATLAS_CORE_SYNC_OK=1 inside `if sync_repo ...; then`) and on failure
+# at line ~227 (ATLAS_CORE_SYNC_OK=0 inside the corresponding `else`)
+# override this initial value when atlas-core IS cloned.
+ATLAS_CORE_SYNC_OK=0
+
 # Phase 3.1 prereq #2 (codex consult 2026-05-04, refined by d6faf12 R2 F2 SOFT
 # 2026-05-05): sync_repo returns the pull's exit status so callers can gate
 # downstream effects on a successful pull. Missing .git is treated as a no-op
@@ -61,12 +76,23 @@ if [ -d "$NANOCLAW_DIR/.git" ]; then
             BUILD_STATUS=$?
             if [ $BUILD_STATUS -eq 0 ]; then
                 echo "$TIMESTAMP | BUILD | nanoclaw | Build succeeded, restarting service" >> "$LOG"
-                sudo /usr/bin/systemctl restart nanoclaw
-                sleep 3
-                if systemctl is-active --quiet nanoclaw; then
-                    echo "$TIMESTAMP | RESTART | nanoclaw | Service restarted successfully" >> "$LOG"
+                # C1 collateral fix (codex 0ba5abf R4 F1 BLOCKING — same
+                # pattern surfaced during atlas-host-executor restart guard
+                # work): gate the is-active probe on the systemctl restart's
+                # own exit code. Pre-fix, a non-zero restart (sudoers /
+                # unit-load / bus errors) still dropped into the is-active
+                # check, which could read the OLD running unit as active and
+                # emit a false-success RESTART log line. Mirroring the
+                # atlas-mission-control block below at lines ~364-380.
+                if sudo /usr/bin/systemctl restart nanoclaw; then
+                    sleep 3
+                    if systemctl is-active --quiet nanoclaw; then
+                        echo "$TIMESTAMP | RESTART | nanoclaw | Service restarted successfully" >> "$LOG"
+                    else
+                        echo "$TIMESTAMP | FAIL | nanoclaw | Service failed to start after rebuild (post-restart is-active check)" >> "$LOG"
+                    fi
                 else
-                    echo "$TIMESTAMP | FAIL | nanoclaw | Service failed to start after rebuild" >> "$LOG"
+                    echo "$TIMESTAMP | FAIL | nanoclaw | systemctl restart failed (non-zero exit; check journalctl for unit-load / sudoers / bus errors)" >> "$LOG"
                 fi
             else
                 echo "$TIMESTAMP | FAIL | nanoclaw | Build failed: ${BUILD_OUT:0:200}" >> "$LOG"
@@ -246,21 +272,32 @@ if [ "${NEEDS_HOST_EXECUTOR_RESTART:-0}" -eq 1 ]; then
     # atlas-lib (atlas-core didn't pull) while running newly-pulled host
     # code, surfacing as ImportError or mixed-version behavior at task time.
     # ATLAS_CORE_SYNC_OK is set to 1 inside the atlas-core success branch
-    # (line ~144 of the if-sync_repo block) and to 0 in the else branch;
-    # initialized to 1 at the top of the script so hosts WITHOUT atlas-core
-    # cloned (the [ -d /home/atlas/.atlas/.git ] guard skips the block) keep
-    # the default success semantics.
-    if [ "${ATLAS_CORE_SYNC_OK:-1}" -eq 1 ]; then
+    # (line ~136 of the if-sync_repo block) and to 0 in the else branch;
+    # initialized to 0 at the top of the script (C2 fix — codex 0ba5abf R4
+    # F2 BLOCKING) so hosts WITHOUT atlas-core cloned fail-closed instead
+    # of falsely inheriting a "success" default.
+    if [ "${ATLAS_CORE_SYNC_OK:-0}" -eq 1 ]; then
         echo "$TIMESTAMP | RESTART | atlas-host-executor | $NEEDS_HOST_EXECUTOR_RESTART_REASON" >> "$LOG"
-        sudo /usr/bin/systemctl restart atlas-host-executor.service
-        sleep 3
-        if systemctl is-active --quiet atlas-host-executor.service; then
-            echo "$TIMESTAMP | RESTART | atlas-host-executor | service restarted successfully" >> "$LOG"
+        # C1 fix (codex 0ba5abf R4 F1 BLOCKING): gate the is-active probe on
+        # the systemctl restart's own exit code. Pre-fix, a non-zero
+        # `systemctl restart` (e.g., systemd unit-load failure, transient
+        # bus fault, sudoers misconfig) would still drop into `sleep 3 +
+        # systemctl is-active`, which could report the OLD running unit as
+        # active and emit a false-success RESTART line. Mirroring the
+        # atlas-command block at lines ~322-340 below — `if sudo systemctl
+        # restart ...; then ... else log FAIL ...; fi`.
+        if sudo /usr/bin/systemctl restart atlas-host-executor.service; then
+            sleep 3
+            if systemctl is-active --quiet atlas-host-executor.service; then
+                echo "$TIMESTAMP | RESTART | atlas-host-executor | service restarted successfully" >> "$LOG"
+            else
+                echo "$TIMESTAMP | FAIL | atlas-host-executor | service failed to start after restart (post-restart is-active check)" >> "$LOG"
+            fi
         else
-            echo "$TIMESTAMP | FAIL | atlas-host-executor | service failed to start after restart" >> "$LOG"
+            echo "$TIMESTAMP | FAIL | atlas-host-executor | systemctl restart failed (non-zero exit; check journalctl for unit-load / sudoers / bus errors)" >> "$LOG"
         fi
     else
-        echo "$TIMESTAMP | SKIP_RESTART | atlas-host-executor | flag set ($NEEDS_HOST_EXECUTOR_RESTART_REASON) but atlas-core sync failed; deferring to next cycle to avoid stale-lib mixed-version window" >> "$LOG"
+        echo "$TIMESTAMP | SKIP_RESTART | atlas-host-executor | flag set ($NEEDS_HOST_EXECUTOR_RESTART_REASON) but atlas-core sync failed or absent; deferring to next cycle to avoid stale-lib mixed-version window" >> "$LOG"
     fi
 fi
 
