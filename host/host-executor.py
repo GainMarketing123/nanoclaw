@@ -240,7 +240,43 @@ QUALITY_CHECK_PORT = 3003
 # not being supported on the /v1/messages endpoint.
 
 def _load_anthropic_api_key() -> str:
-    """Read ANTHROPIC_API_KEY from ~/.atlas/.env or environment."""
+    """Read ANTHROPIC_API_KEY: systemd LoadCredential first, then env, then file.
+
+    Phase 3.1 (1.A.6): production reads ANTHROPIC_API_KEY from a systemd-
+    injected credential file at $CREDENTIALS_DIRECTORY/anthropic-api-key.
+    The matching unit declaration is
+      LoadCredential=anthropic-api-key:/etc/atlas/anthropic-api-key.secret
+    The source file at /etc/atlas/anthropic-api-key.secret is root-owned
+    mode 0400. systemd reads it as root, then exposes the rendered copy to
+    the service inside its private credential namespace — readable only by
+    the service's User=. Net effect: atlas-svc group members, cron, other
+    services, and the gateway-era shared file all lose read access; only
+    the running atlas-host-executor process can see the key.
+
+    Path() wrap is required (codex R1 F1 catch in the Phase 3.1 spec):
+    `os.environ.get(...)` returns str; `str / str` raises TypeError; the
+    wrap is the only thing preventing a startup-time crash on the new
+    code path.
+
+    Legacy paths preserved for laptop / dev / partial-deployment cases:
+      1. ANTHROPIC_API_KEY env var (production EnvironmentFile= injection
+         pre-Phase 3.1; also matches direct shell-set for ad-hoc test).
+      2. ATLAS_DIR/.env file (laptop fallback when no env var set).
+
+    Returns "" if all three paths fail; main() surfaces a clear startup
+    error rather than running with an empty key.
+    """
+    cred_dir = os.environ.get("CREDENTIALS_DIRECTORY")
+    if cred_dir:
+        cred_file = Path(cred_dir) / "anthropic-api-key"
+        try:
+            content = cred_file.read_text().strip()
+            if content:
+                return content
+        except (FileNotFoundError, PermissionError, OSError):
+            # Transient read failure — fall through to legacy paths rather
+            # than crash. Auth failures downstream surface a clearer error.
+            pass
     key = os.environ.get("ANTHROPIC_API_KEY", "")
     if key:
         return key
@@ -423,7 +459,12 @@ def _call_haiku(response_text: str) -> dict:
     """
     api_key = _load_anthropic_api_key()
     if not api_key:
-        return _unavailable("token_missing", False, "ANTHROPIC_API_KEY not in ~/.atlas/.env or env")
+        return _unavailable(
+            "token_missing", False,
+            "ANTHROPIC_API_KEY missing from all sources: "
+            "$CREDENTIALS_DIRECTORY/anthropic-api-key (Phase 3.1 LoadCredential), "
+            "$ANTHROPIC_API_KEY env var, ~/.atlas/.env file"
+        )
 
     if not QUALITY_CHECK_PROMPT:
         # Host runs in degraded mode when the prompt file is missing/invalid
