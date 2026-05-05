@@ -5,19 +5,37 @@
 LOG=/home/atlas/nanoclaw/logs/git-sync.log
 TIMESTAMP=$(date +%Y-%m-%dT%H:%M:%S%z)
 
-# C2 fix (codex 0ba5abf R4 F2 BLOCKING): atlas-core sync success flag,
-# fail-closed initialization. Pre-fix, the consolidated restart block at the
-# bottom of this script read `${ATLAS_CORE_SYNC_OK:-1}` — defaulting to 1
-# when the variable was unset. That meant a host WITHOUT atlas-core cloned
-# (the `[ -d /home/atlas/.atlas/.git ]` guard later in this script skips
-# the entire atlas-core block, never setting the flag) would still have
-# the consolidated restart fire, restarting host-executor against an
-# atlas-lib it cannot load. Initializing here to 0 fail-closes the
-# default: host-executor only restarts when atlas-core sync was
-# explicitly known-good this cycle. Setters on success at line ~136
-# (ATLAS_CORE_SYNC_OK=1 inside `if sync_repo ...; then`) and on failure
-# at line ~227 (ATLAS_CORE_SYNC_OK=0 inside the corresponding `else`)
-# override this initial value when atlas-core IS cloned.
+# C2 + R1 codex 5955b3c follow-up — atlas-core restart-safety tri-state.
+#
+# Original C2 problem (codex 0ba5abf R4 F2 BLOCKING): pre-C2 default of 1
+# meant a host WITHOUT atlas-core cloned (the `[ -d /home/atlas/.atlas/.git ]`
+# guard at line ~110 skips the entire atlas-core block, never setting the
+# flag) still had the consolidated restart fire, restarting host-executor
+# against an atlas-lib it couldn't load.
+#
+# Round-1 follow-up (codex 5955b3c BLOCKING — same architectural area, NEW
+# scenario): a default of 0 fail-closes correctly when atlas-core is present
+# but its sync failed, BUT it ALSO suppresses restart on legitimate hosts
+# where ATLAS_DIR is overridden via the systemd env var to a path other than
+# /home/atlas/.atlas (host-executor.py line 64 supports this). On such
+# hosts: (a) git-sync.sh still hard-codes the .git existence check at
+# /home/atlas/.atlas, (b) the atlas-core block stays skipped, (c) host-
+# executor.py runs fine using the overridden ATLAS_DIR/lib fallback, but
+# (d) nanoclaw host code changes never trigger restart — the running
+# process keeps executing stale Python indefinitely.
+#
+# Tri-state guard distinguishes "atlas-core ABSENT" from "atlas-core
+# PRESENT but sync FAILED":
+#   ATLAS_CORE_PRESENT=0 → no /home/atlas/.atlas/.git on this host
+#                          (set/cleared at the line ~110 guard)
+#   ATLAS_CORE_PRESENT=1 → /home/atlas/.atlas/.git exists; pair with:
+#     ATLAS_CORE_SYNC_OK=1 → this cycle's pull succeeded
+#     ATLAS_CORE_SYNC_OK=0 → this cycle's pull failed OR not yet attempted
+#
+# Bottom-gate restart logic (line ~265):
+#   restart_safe := (ATLAS_CORE_PRESENT == 0) || (ATLAS_CORE_SYNC_OK == 1)
+# i.e., restart unless atlas-core is present-but-failed-this-cycle.
+ATLAS_CORE_PRESENT=0
 ATLAS_CORE_SYNC_OK=0
 
 # Phase 3.1 prereq #2 (codex consult 2026-05-04, refined by d6faf12 R2 F2 SOFT
@@ -134,6 +152,13 @@ fi
 # Reset it before pull so upstream changes land cleanly. The autonomous loop
 # will re-write the correct VPS state on its next run (daily at 10AM).
 if [ -d /home/atlas/.atlas/.git ]; then
+    # Tri-state guard (codex 5955b3c R1 BLOCKING): mark atlas-core as
+    # PRESENT on this host so the bottom-gate restart logic distinguishes
+    # "atlas-core repo absent (legitimate pre-cutover host with overridden
+    # ATLAS_DIR)" from "atlas-core present-but-failed-to-sync (unsafe to
+    # restart against potentially-stale lib)". See top-of-script comment
+    # on ATLAS_CORE_PRESENT for full rationale.
+    ATLAS_CORE_PRESENT=1
     cd /home/atlas/.atlas
     git checkout -- autonomy/graduation-status.json 2>/dev/null
     HEAD_BEFORE_AC=$(git rev-parse HEAD 2>/dev/null)
@@ -271,12 +296,18 @@ if [ "${NEEDS_HOST_EXECUTOR_RESTART:-0}" -eq 1 ]; then
     # restarted host-executor.py resolved _ATLAS_LIB_PATH against stale
     # atlas-lib (atlas-core didn't pull) while running newly-pulled host
     # code, surfacing as ImportError or mixed-version behavior at task time.
-    # ATLAS_CORE_SYNC_OK is set to 1 inside the atlas-core success branch
-    # (line ~136 of the if-sync_repo block) and to 0 in the else branch;
-    # initialized to 0 at the top of the script (C2 fix — codex 0ba5abf R4
-    # F2 BLOCKING) so hosts WITHOUT atlas-core cloned fail-closed instead
-    # of falsely inheriting a "success" default.
-    if [ "${ATLAS_CORE_SYNC_OK:-0}" -eq 1 ]; then
+    #
+    # Tri-state restart-safety guard (codex 5955b3c R1 BLOCKING):
+    #   ATLAS_CORE_PRESENT=0 → atlas-core repo not on this host (legitimate
+    #     pre-cutover / overridden-ATLAS_DIR scenario per host-executor.py
+    #     lines 64-69 + 143-146 — host-executor falls back to ATLAS_DIR/lib).
+    #     Restart IS appropriate for nanoclaw host code changes.
+    #   ATLAS_CORE_PRESENT=1 + ATLAS_CORE_SYNC_OK=1 → repo present, this
+    #     cycle's pull succeeded. Restart appropriate.
+    #   ATLAS_CORE_PRESENT=1 + ATLAS_CORE_SYNC_OK=0 → repo present, this
+    #     cycle's pull failed. Restart UNSAFE (mixed-version window).
+    # Restart safe iff: atlas-core ABSENT, OR (atlas-core PRESENT AND sync OK).
+    if [ "${ATLAS_CORE_PRESENT:-0}" -eq 0 ] || [ "${ATLAS_CORE_SYNC_OK:-0}" -eq 1 ]; then
         echo "$TIMESTAMP | RESTART | atlas-host-executor | $NEEDS_HOST_EXECUTOR_RESTART_REASON" >> "$LOG"
         # C1 fix (codex 0ba5abf R4 F1 BLOCKING): gate the is-active probe on
         # the systemctl restart's own exit code. Pre-fix, a non-zero
@@ -297,7 +328,7 @@ if [ "${NEEDS_HOST_EXECUTOR_RESTART:-0}" -eq 1 ]; then
             echo "$TIMESTAMP | FAIL | atlas-host-executor | systemctl restart failed (non-zero exit; check journalctl for unit-load / sudoers / bus errors)" >> "$LOG"
         fi
     else
-        echo "$TIMESTAMP | SKIP_RESTART | atlas-host-executor | flag set ($NEEDS_HOST_EXECUTOR_RESTART_REASON) but atlas-core sync failed or absent; deferring to next cycle to avoid stale-lib mixed-version window" >> "$LOG"
+        echo "$TIMESTAMP | SKIP_RESTART | atlas-host-executor | flag set ($NEEDS_HOST_EXECUTOR_RESTART_REASON) but atlas-core present-and-sync-failed this cycle (PRESENT=$ATLAS_CORE_PRESENT SYNC_OK=$ATLAS_CORE_SYNC_OK); deferring to next cycle to avoid stale-lib mixed-version window" >> "$LOG"
     fi
 fi
 
