@@ -133,6 +133,7 @@ if [ -d /home/atlas/.atlas/.git ]; then
     #       rsync failed; cycle-2 pull is no-op so (A) doesn't fire, but
     #       rsync re-attempts and on success the marker advances).
     if sync_repo /home/atlas/.atlas atlas-core; then
+        ATLAS_CORE_SYNC_OK=1
         HEAD_AFTER_AC=$(git rev-parse HEAD 2>/dev/null)
         # Tree hash is content-addressed: any lib/ change yields a new hash;
         # unrelated atlas-core changes don't. More precise than a commit-sha
@@ -223,6 +224,7 @@ if [ -d /home/atlas/.atlas/.git ]; then
             echo "$TIMESTAMP | DEFER_RESTART | atlas-host-executor | atlas-core lib/ tree marker advanced ${LAST_RSYNCED_TREE:0:12} -> ${CURRENT_LIB_TREE:0:12}" >> "$LOG"
         fi
     else
+        ATLAS_CORE_SYNC_OK=0
         echo "$TIMESTAMP | SKIP | atlas-lib-sync | atlas-core sync_repo non-zero; marker unchanged, will retry next cycle" >> "$LOG"
     fi
 fi
@@ -236,13 +238,29 @@ fi
 # repos changed — eliminates the mixed-version window where a restart on
 # nanoclaw changes alone cached old atlas-core lib modules.
 if [ "${NEEDS_HOST_EXECUTOR_RESTART:-0}" -eq 1 ]; then
-    echo "$TIMESTAMP | RESTART | atlas-host-executor | $NEEDS_HOST_EXECUTOR_RESTART_REASON" >> "$LOG"
-    sudo /usr/bin/systemctl restart atlas-host-executor.service
-    sleep 3
-    if systemctl is-active --quiet atlas-host-executor.service; then
-        echo "$TIMESTAMP | RESTART | atlas-host-executor | service restarted successfully" >> "$LOG"
+    # Codex 4ccb79b R4 F1 BLOCKING fix: only restart when atlas-core sync was
+    # known-good for this cycle. Pre-fix, a nanoclaw host/infra change set
+    # NEEDS_HOST_EXECUTOR_RESTART=1 BEFORE the atlas-core pull at line ~107;
+    # if atlas-core then failed, the consolidated restart still ran and the
+    # restarted host-executor.py resolved _ATLAS_LIB_PATH against stale
+    # atlas-lib (atlas-core didn't pull) while running newly-pulled host
+    # code, surfacing as ImportError or mixed-version behavior at task time.
+    # ATLAS_CORE_SYNC_OK is set to 1 inside the atlas-core success branch
+    # (line ~144 of the if-sync_repo block) and to 0 in the else branch;
+    # initialized to 1 at the top of the script so hosts WITHOUT atlas-core
+    # cloned (the [ -d /home/atlas/.atlas/.git ] guard skips the block) keep
+    # the default success semantics.
+    if [ "${ATLAS_CORE_SYNC_OK:-1}" -eq 1 ]; then
+        echo "$TIMESTAMP | RESTART | atlas-host-executor | $NEEDS_HOST_EXECUTOR_RESTART_REASON" >> "$LOG"
+        sudo /usr/bin/systemctl restart atlas-host-executor.service
+        sleep 3
+        if systemctl is-active --quiet atlas-host-executor.service; then
+            echo "$TIMESTAMP | RESTART | atlas-host-executor | service restarted successfully" >> "$LOG"
+        else
+            echo "$TIMESTAMP | FAIL | atlas-host-executor | service failed to start after restart" >> "$LOG"
+        fi
     else
-        echo "$TIMESTAMP | FAIL | atlas-host-executor | service failed to start after restart" >> "$LOG"
+        echo "$TIMESTAMP | SKIP_RESTART | atlas-host-executor | flag set ($NEEDS_HOST_EXECUTOR_RESTART_REASON) but atlas-core sync failed; deferring to next cycle to avoid stale-lib mixed-version window" >> "$LOG"
     fi
 fi
 
