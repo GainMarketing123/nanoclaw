@@ -100,7 +100,19 @@ NANOCLAW_DIR = _resolve_dir("NANOCLAW_DIR", Path.home() / "nanoclaw")
 # false-passes on a partial tree that's missing the new module).
 _ATLAS_LIB_REQUIRED_MODULES = (
     "ssrf.py",
-    "providers.py",
+    # Phase 3.0 cutover bug fix (2026-05-05 session 1e456cce): `providers` is a
+    # PACKAGE (providers/__init__.py + providers/router.py + providers/clients/)
+    # not a top-level providers.py file. Pre-fix, the file-existence pre-check
+    # `Path(prod / m).is_file()` returned False on the directory, so
+    # _resolve_atlas_lib_path always fell back to ATLAS_DIR/lib even when
+    # /usr/local/lib/atlas was correctly populated by the rsync — defeating
+    # Phase 3.0's code-load relocation goal entirely. The probe statement
+    # `from providers import route` works on the package shape; only the
+    # pre-check was wrong. agent-runner.py's lockstep file uses
+    # `providers/__init__.py` + `providers/router.py` and was always correct;
+    # this file's drift was a single-line typo that the partial-migration
+    # discipline caught only when the prod tree finally existed at runtime.
+    "providers/__init__.py",
     "performance_tracker.py",
     "autonomy_tracker.py",
     "mission_executor.py",
