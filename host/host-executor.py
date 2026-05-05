@@ -73,8 +73,24 @@ NANOCLAW_DIR = _resolve_dir("NANOCLAW_DIR", Path.home() / "nanoclaw")
 # stale, or silently failing, every later import site would resolve against
 # the broken tree and never retry ATLAS_DIR/lib. Validation now requires
 # every host-executor-required module file to be present in the prod path
-# before selecting it; partial trees fall back to ATLAS_DIR/lib (which holds
-# the working code) until the next git-sync run completes the mirror.
+# AND the modules must actually import in an isolated subprocess (Phase 3.1
+# prereq #3 — codex consult 2026-05-04). File-existence alone false-passed
+# on partial trees where top-level files were present but transitive deps
+# were missing; in-process probe-import polluted sys.modules and broke
+# downstream sys.path / cache assumptions. Subprocess probe with
+# PYTHONPATH=/usr/local/lib/atlas runs `python3 -c "import M1; ..."` in a
+# clean child interpreter, so module init code runs against the prod tree
+# only and zero modules cache in the parent. Falls back to ATLAS_DIR/lib
+# loud-logged-to-stderr on any failure mode — silent fallback would
+# undermine the point of the sealed prod tree.
+#
+# LOCKSTEP NOTE: the matching validator lives in atlas-engineering at
+# ~/.atlas/agents/agent-runner.py. Both files duplicate the algorithm by
+# design (codex 2026-05-04 ruled against a shared helper inside atlas-lib —
+# chicken-and-egg with the very tree we're validating). Per-file probe
+# module sets DIFFER (each entrypoint imports a different subset) but the
+# subprocess + file-existence + loud-fallback shape MUST stay identical.
+# Update both files together.
 #
 # Resolution is one-shot at startup — subsequent appearance / removal of the
 # prod path takes effect on next service restart, which matches the chattr
@@ -89,11 +105,65 @@ _ATLAS_LIB_REQUIRED_MODULES = (
     "autonomy_tracker.py",
     "mission_executor.py",
 )
+# Probe-import module set: the actual `import M` form callers issue
+# downstream. File-existence covers the .py path; subprocess probe covers
+# import-time correctness AND transitive dep presence (Python resolves
+# transitives during import). Keep this list a strict subset of the file
+# names above (sans .py) — drift means the subprocess could fail-open on
+# a missing module that file-existence didn't list.
+_ATLAS_LIB_PROBE_MODULES = (
+    "ssrf",
+    "providers",
+    "performance_tracker",
+    "autonomy_tracker",
+    "mission_executor",
+)
 def _resolve_atlas_lib_path() -> str:
     prod = Path("/usr/local/lib/atlas")
-    if prod.is_dir() and all((prod / m).is_file() for m in _ATLAS_LIB_REQUIRED_MODULES):
-        return str(prod)
-    return str(ATLAS_DIR / "lib")
+    fallback = str(ATLAS_DIR / "lib")
+    if not prod.is_dir():
+        return fallback
+    if not all((prod / m).is_file() for m in _ATLAS_LIB_REQUIRED_MODULES):
+        sys.stderr.write(
+            f"[atlas-lib-resolver] {prod} present but missing required module file(s); "
+            f"falling back to {fallback}\n"
+        )
+        return fallback
+    # Subprocess probe — same interpreter (sys.executable), PYTHONPATH
+    # narrowed to the prod tree, no parent sys.path or sys.modules side
+    # effects. PYTHONDONTWRITEBYTECODE=1 prevents the probe from creating
+    # __pycache__ entries inside the prod tree (a no-op once chattr +i
+    # lands in Phase 3.1+ but defensive today while atlas writes go via
+    # sudo rsync). Bounded timeout — module init for these modules is
+    # sub-second; 15s catches a stuck import without hanging the unit
+    # start indefinitely.
+    probe_script = "; ".join(f"import {m}" for m in _ATLAS_LIB_PROBE_MODULES)
+    probe_env = dict(os.environ)
+    probe_env["PYTHONPATH"] = str(prod)
+    probe_env["PYTHONDONTWRITEBYTECODE"] = "1"
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", probe_script],
+            env=probe_env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        sys.stderr.write(
+            f"[atlas-lib-resolver] probe subprocess failed to launch under {prod} ({e}); "
+            f"falling back to {fallback}\n"
+        )
+        return fallback
+    if result.returncode != 0:
+        stderr_excerpt = (result.stderr or "").strip().replace("\n", " ")[:300]
+        sys.stderr.write(
+            f"[atlas-lib-resolver] probe-import failed under {prod} "
+            f"(exit={result.returncode}); falling back to {fallback}. "
+            f"stderr: {stderr_excerpt}\n"
+        )
+        return fallback
+    return str(prod)
 _ATLAS_LIB_PATH = _resolve_atlas_lib_path()
 PENDING_DIR = ATLAS_DIR / "host-tasks" / "pending"
 COMPLETED_DIR = ATLAS_DIR / "host-tasks" / "completed"
