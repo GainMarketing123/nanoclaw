@@ -371,13 +371,16 @@ export function startCredentialProxy(
   host = '127.0.0.1',
 ): Promise<Server> {
   const secrets = readEnvFile([
-    'ANTHROPIC_API_KEY',
     'CLAUDE_CODE_OAUTH_TOKEN',
     'ANTHROPIC_AUTH_TOKEN',
     'ANTHROPIC_BASE_URL',
   ]);
 
-  const authMode: AuthMode = secrets.ANTHROPIC_API_KEY ? 'api-key' : 'oauth';
+  // ANTHROPIC_API_KEY uses the systemd → env → file precedence; .env-only
+  // detection mis-classifies post-Phase-3.1 deployments (where the key only
+  // exists at $CREDENTIALS_DIRECTORY/anthropic-api-key).
+  const apiKey = loadAnthropicApiKey();
+  const authMode: AuthMode = apiKey ? 'api-key' : 'oauth';
   const envOauthToken =
     secrets.CLAUDE_CODE_OAUTH_TOKEN || secrets.ANTHROPIC_AUTH_TOKEN;
 
@@ -492,7 +495,7 @@ export function startCredentialProxy(
 
           if (authMode === 'api-key') {
             delete headers['x-api-key'];
-            headers['x-api-key'] = secrets.ANTHROPIC_API_KEY;
+            headers['x-api-key'] = apiKey;
           } else {
             if (headers['authorization']) {
               delete headers['authorization'];
@@ -637,8 +640,42 @@ export function startCredentialProxy(
   });
 }
 
+/**
+ * Load ANTHROPIC_API_KEY following the host-executor precedence so the proxy
+ * and the host process agree on auth mode regardless of how the secret is
+ * delivered. Mirrors host/host-executor.py:_load_anthropic_api_key():
+ *   1. $CREDENTIALS_DIRECTORY/anthropic-api-key  (systemd LoadCredential —
+ *      Phase 3.1 production cutover; .env may be empty post-cutover)
+ *   2. process.env.ANTHROPIC_API_KEY              (pre-3.1 EnvironmentFile +
+ *      direct shell-set for dev/test)
+ *   3. .env file fallback                         (laptop / partial deploy)
+ * Returns the trimmed key or "" if all three paths fail.
+ *
+ * Without this precedence, post-Phase-3.1 deployments where .env's
+ * ANTHROPIC_API_KEY is removed in favor of the systemd credential will be
+ * mis-classified as oauth by the proxy/container-runner, causing 401s on
+ * upstream requests despite a valid API key being present via systemd.
+ */
+function loadAnthropicApiKey(): string {
+  const credDir = process.env.CREDENTIALS_DIRECTORY;
+  if (credDir) {
+    try {
+      const credPath = path.join(credDir, 'anthropic-api-key');
+      if (fs.existsSync(credPath)) {
+        const content = fs.readFileSync(credPath, 'utf-8').trim();
+        if (content) return content;
+      }
+    } catch {
+      // Transient read failure — fall through to legacy paths.
+    }
+  }
+  const envKey = process.env.ANTHROPIC_API_KEY;
+  if (envKey && envKey.trim()) return envKey.trim();
+  const fileSecrets = readEnvFile(['ANTHROPIC_API_KEY']);
+  return fileSecrets.ANTHROPIC_API_KEY || '';
+}
+
 /** Detect which auth mode the host is configured for. */
 export function detectAuthMode(): AuthMode {
-  const secrets = readEnvFile(['ANTHROPIC_API_KEY']);
-  return secrets.ANTHROPIC_API_KEY ? 'api-key' : 'oauth';
+  return loadAnthropicApiKey() ? 'api-key' : 'oauth';
 }
