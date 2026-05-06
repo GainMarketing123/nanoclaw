@@ -27,7 +27,17 @@ export const HOME_DIR =
   process.platform !== 'win32' && process.env.HOME
     ? process.env.HOME
     : os.homedir();
-export const HOST_CLAUDE_DIR = path.join(HOME_DIR, '.claude');
+
+// CLAUDE_CONFIG_DIR is the Claude CLI / Anthropic SDK standard env var
+// for relocating the Claude config + credentials root. When the runtime
+// user is not the credential owner (Phase 3.2 nanoclaw-he case), the env
+// override points the proxy + container-runner at the actual location
+// (e.g. /home/nanoclaw-he/.claude). HOST_CLAUDE_DIR is retained as a
+// back-compat alias for existing imports — callers should migrate to
+// CLAUDE_CONFIG_DIR over time.
+export const CLAUDE_CONFIG_DIR =
+  process.env.CLAUDE_CONFIG_DIR || path.join(HOME_DIR, '.claude');
+export const HOST_CLAUDE_DIR = CLAUDE_CONFIG_DIR;
 
 // Mount security: allowlist stored OUTSIDE project root, never mounted into containers
 export const MOUNT_ALLOWLIST_PATH = path.join(
@@ -87,8 +97,14 @@ export const TIMEZONE =
 // audit doc 1.A.6 condition (b) decoupling): explicit path config so a future
 // user-account migration can repoint both services without simultaneous code +
 // deploy changes. Defaults to the historical home-relative location.
-export const ATLAS_STATE_DIR =
+//
+// ATLAS_DIR is the canonical name (matches Python lib/atlas_paths.py and the
+// engineering-side env-var contract). ATLAS_STATE_DIR is retained as a
+// back-compat alias for existing imports — callers should migrate to
+// ATLAS_DIR over time.
+export const ATLAS_DIR =
   process.env.ATLAS_DIR || path.join(HOME_DIR, '.atlas');
+export const ATLAS_STATE_DIR = ATLAS_DIR;
 
 // Atlas Operations directory — bridge, swarm, entities, security
 // Post three-repo split: operations state lives separately from engineering

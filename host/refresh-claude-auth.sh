@@ -13,8 +13,15 @@
 
 set -euo pipefail
 
-CREDS_FILE="/home/nanoclaw-he/.claude/.credentials.json"
-BACKUP_FILE="/home/nanoclaw-he/.claude/.credentials.json.bak"
+# CLAUDE_CONFIG_DIR is the Claude CLI / Anthropic SDK standard env var
+# for relocating the credential root. VPS-specific default: this script
+# ONLY runs on the VPS as root managing nanoclaw-he, so the fallback
+# hardcodes nanoclaw-he's home rather than generic ${HOME}/.claude
+# (which would resolve to /root/.claude when invoked via SSH-as-root,
+# silently writing credentials to the wrong tree).
+CLAUDE_HOME="${CLAUDE_CONFIG_DIR:-/home/nanoclaw-he/.claude}"
+CREDS_FILE="$CLAUDE_HOME/.credentials.json"
+BACKUP_FILE="$CLAUDE_HOME/.credentials.json.bak"
 
 echo "=== Atlas Claude Auth Refresh ==="
 
@@ -28,7 +35,7 @@ fi
 if [ ! -t 0 ]; then
     echo "Reading credentials from stdin..."
     # Phase 3.2: ensure the .claude directory exists and is owned by nanoclaw-he
-    install -d -m 0755 -o nanoclaw-he -g nanoclaw-he /home/nanoclaw-he/.claude
+    install -d -m 0755 -o nanoclaw-he -g nanoclaw-he "$CLAUDE_HOME"
     cat > "$CREDS_FILE"
     chmod 600 "$CREDS_FILE"
     chown nanoclaw-he:nanoclaw-he "$CREDS_FILE"

@@ -1120,8 +1120,8 @@ def process_task(task_path: Path) -> None:
                 f"Task `{task_id}` for {entity} failed due to expired authentication.\n\n"
                 "Run on your laptop:\n"
                 "`scp ~/.claude/.credentials.json root@5.78.190.56:/home/nanoclaw-he/.claude/.credentials.json`\n\n"
-                "Or SSH and run:\n"
-                "`/home/atlas/scripts/refresh-claude-auth.sh`"
+                "Or pipe credentials over SSH (the script rejects non-pipe stdin):\n"
+                "`ssh root@5.78.190.56 '/home/atlas/scripts/refresh-claude-auth.sh' < ~/.claude/.credentials.json`"
             )
             send_telegram_alert(auth_msg)
             write_result(task_id, entity, "error", exit_code,
