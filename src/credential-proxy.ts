@@ -582,7 +582,7 @@ export function startCredentialProxy(
                 '*OAuth Refresh Token Failed*\n\n' +
                   'The refresh token is invalid or expired. This is NOT an outage — the token needs replacing.\n\n' +
                   'From your laptop, run:\n' +
-                  '`scp ~/.claude/.credentials.json root@5.78.190.56:/home/atlas/.claude/.credentials.json`\n\n' +
+                  '`scp ~/.claude/.credentials.json root@5.78.190.56:/home/nanoclaw-he/.claude/.credentials.json`\n\n' +
                   'Then: `ssh root@5.78.190.56 systemctl restart nanoclaw`',
               );
             }

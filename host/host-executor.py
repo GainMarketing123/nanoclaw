@@ -1119,7 +1119,7 @@ def process_task(task_path: Path) -> None:
                 "*Host-Executor Auth Failure*\n\n"
                 f"Task `{task_id}` for {entity} failed due to expired authentication.\n\n"
                 "Run on your laptop:\n"
-                "`scp ~/.claude/.credentials.json root@5.78.190.56:/home/atlas/.claude/.credentials.json`\n\n"
+                "`scp ~/.claude/.credentials.json root@5.78.190.56:/home/nanoclaw-he/.claude/.credentials.json`\n\n"
                 "Or SSH and run:\n"
                 "`/home/atlas/scripts/refresh-claude-auth.sh`"
             )
