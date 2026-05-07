@@ -307,6 +307,13 @@ function startOutageRecovery(creds: {
   const tryRecover = async (): Promise<void> => {
     if (!creds.refreshToken) {
       logger.error('No refresh token available for outage recovery');
+      // Codex b48776f F2 BLOCKING fix: clear healthCheckTimer so a later
+      // request that updates currentCreds (e.g., file-reload in the proactive
+      // path) and triggers startOutageRecovery again can actually start a
+      // fresh recovery cycle. Without this, healthCheckTimer holds a stale
+      // ID and the `if (healthCheckTimer) return` global lock at
+      // startOutageRecovery permanently blocks re-entry.
+      healthCheckTimer = null;
       return;
     }
 
@@ -327,10 +334,21 @@ function startOutageRecovery(creds: {
         creds.accessToken = result.accessToken;
         creds.refreshToken = result.refreshToken;
       } catch (saveErr) {
+        // Codex b48776f F2 BLOCKING fix: schedule the next retry
+        // explicitly. The one-shot setTimeout that fired this tryRecover
+        // is consumed; without rescheduling here, healthCheckTimer holds
+        // a stale ID and the global re-entry lock at startOutageRecovery
+        // permanently blocks future recovery attempts.
+        const delay =
+          HEALTH_CHECK_BACKOFF_MS[
+            Math.min(attempt, HEALTH_CHECK_BACKOFF_MS.length - 1)
+          ];
+        attempt++;
         logger.error(
-          { err: saveErr },
-          'Outage recovery refresh succeeded but persistence failed — staying in outage mode for retry',
+          { err: saveErr, attempt, nextCheckSec: Math.round(delay / 1000) },
+          'Outage recovery refresh succeeded but persistence failed — rescheduling retry',
         );
+        healthCheckTimer = setTimeout(tryRecover, delay);
         return;
       }
 

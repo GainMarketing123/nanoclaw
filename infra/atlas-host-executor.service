@@ -27,6 +27,14 @@ Environment=PATH=/usr/local/bin:/usr/bin:/bin:/home/atlas/.local/bin
 # after the unit lands) continue to behave as before.
 Environment=ATLAS_DIR=/home/atlas/.atlas
 Environment=NANOCLAW_DIR=/home/atlas/nanoclaw
+# Codex b48776f F1 BLOCKING fix: persist CLAUDE_CONFIG_DIR in service env
+# so the runtime CREDENTIALS_PATH (built from process.env.CLAUDE_CONFIG_DIR
+# || HOME/.claude in src/config.ts) reads the SAME path the refresh script
+# writes to. Without this, refresh-claude-auth.sh writes to
+# /home/nanoclaw-he/.claude but the restarted service reads $HOME/.claude
+# under whatever HOME the unit declares — refresh "succeeds" while live
+# auth stays stale.
+Environment=CLAUDE_CONFIG_DIR=/home/nanoclaw-he/.claude
 # Phase 3.0 (1.A.6): activate the production fail-closed path in
 # host-executor.py — when ATLAS_HOST_MODE=production is set, missing
 # ATLAS_DIR / NANOCLAW_DIR env vars become an explicit RuntimeError at

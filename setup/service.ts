@@ -246,6 +246,7 @@ RestartSec=5
 KillMode=process
 Environment=HOME=${homeDir}
 Environment=PATH=/usr/local/bin:/usr/bin:/bin:${homeDir}/.local/bin
+${process.env.CLAUDE_CONFIG_DIR ? `Environment=CLAUDE_CONFIG_DIR=${process.env.CLAUDE_CONFIG_DIR}\n` : ''}
 StandardOutput=append:${projectRoot}/logs/nanoclaw.log
 StandardError=append:${projectRoot}/logs/nanoclaw.error.log
 
