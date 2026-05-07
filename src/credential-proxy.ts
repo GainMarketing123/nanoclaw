@@ -120,10 +120,30 @@ function saveCredentials(
 
     const dir = path.dirname(CREDENTIALS_PATH);
     fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(CREDENTIALS_PATH, JSON.stringify(data, null, 2));
-    fs.chmodSync(CREDENTIALS_PATH, 0o600);
 
-    logger.info('OAuth credentials refreshed and saved');
+    // Codex cfc93bb F1 BLOCKING fix: atomic write via temp-file-in-directory
+    // + rename. Prior writeFileSync truncated the live file in place — a
+    // concurrent loadCredentials() (5-min refresh loop, host script,
+    // re-load on auth-error) could parse half-written JSON and fall back
+    // to .env. fs.renameSync on the same filesystem is atomic at the
+    // rename boundary, so readers see either the old file or the new
+    // file, never a mid-write state. Same pattern as the shell-side fix
+    // in host/refresh-claude-auth.sh.
+    const tmpPath = `${CREDENTIALS_PATH}.new.${process.pid}.${Date.now()}`;
+    try {
+      fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), { mode: 0o600 });
+      fs.renameSync(tmpPath, CREDENTIALS_PATH);
+    } catch (writeErr) {
+      // Clean up the temp file if rename failed.
+      try {
+        fs.unlinkSync(tmpPath);
+      } catch {
+        // Best-effort cleanup; ignore if temp doesn't exist.
+      }
+      throw writeErr;
+    }
+
+    logger.info('OAuth credentials refreshed and saved (atomic)');
   } catch (err) {
     logger.error({ err }, 'Failed to save refreshed credentials');
   }
