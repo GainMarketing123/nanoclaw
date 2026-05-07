@@ -98,14 +98,14 @@ export async function run(_args: string[]): Promise<void> {
 
   // 3. Check credentials
   //
-  // Codex 53ed80e F3 SOFT fix: align with runtime credential precedence
-  // in src/credential-proxy.ts:detectAuthMode and host/host-executor.py:
-  // _load_anthropic_api_key. The prior check only inspected
-  // projectRoot/.env, producing false failures on valid deployments
-  // using $CREDENTIALS_DIRECTORY/anthropic-api-key (systemd
-  // LoadCredential=) or ATLAS_DIR/.env, and false successes when
-  // projectRoot/.env was stale but the runtime proxy ignored it.
-  // Verification now follows the same precedence the runtime uses.
+  // Codex 53ed80e F3 SOFT / c6ba137 F4 SOFT fix: align with runtime
+  // credential precedence in src/credential-proxy.ts:detectAuthMode and
+  // host/host-executor.py:_load_anthropic_api_key. Runtime auth loaders
+  // do NOT consult projectRoot/.env — including it as a verification
+  // source produced false successes when projectRoot/.env was stale
+  // but the runtime ignored it. The precedence below mirrors what the
+  // running services actually read; nothing else is a valid
+  // verification source.
   let credentials = 'missing';
   const credKeys = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY'];
 
@@ -133,7 +133,10 @@ export async function run(_args: string[]): Promise<void> {
 
   // 3c. ATLAS_DIR/.env — Atlas-host-secrets contract used by the proxy
   // for OAuth token + base URL when the systemd LoadCredential and
-  // process env paths are not in play.
+  // process env paths are not in play. This is the LAST runtime source
+  // that the credential-proxy actually reads — projectRoot/.env was
+  // historically a fallback but is no longer consulted by runtime, so
+  // it is intentionally excluded from verification.
   if (credentials === 'missing') {
     const atlasDir = process.env.ATLAS_DIR || path.join(homeDir, '.atlas');
     const atlasEnv = path.join(atlasDir, '.env');
@@ -145,17 +148,6 @@ export async function run(_args: string[]): Promise<void> {
         }
       } catch {
         // unreadable
-      }
-    }
-  }
-
-  // 3d. projectRoot/.env — legacy / setup-time credential location.
-  if (credentials === 'missing') {
-    const envFile = path.join(projectRoot, '.env');
-    if (fs.existsSync(envFile)) {
-      const envContent = fs.readFileSync(envFile, 'utf-8');
-      if (new RegExp(`^(${credKeys.join('|')})=`, 'm').test(envContent)) {
-        credentials = 'configured';
       }
     }
   }
