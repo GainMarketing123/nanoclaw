@@ -76,10 +76,18 @@ else
     echo "WARNING: Auth status check failed. Credentials may be invalid."
     echo "$AUTH_STATUS"
 
-    # Restore backup if verification failed
+    # Restore backup if verification failed.
+    # Codex b7e9788 F1 BLOCKING fix: this script runs as root, so the
+    # earlier `cp "$CREDS_FILE" "$BACKUP_FILE"` created a root-owned
+    # backup. A naive `cp "$BACKUP_FILE" "$CREDS_FILE"` here would leave
+    # a root-owned 0600 file unreadable to the nanoclaw-he runtime user
+    # — `claude auth status` and the post-restart services would fail
+    # auth instead of recovering. install(1) sets ownership and mode
+    # atomically as part of the copy so the rolled-back file is
+    # immediately usable by nanoclaw-he.
     if [ -f "$BACKUP_FILE" ]; then
-        cp "$BACKUP_FILE" "$CREDS_FILE"
-        echo "Restored previous credentials from backup"
+        install -m 600 -o nanoclaw-he -g nanoclaw-he "$BACKUP_FILE" "$CREDS_FILE"
+        echo "Restored previous credentials from backup (nanoclaw-he-owned)"
     fi
     exit 1
 fi
