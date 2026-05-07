@@ -102,8 +102,7 @@ export const TIMEZONE =
 // engineering-side env-var contract). ATLAS_STATE_DIR is retained as a
 // back-compat alias for existing imports — callers should migrate to
 // ATLAS_DIR over time.
-export const ATLAS_DIR =
-  process.env.ATLAS_DIR || path.join(HOME_DIR, '.atlas');
+export const ATLAS_DIR = process.env.ATLAS_DIR || path.join(HOME_DIR, '.atlas');
 export const ATLAS_STATE_DIR = ATLAS_DIR;
 
 // Atlas Operations directory — bridge, swarm, entities, security
