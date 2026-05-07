@@ -24,7 +24,7 @@ import { createServer, Server } from 'http';
 import { request as httpsRequest } from 'https';
 import { request as httpRequest, IncomingMessage, RequestOptions } from 'http';
 
-import { HOST_CLAUDE_DIR } from './config.js';
+import { ATLAS_DIR, HOST_CLAUDE_DIR } from './config.js';
 import { readEnvFile } from './env.js';
 import { logger } from './logger.js';
 
@@ -370,11 +370,16 @@ export function startCredentialProxy(
   port: number,
   host = '127.0.0.1',
 ): Promise<Server> {
-  const secrets = readEnvFile([
-    'CLAUDE_CODE_OAUTH_TOKEN',
-    'ANTHROPIC_AUTH_TOKEN',
-    'ANTHROPIC_BASE_URL',
-  ]);
+  // Codex 8ac9c6c F1 BLOCKING fix: read ATLAS_DIR/.env explicitly (NOT the
+  // project-root default that env.ts reverted to). Atlas-host secrets
+  // (OAUTH_TOKEN, AUTH_TOKEN, ANTHROPIC_BASE_URL) live in the Atlas-shared
+  // .env at ATLAS_DIR; project-config secrets (channel tokens, ASSISTANT_NAME)
+  // live in nanoclaw's own .env at projectRoot. These are intentionally
+  // separate files — pass the explicit dir to disambiguate.
+  const secrets = readEnvFile(
+    ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL'],
+    ATLAS_DIR,
+  );
 
   // ANTHROPIC_API_KEY uses the systemd → env → file precedence; .env-only
   // detection mis-classifies post-Phase-3.1 deployments (where the key only
@@ -671,7 +676,10 @@ function loadAnthropicApiKey(): string {
   }
   const envKey = process.env.ANTHROPIC_API_KEY;
   if (envKey && envKey.trim()) return envKey.trim();
-  const fileSecrets = readEnvFile(['ANTHROPIC_API_KEY']);
+  // Codex 8ac9c6c F1 BLOCKING fix: read ATLAS_DIR/.env explicitly. Same
+  // rationale as startCredentialProxy() — Atlas-host secrets live in the
+  // Atlas-shared .env, not project root.
+  const fileSecrets = readEnvFile(['ANTHROPIC_API_KEY'], ATLAS_DIR);
   return fileSecrets.ANTHROPIC_API_KEY || '';
 }
 

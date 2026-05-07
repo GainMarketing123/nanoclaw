@@ -36,10 +36,32 @@ if [ ! -t 0 ]; then
     echo "Reading credentials from stdin..."
     # Phase 3.2: ensure the .claude directory exists and is owned by nanoclaw-he
     install -d -m 0755 -o nanoclaw-he -g nanoclaw-he "$CLAUDE_HOME"
-    cat > "$CREDS_FILE"
-    chmod 600 "$CREDS_FILE"
-    chown nanoclaw-he:nanoclaw-he "$CREDS_FILE"
-    echo "Credentials written from stdin"
+
+    # Codex 8ac9c6c F2 BLOCKING fix: write to a temp file in the same
+    # directory then atomic-rename into place. The prior `cat > "$CREDS_FILE"`
+    # truncated the live file in place — the running credential proxy
+    # (nanoclaw service) reads/rewrites the same path concurrently and
+    # could parse a half-written file or clobber the new credentials with
+    # its own refresh-write. mv on the same filesystem is atomic at the
+    # rename boundary, so the proxy sees either the old file or the new
+    # file — never a mid-truncate state.
+    TMP_CREDS=$(mktemp -p "$CLAUDE_HOME" .credentials.json.new.XXXXXX)
+    trap 'rm -f "$TMP_CREDS"' EXIT
+    cat > "$TMP_CREDS"
+    # Validate the temp file is non-empty + parseable JSON before swapping in.
+    if [ ! -s "$TMP_CREDS" ]; then
+        echo "ERROR: stdin produced empty credentials file. Aborting."
+        exit 1
+    fi
+    if ! python3 -c "import json,sys; json.load(open('$TMP_CREDS'))" 2>/dev/null; then
+        echo "ERROR: stdin credentials are not valid JSON. Aborting."
+        exit 1
+    fi
+    chmod 600 "$TMP_CREDS"
+    chown nanoclaw-he:nanoclaw-he "$TMP_CREDS"
+    mv -f "$TMP_CREDS" "$CREDS_FILE"
+    trap - EXIT
+    echo "Credentials written from stdin (atomic replace)"
 else
     echo ""
     echo "No stdin detected. Copy credentials from your laptop:"
