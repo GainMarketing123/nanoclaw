@@ -129,9 +129,42 @@ function saveCredentials(
     // rename boundary, so readers see either the old file or the new
     // file, never a mid-write state. Same pattern as the shell-side fix
     // in host/refresh-claude-auth.sh.
+    //
+    // Codex 64a06c7 F1 BLOCKING fix: preserve uid/gid on the rename. The
+    // proxy may run under a different user than the one that owns the
+    // existing credentials file (host/refresh-claude-auth.sh writes as
+    // nanoclaw-he). renameSync swaps the temp file's inode in, so without
+    // explicit chown the new file inherits the proxy process's uid — the
+    // next claude auth status under nanoclaw-he gets EPERM. Read existing
+    // owner first, then chown temp to match before rename.
     const tmpPath = `${CREDENTIALS_PATH}.new.${process.pid}.${Date.now()}`;
+    let targetUid: number | null = null;
+    let targetGid: number | null = null;
+    try {
+      const existingStat = fs.statSync(CREDENTIALS_PATH);
+      targetUid = existingStat.uid;
+      targetGid = existingStat.gid;
+    } catch {
+      // File doesn't exist yet — first-time write. uid/gid unset; the
+      // rename will adopt the proxy process's defaults, which is correct
+      // when there's no prior owner contract to preserve.
+    }
     try {
       fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), { mode: 0o600 });
+      if (targetUid !== null && targetGid !== null) {
+        try {
+          fs.chownSync(tmpPath, targetUid, targetGid);
+        } catch (chownErr) {
+          // chown may fail if the proxy lacks privilege to set ownership
+          // to a foreign user — surface but don't abort, since the rename
+          // would still produce a usable file under the proxy's own user
+          // when both writer and runtime are the same.
+          logger.warn(
+            { err: chownErr, targetUid, targetGid },
+            'chown failed before atomic rename; preserving proxy-user ownership',
+          );
+        }
+      }
       fs.renameSync(tmpPath, CREDENTIALS_PATH);
     } catch (writeErr) {
       // Clean up the temp file if rename failed.
@@ -145,7 +178,16 @@ function saveCredentials(
 
     logger.info('OAuth credentials refreshed and saved (atomic)');
   } catch (err) {
-    logger.error({ err }, 'Failed to save refreshed credentials');
+    // Codex 64a06c7 F2 BLOCKING fix: rethrow instead of swallowing.
+    // Callers (refreshOauthToken, the 5-min refresh loop) update
+    // currentCreds in-memory immediately after this returns. If we
+    // swallow, in-memory state advances but on-disk stays stale —
+    // proxy appears healthy until restart, then reloads the old token
+    // and falls into 401/refresh loops. Surface the error so callers
+    // can treat it as a real auth/storage failure (skip in-memory
+    // advance, schedule retry, or fail-fast the request).
+    logger.error({ err }, 'Failed to save refreshed credentials (atomic)');
+    throw err;
   }
 }
 
@@ -271,14 +313,26 @@ function startOutageRecovery(creds: {
     const result = await refreshAccessToken(creds.refreshToken);
 
     if (result.ok) {
-      // API is back — save tokens, restore service
-      saveCredentials(
-        result.accessToken,
-        result.refreshToken,
-        result.expiresIn,
-      );
-      creds.accessToken = result.accessToken;
-      creds.refreshToken = result.refreshToken;
+      // API is back — save tokens, restore service.
+      // Codex 64a06c7 F2 BLOCKING fix: persistence-or-bust on outage
+      // recovery. If save fails, stay in outage mode so the next health
+      // check retries the persistence step rather than declaring recovery
+      // with stale on-disk credentials.
+      try {
+        saveCredentials(
+          result.accessToken,
+          result.refreshToken,
+          result.expiresIn,
+        );
+        creds.accessToken = result.accessToken;
+        creds.refreshToken = result.refreshToken;
+      } catch (saveErr) {
+        logger.error(
+          { err: saveErr },
+          'Outage recovery refresh succeeded but persistence failed — staying in outage mode for retry',
+        );
+        return;
+      }
 
       isInOutage = false;
       outageAlertSent = false;
@@ -440,15 +494,30 @@ export function startCredentialProxy(
 
           refreshAccessToken(oauth.refreshToken).then((result) => {
             if (result.ok) {
-              saveCredentials(
-                result.accessToken,
-                result.refreshToken,
-                result.expiresIn,
-              );
-              currentCreds = {
-                accessToken: result.accessToken,
-                refreshToken: result.refreshToken,
-              };
+              // Codex 64a06c7 F2 BLOCKING fix: only advance in-memory
+              // currentCreds AFTER successful persistence. If saveCredentials
+              // throws (chown failed, ENOSPC, etc.), keep the old in-memory
+              // state so the proxy doesn't drift from disk — next refresh
+              // attempt will retry persistence.
+              try {
+                saveCredentials(
+                  result.accessToken,
+                  result.refreshToken,
+                  result.expiresIn,
+                );
+                currentCreds = {
+                  accessToken: result.accessToken,
+                  refreshToken: result.refreshToken,
+                };
+              } catch (saveErr) {
+                logger.error(
+                  { err: saveErr },
+                  'Token refreshed but persistence failed; keeping old in-memory state',
+                );
+                // Don't enter outage mode (refresh worked); the next
+                // proactive cycle will retry persistence.
+                return;
+              }
               // If we were in outage mode, clear it — we just recovered
               if (isInOutage) {
                 const downtimeMin = Math.round(
@@ -563,16 +632,36 @@ export function startCredentialProxy(
             );
 
             if (refreshResult.ok) {
-              // Save new tokens and retry the request
-              saveCredentials(
-                refreshResult.accessToken,
-                refreshResult.refreshToken,
-                refreshResult.expiresIn,
-              );
-              currentCreds = {
-                accessToken: refreshResult.accessToken,
-                refreshToken: refreshResult.refreshToken,
-              };
+              // Codex 64a06c7 F2 BLOCKING fix: only advance currentCreds
+              // after successful persistence. If save fails, surface a 503
+              // to the upstream caller so the request retries with the
+              // (still-valid in-memory) old token rather than drifting
+              // from disk silently.
+              try {
+                saveCredentials(
+                  refreshResult.accessToken,
+                  refreshResult.refreshToken,
+                  refreshResult.expiresIn,
+                );
+                currentCreds = {
+                  accessToken: refreshResult.accessToken,
+                  refreshToken: refreshResult.refreshToken,
+                };
+              } catch (saveErr) {
+                logger.error(
+                  { err: saveErr },
+                  'OAuth refresh succeeded on 401 but persistence failed — surfacing 503 so caller retries',
+                );
+                if (!res.headersSent) {
+                  res.writeHead(503, { 'Content-Type': 'application/json' });
+                  res.end(
+                    JSON.stringify({
+                      error: 'credential persistence failed during refresh',
+                    }),
+                  );
+                }
+                return;
+              }
               // Clear outage state if we were in one
               if (isInOutage) {
                 isInOutage = false;
