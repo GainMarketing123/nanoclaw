@@ -233,6 +233,50 @@ function setupSystemd(
     systemctlPrefix = 'systemctl --user';
   }
 
+  // Codex 198fd5f F1 / a5f9100 F1 BLOCKING fix: do NOT persist
+  // Environment=CLAUDE_CONFIG_DIR= into the generated unit unless the
+  // service's runtime UID will actually be able to read that directory.
+  //
+  // Without this guard, a user-systemd install run by `atlas` while
+  // CLAUDE_CONFIG_DIR=/home/nanoclaw-he/.claude is exported would persist
+  // the override into the unit. The unit has no User= override, so
+  // systemd starts the service as `atlas`, which can't read 0600 files
+  // owned by `nanoclaw-he`. The proxy then boots with stale/missing auth.
+  // The same problem blew up atlas-host-executor.service last session
+  // (commit a5f9100 reverted the Environment= line for the same reason).
+  //
+  // Two guards:
+  //   - root-systemd (runningAsRoot=true): the unit has no User= line so
+  //     the service runs as root, which can read any 0600 file. Safe.
+  //   - user-systemd: the service runs as the invoking UID. Check that
+  //     the current process can read CLAUDE_CONFIG_DIR; if it can, the
+  //     runtime UID matches (same UID owns user-systemd). If it cannot,
+  //     refuse to persist and log a warning naming the fix (set User= to
+  //     the credential owner OR run setup as that user).
+  let claudeConfigDirEnv = '';
+  if (process.env.CLAUDE_CONFIG_DIR) {
+    const cfgPath = process.env.CLAUDE_CONFIG_DIR;
+    let runtimeUidCanRead = false;
+    if (runningAsRoot) {
+      runtimeUidCanRead = true;
+    } else {
+      try {
+        fs.accessSync(cfgPath, fs.constants.R_OK | fs.constants.X_OK);
+        runtimeUidCanRead = true;
+      } catch {
+        runtimeUidCanRead = false;
+      }
+    }
+    if (runtimeUidCanRead) {
+      claudeConfigDirEnv = `Environment=CLAUDE_CONFIG_DIR=${cfgPath}\n`;
+    } else {
+      logger.warn(
+        { cfgPath },
+        'CLAUDE_CONFIG_DIR not persisted to systemd unit — current UID cannot read this directory, so the service would fail auth at runtime. Either set User= to the credential owner in the unit, or rerun setup as that user.',
+      );
+    }
+  }
+
   const unit = `[Unit]
 Description=NanoClaw Personal Assistant
 After=network.target
@@ -246,7 +290,7 @@ RestartSec=5
 KillMode=process
 Environment=HOME=${homeDir}
 Environment=PATH=/usr/local/bin:/usr/bin:/bin:${homeDir}/.local/bin
-${process.env.CLAUDE_CONFIG_DIR ? `Environment=CLAUDE_CONFIG_DIR=${process.env.CLAUDE_CONFIG_DIR}\n` : ''}
+${claudeConfigDirEnv}
 StandardOutput=append:${projectRoot}/logs/nanoclaw.log
 StandardError=append:${projectRoot}/logs/nanoclaw.error.log
 

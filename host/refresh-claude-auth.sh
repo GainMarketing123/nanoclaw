@@ -90,10 +90,24 @@ if echo "$AUTH_STATUS" | grep -q '"loggedIn": true'; then
     echo "Auth verified: logged in"
     echo "$AUTH_STATUS" | grep -E 'loggedIn|subscriptionType'
 
-    # Restart services that use Claude auth
-    echo "Restarting nanoclaw and host-executor..."
-    systemctl restart nanoclaw atlas-host-executor 2>/dev/null || true
-    echo "Done. All services restarted."
+    # Restart services that use Claude auth.
+    #
+    # Codex a5f9100 F2 BLOCKING fix: restart is scoped to `nanoclaw` only
+    # until the 1.A.6 Phase 3.2 User=nanoclaw-he migration lands on
+    # atlas-host-executor.service. atlas-host-executor still runs as
+    # User=atlas and intentionally omits CLAUDE_CONFIG_DIR — it resolves
+    # auth from /home/atlas/.claude, not /home/nanoclaw-he/.claude that
+    # this script just wrote. Restarting it here would cycle a service
+    # without giving it the new credentials, masking the auth-mismatch
+    # behind a "successful refresh" report.
+    #
+    # When Phase 3.2 lands (atlas-host-executor migrated to
+    # User=nanoclaw-he with Environment=CLAUDE_CONFIG_DIR=/home/nanoclaw-he/.claude),
+    # add `atlas-host-executor` back to the restart list so the executor
+    # picks up the new credentials in lockstep with nanoclaw.
+    echo "Restarting nanoclaw (atlas-host-executor restart deferred until Phase 3.2 User= migration)..."
+    systemctl restart nanoclaw 2>/dev/null || true
+    echo "Done. nanoclaw restarted."
 else
     echo "WARNING: Auth status check failed. Credentials may be invalid."
     echo "$AUTH_STATUS"
