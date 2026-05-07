@@ -233,26 +233,34 @@ function setupSystemd(
     systemctlPrefix = 'systemctl --user';
   }
 
-  // Codex 198fd5f F1 / a5f9100 F1 BLOCKING fix: do NOT persist
-  // Environment=CLAUDE_CONFIG_DIR= into the generated unit unless the
-  // service's runtime UID will actually be able to read that directory.
+  // Codex 198fd5f F1 / a5f9100 F1 / 53ed80e F1 BLOCKING fix: do NOT
+  // persist Environment=CLAUDE_CONFIG_DIR= into the generated unit
+  // unless the service's runtime UID will actually be able to read the
+  // .credentials.json FILE the proxy needs.
   //
   // Without this guard, a user-systemd install run by `atlas` while
   // CLAUDE_CONFIG_DIR=/home/nanoclaw-he/.claude is exported would persist
   // the override into the unit. The unit has no User= override, so
-  // systemd starts the service as `atlas`, which can't read 0600 files
-  // owned by `nanoclaw-he`. The proxy then boots with stale/missing auth.
-  // The same problem blew up atlas-host-executor.service last session
-  // (commit a5f9100 reverted the Environment= line for the same reason).
+  // systemd starts the service as `atlas`. The same problem blew up
+  // atlas-host-executor.service last session (commit a5f9100 reverted
+  // the Environment= line for the same reason).
+  //
+  // Codex 53ed80e F1 fix: dir-level fs.accessSync was insufficient
+  // because /home/nanoclaw-he/.claude can be 0755 (atlas-readable) while
+  // .credentials.json is 0600 owned by nanoclaw-he (atlas-unreadable).
+  // The dir-level guard would pass, persist CLAUDE_CONFIG_DIR=, and the
+  // proxy would still hit EACCES on the credential file at runtime.
+  // Validate the credential file specifically.
   //
   // Two guards:
   //   - root-systemd (runningAsRoot=true): the unit has no User= line so
   //     the service runs as root, which can read any 0600 file. Safe.
   //   - user-systemd: the service runs as the invoking UID. Check that
-  //     the current process can read CLAUDE_CONFIG_DIR; if it can, the
-  //     runtime UID matches (same UID owns user-systemd). If it cannot,
-  //     refuse to persist and log a warning naming the fix (set User= to
-  //     the credential owner OR run setup as that user).
+  //     the current process can read .credentials.json (when it exists);
+  //     if it can, the runtime UID matches. If the file does not exist
+  //     yet, fall back to a stat owner-vs-current-uid check on the
+  //     directory. If neither check confirms readability, refuse to
+  //     persist and log a warning naming the fix.
   let claudeConfigDirEnv = '';
   if (process.env.CLAUDE_CONFIG_DIR) {
     const cfgPath = process.env.CLAUDE_CONFIG_DIR;
@@ -260,9 +268,22 @@ function setupSystemd(
     if (runningAsRoot) {
       runtimeUidCanRead = true;
     } else {
+      const credsPath = path.join(cfgPath, '.credentials.json');
       try {
-        fs.accessSync(cfgPath, fs.constants.R_OK | fs.constants.X_OK);
-        runtimeUidCanRead = true;
+        if (fs.existsSync(credsPath)) {
+          // The actual file the proxy reads — validates 0600 readability,
+          // not just 0755 directory traversal.
+          fs.accessSync(credsPath, fs.constants.R_OK);
+          runtimeUidCanRead = true;
+        } else {
+          // No credential file yet (refresh hasn't run). Best we can do
+          // is verify the dir owner matches current UID — that way when
+          // the file lands later with the same owner, we can read it.
+          const dirStat = fs.statSync(cfgPath);
+          if (typeof process.geteuid === 'function' && dirStat.uid === process.geteuid()) {
+            runtimeUidCanRead = true;
+          }
+        }
       } catch {
         runtimeUidCanRead = false;
       }
@@ -272,10 +293,22 @@ function setupSystemd(
     } else {
       logger.warn(
         { cfgPath },
-        'CLAUDE_CONFIG_DIR not persisted to systemd unit — current UID cannot read this directory, so the service would fail auth at runtime. Either set User= to the credential owner in the unit, or rerun setup as that user.',
+        'CLAUDE_CONFIG_DIR not persisted to systemd unit — current UID cannot read .credentials.json under this path, so the service would fail auth at runtime. Either set User= to the credential owner in the unit, or rerun setup as that user.',
       );
     }
   }
+
+  // Codex 53ed80e F2 BLOCKING fix: persist ATLAS_DIR into the generated
+  // unit so src/credential-proxy.ts and src/config.ts resolve secrets
+  // from the real Atlas state path instead of falling back to
+  // ${HOME}/.atlas. For root installs, HOME=/root would otherwise
+  // default ATLAS_DIR to /root/.atlas — which doesn't exist — and the
+  // proxy would miss CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_AUTH_TOKEN/
+  // ANTHROPIC_BASE_URL/ANTHROPIC_API_KEY entirely. atlas-host-executor.
+  // service already pins this same contract; matching it here keeps
+  // both services pointed at the same Atlas tree.
+  const atlasDirResolved = process.env.ATLAS_DIR || path.join(homeDir, '.atlas');
+  const atlasDirEnv = `Environment=ATLAS_DIR=${atlasDirResolved}\n`;
 
   const unit = `[Unit]
 Description=NanoClaw Personal Assistant
@@ -290,7 +323,7 @@ RestartSec=5
 KillMode=process
 Environment=HOME=${homeDir}
 Environment=PATH=/usr/local/bin:/usr/bin:/bin:${homeDir}/.local/bin
-${claudeConfigDirEnv}
+${atlasDirEnv}${claudeConfigDirEnv}
 StandardOutput=append:${projectRoot}/logs/nanoclaw.log
 StandardError=append:${projectRoot}/logs/nanoclaw.error.log
 

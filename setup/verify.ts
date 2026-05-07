@@ -97,12 +97,66 @@ export async function run(_args: string[]): Promise<void> {
   }
 
   // 3. Check credentials
+  //
+  // Codex 53ed80e F3 SOFT fix: align with runtime credential precedence
+  // in src/credential-proxy.ts:detectAuthMode and host/host-executor.py:
+  // _load_anthropic_api_key. The prior check only inspected
+  // projectRoot/.env, producing false failures on valid deployments
+  // using $CREDENTIALS_DIRECTORY/anthropic-api-key (systemd
+  // LoadCredential=) or ATLAS_DIR/.env, and false successes when
+  // projectRoot/.env was stale but the runtime proxy ignored it.
+  // Verification now follows the same precedence the runtime uses.
   let credentials = 'missing';
-  const envFile = path.join(projectRoot, '.env');
-  if (fs.existsSync(envFile)) {
-    const envContent = fs.readFileSync(envFile, 'utf-8');
-    if (/^(CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY)=/m.test(envContent)) {
+  const credKeys = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY'];
+
+  // 3a. systemd LoadCredential — root-installed unit on VPS.
+  const credentialsDir = process.env.CREDENTIALS_DIRECTORY;
+  if (credentials === 'missing' && credentialsDir) {
+    const apiKeyFile = path.join(credentialsDir, 'anthropic-api-key');
+    if (fs.existsSync(apiKeyFile)) {
+      try {
+        if ((fs.readFileSync(apiKeyFile, 'utf-8') || '').trim()) {
+          credentials = 'configured';
+        }
+      } catch {
+        // unreadable — treat as missing for this source
+      }
+    }
+  }
+
+  // 3b. Inherited process env (most operator workflows).
+  if (credentials === 'missing') {
+    if (credKeys.some((k) => (process.env[k] || '').trim())) {
       credentials = 'configured';
+    }
+  }
+
+  // 3c. ATLAS_DIR/.env — Atlas-host-secrets contract used by the proxy
+  // for OAuth token + base URL when the systemd LoadCredential and
+  // process env paths are not in play.
+  if (credentials === 'missing') {
+    const atlasDir = process.env.ATLAS_DIR || path.join(homeDir, '.atlas');
+    const atlasEnv = path.join(atlasDir, '.env');
+    if (fs.existsSync(atlasEnv)) {
+      try {
+        const c = fs.readFileSync(atlasEnv, 'utf-8');
+        if (new RegExp(`^(${credKeys.join('|')})=`, 'm').test(c)) {
+          credentials = 'configured';
+        }
+      } catch {
+        // unreadable
+      }
+    }
+  }
+
+  // 3d. projectRoot/.env — legacy / setup-time credential location.
+  if (credentials === 'missing') {
+    const envFile = path.join(projectRoot, '.env');
+    if (fs.existsSync(envFile)) {
+      const envContent = fs.readFileSync(envFile, 'utf-8');
+      if (new RegExp(`^(${credKeys.join('|')})=`, 'm').test(envContent)) {
+        credentials = 'configured';
+      }
     }
   }
 
