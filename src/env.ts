@@ -1,24 +1,33 @@
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
 import { logger } from './logger.js';
 
 /**
  * Resolve where the canonical .env file lives.
  *
- * Mirrors the Python lib/atlas_paths.py contract: ATLAS_DIR env var wins,
- * fallback to ~/.atlas. Hardcoding process.cwd() (the prior behavior)
- * broke when the daemon launched with cwd != the install directory —
- * common under systemd, container entrypoints, and any non-default
- * service-user setup (Phase 3.2 nanoclaw-he case). Callers can still
- * pass an explicit dir to override (tests, alt-config layouts).
+ * Default is the nanoclaw project root (process.cwd()). This matches the
+ * convention used by every writer and reader in this repo:
+ *   - setup/register.ts:72 (writer)         — process.cwd()
+ *   - setup/verify.ts:26 (reader)           — process.cwd()
+ *   - setup/environment.ts:16 (reader)      — process.cwd()
+ *   - src/config.ts:20 (reader, PROJECT_ROOT) — process.cwd()
+ *   - src/credential-proxy.ts:306 (reader)  — process.cwd()
+ *
+ * Codex e39da2b F1 BLOCKING fix: the prior default was ATLAS_DIR/~/.atlas,
+ * which is atlas-engineering's install root — NOT nanoclaw's project root.
+ * That mis-modeling silently broke the writer/reader contract: setup wrote
+ * ASSISTANT_NAME etc. to projectRoot/.env while the runtime resolved
+ * .env from ATLAS_DIR/.env (which is a different file owned by Atlas
+ * Engineering with different secrets), so services started reading the
+ * wrong file or no file at all even though setup reported "config present".
+ *
+ * Systemd / launchd units MUST set `WorkingDirectory=` to the nanoclaw
+ * checkout — that is the project's existing deployment convention and
+ * makes process.cwd() correct under daemonization. Tests / alt-config
+ * layouts can still override via the explicit `dir` parameter.
  */
 function defaultEnvDir(): string {
-  if (process.env.ATLAS_DIR) return process.env.ATLAS_DIR;
-  if (process.platform !== 'win32' && process.env.HOME) {
-    return path.join(process.env.HOME, '.atlas');
-  }
-  return path.join(os.homedir(), '.atlas');
+  return process.cwd();
 }
 
 /**

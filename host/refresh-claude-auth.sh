@@ -57,7 +57,13 @@ fi
 # /usr/sbin/nologin so `su -` won't work. runuser handles nologin shells
 # when given a specific command. HOME must be set so claude reads the right
 # .credentials.json file.
-AUTH_STATUS=$(runuser -u nanoclaw-he -- env HOME=/home/nanoclaw-he claude auth status 2>&1 || true)
+# Codex e39da2b F2 SOFT fix: pass CLAUDE_CONFIG_DIR through to verify so
+# we check the EXACT path we just wrote to, not whatever path claude auth
+# resolves from $HOME/.claude alone. Without this, an override that
+# relocated the credential root would write correctly but verify against
+# the default home-based path, report not logged in, and restore the
+# backup even though the new credentials were written correctly.
+AUTH_STATUS=$(runuser -u nanoclaw-he -- env HOME=/home/nanoclaw-he CLAUDE_CONFIG_DIR="$CLAUDE_HOME" claude auth status 2>&1 || true)
 if echo "$AUTH_STATUS" | grep -q '"loggedIn": true'; then
     echo "Auth verified: logged in"
     echo "$AUTH_STATUS" | grep -E 'loggedIn|subscriptionType'
