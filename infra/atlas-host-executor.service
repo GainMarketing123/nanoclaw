@@ -27,14 +27,19 @@ Environment=PATH=/usr/local/bin:/usr/bin:/bin:/home/atlas/.local/bin
 # after the unit lands) continue to behave as before.
 Environment=ATLAS_DIR=/home/atlas/.atlas
 Environment=NANOCLAW_DIR=/home/atlas/nanoclaw
-# Codex b48776f F1 BLOCKING fix: persist CLAUDE_CONFIG_DIR in service env
-# so the runtime CREDENTIALS_PATH (built from process.env.CLAUDE_CONFIG_DIR
-# || HOME/.claude in src/config.ts) reads the SAME path the refresh script
-# writes to. Without this, refresh-claude-auth.sh writes to
-# /home/nanoclaw-he/.claude but the restarted service reads $HOME/.claude
-# under whatever HOME the unit declares — refresh "succeeds" while live
-# auth stays stale.
-Environment=CLAUDE_CONFIG_DIR=/home/nanoclaw-he/.claude
+# Codex 7c7401b F2 BLOCKING revert: a previous version of this file added
+# Environment=CLAUDE_CONFIG_DIR=/home/nanoclaw-he/.claude here, but this
+# unit still runs as User=atlas. The atlas user cannot read a 0600
+# credentials file owned by nanoclaw-he, so that env line caused
+# permission errors on every claude -p invocation. The CLAUDE_CONFIG_DIR=
+# line BELONGS in this unit AFTER the 1.A.6 Phase 3.2 User=nanoclaw-he
+# migration lands — at which point the user owning the credentials and
+# the user running the service align. CEO's resume-prompt VPS-side step
+# (add CLAUDE_CONFIG_DIR to the live unit's EnvironmentFile) runs in
+# lockstep with the User= cutover, NOT separately. Until then, this unit
+# keeps the atlas-user-readable default ($HOME/.claude under the atlas
+# user) and the refresh script's relocated path applies only to the
+# nanoclaw service (which already runs under the right user).
 # Phase 3.0 (1.A.6): activate the production fail-closed path in
 # host-executor.py — when ATLAS_HOST_MODE=production is set, missing
 # ATLAS_DIR / NANOCLAW_DIR env vars become an explicit RuntimeError at
