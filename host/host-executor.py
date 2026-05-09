@@ -221,6 +221,61 @@ _ATLAS_LIB_PROBE_STATEMENTS = (
     "from performance_tracker import track",
     "from autonomy_tracker import evaluate_m2_clean_run",
 )
+
+
+def _probe_lib_path(lib_path: str) -> bool:
+    """Isolated-subprocess probe-import test for a candidate lib_path.
+
+    Runs `python3 -I -S -c "<probe-script>"` with sys.path narrowed to
+    [lib_path] + non-empty stdlib paths, executing every statement in
+    _ATLAS_LIB_PROBE_STATEMENTS. Returns True only on exit code 0.
+    -I disables user-site / PYTHONPATH / cwd-prepend; -S skips site
+    init; cwd='/' prevents implicit '' from shadowing modules;
+    PYTHONDONTWRITEBYTECODE=1 prevents __pycache__ writes; 15s timeout
+    bounds startup latency.
+
+    Used by `_resolve_atlas_lib_path()` for BOTH the prod tree at
+    /usr/local/lib/atlas AND fallback candidates (`_lib_path`,
+    `_sibling_lib`). Codex bcabb38 R2 BLOCKING #1 (2026-05-09): pre-
+    helper, only the prod tree was probe-imported; fallback candidates
+    were file-presence-validated only, so a fallback with broken top-
+    level imports / syntax errors / missing transitive deps would pass
+    file-presence and fail at task time. Sharing this helper across
+    prod + fallbacks closes that gap symmetrically.
+    """
+    probe_script = "; ".join(
+        ["import sys", f"sys.path[:] = [{repr(lib_path)}] + [p for p in sys.path if p]"]
+        + list(_ATLAS_LIB_PROBE_STATEMENTS)
+    )
+    probe_env = dict(os.environ)
+    probe_env.pop("PYTHONPATH", None)  # -I ignores it but be explicit
+    probe_env["PYTHONDONTWRITEBYTECODE"] = "1"
+    try:
+        result = subprocess.run(
+            [sys.executable, "-I", "-S", "-c", probe_script],
+            env=probe_env,
+            cwd="/",
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        sys.stderr.write(
+            f"[atlas-lib-probe] subprocess failed under {lib_path} ({e}); "
+            f"treating as failed\n"
+        )
+        return False
+    if result.returncode != 0:
+        stderr_excerpt = (result.stderr or "").strip().replace("\n", " ")[:300]
+        sys.stderr.write(
+            f"[atlas-lib-probe] probe-import failed under {lib_path} "
+            f"(exit={result.returncode}); treating as failed. "
+            f"stderr: {stderr_excerpt}\n"
+        )
+        return False
+    return True
+
+
 def _resolve_atlas_lib_path() -> str:
     """Pick the prod path only if it imports cleanly in an isolated subprocess.
 
@@ -258,29 +313,36 @@ def _resolve_atlas_lib_path() -> str:
     rejected override tree and raise at task time.
     """
     prod = Path("/usr/local/lib/atlas")
-    # Validate the bootstrap-chosen `_lib_path` against the FULL required-
-    # modules set before threading as fallback. Bootstrap probe only checked
-    # `env_or_home` importability — partial trees can pass that probe but
-    # lack runtime modules.
-    _bootstrap_complete = all(
-        (_lib_path / m).is_file() for m in _ATLAS_LIB_REQUIRED_MODULES
-    )
-    _sibling_complete = all(
+    # Codex bcabb38 R2 BLOCKING #1 follow-up (2026-05-09): file-presence
+    # validation is necessary but NOT sufficient. A fallback tree with
+    # broken top-level imports / syntax errors / missing transitive deps
+    # in any of the required modules passes file-presence but fails at
+    # task time. The probe-import helper below applies the same isolated
+    # subprocess probe used for the prod tree to fallback candidates,
+    # so only an importable fallback is returned.
+    candidates = []
+    if all((_lib_path / m).is_file() for m in _ATLAS_LIB_REQUIRED_MODULES):
+        candidates.append(str(_lib_path))
+    if str(_sibling_lib) != str(_lib_path) and all(
         (_sibling_lib / m).is_file() for m in _ATLAS_LIB_REQUIRED_MODULES
-    )
-    if _bootstrap_complete:
-        fallback = str(_lib_path)
-    elif _sibling_complete:
+    ):
+        candidates.append(str(_sibling_lib))
+    fallback = None
+    for cand in candidates:
+        if _probe_lib_path(cand):
+            fallback = cand
+            break
         sys.stderr.write(
-            f"[atlas-lib-resolver] {_lib_path} is incomplete (missing required "
-            f"modules); using source-tree sibling {_sibling_lib} as fallback\n"
+            f"[atlas-lib-resolver] fallback candidate {cand} passed file-presence "
+            f"but failed probe-import; trying next candidate\n"
         )
-        fallback = str(_sibling_lib)
-    else:
+    if fallback is None:
+        # No candidate passed both checks. Loud-log and pick the bootstrap
+        # path so any downstream ImportError surfaces with the real cause.
         sys.stderr.write(
-            f"[atlas-lib-resolver] BOTH bootstrap path {_lib_path} and sibling "
-            f"{_sibling_lib} are incomplete; using bootstrap path; runtime "
-            f"imports will raise ImportError loud\n"
+            f"[atlas-lib-resolver] all fallback candidates ({_lib_path}, "
+            f"{_sibling_lib}) failed probe-import OR file-presence; using "
+            f"{_lib_path} as last-ditch — runtime ImportError will surface\n"
         )
         fallback = str(_lib_path)
     if not prod.is_dir():

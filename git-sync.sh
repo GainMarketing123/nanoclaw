@@ -89,6 +89,18 @@ if [ -r /etc/atlas/atlas.env ]; then
         esac
         key="${line%%=*}"
         value="${line#*=}"
+        # Codex bcabb38 R2 SOFT close (2026-05-09): whitelist the keys this
+        # script consumes (ATLAS_DIR, NANOCLAW_DIR). Without the whitelist,
+        # any service-only var placed in /etc/atlas/atlas.env (PATH, HOME,
+        # GIT_DIR, NODE_OPTIONS, PYTHONPATH, ...) would propagate into the
+        # cron environment and silently alter every later git/npm/python3
+        # subprocess in this script. The shared file's intent is checkout-
+        # root parity for the host-executor service; cron does NOT need
+        # any other variable from it.
+        case "$key" in
+            ATLAS_DIR|NANOCLAW_DIR) ;;
+            *) echo "$TIMESTAMP | INFO | atlas.env | key not whitelisted, skipped: $key" >> "$LOG"; continue ;;
+        esac
         # Strip trailing whitespace from value (codex e0085eb R2 BLOCKING #1 close,
         # matches systemd unquoted-value behavior — pre-fix exported the raw value
         # including trailing spaces while systemd stripped them, recreating the
