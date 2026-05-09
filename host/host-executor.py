@@ -65,25 +65,75 @@ _sibling_lib = Path(__file__).resolve().parent.parent / "lib"
 
 
 def _atlas_paths_has_env_or_home(lib_dir: Path) -> bool:
-    """Symbol-level probe: does this lib_dir's atlas_paths.py expose env_or_home?
+    """Subprocess-isolated probe: does this lib_dir's atlas_paths expose env_or_home?
 
-    Codex b137484 R1 F1 BLOCKING fix: file-existence alone false-passes
-    on a stale ATLAS_DIR/lib (e.g. /usr/local/lib/atlas left behind by a
-    partial rsync rollout) where atlas_paths.py exists but pre-dates the
-    env_or_home rename. The bare `from atlas_paths import env_or_home`
-    that follows would then crash startup before the sibling fallback
-    is considered. Source-text scan instead of import-and-introspect
-    keeps this dirt-cheap (no module-init side effects, no sys.modules
-    pollution before bootstrap) and avoids the chicken-and-egg of
-    importing the very module we're trying to validate.
+    CO-1.A.6-FU-2 fix (2026-05-09): the prior substring text-scan
+    (`"def env_or_home" in f.read_text(...)`) false-passed on a stale
+    atlas_paths.py whose source contains the symbol but whose top of
+    file has a syntax error or a broken top-level import. The bare
+    `from atlas_paths import env_or_home` that follows the bootstrap
+    block would then crash startup before the sibling fallback was
+    considered. Mirror the _resolve_atlas_lib_path shape below: an
+    isolated `-I -S` subprocess + sys.path explicitly set + 15s
+    timeout + loud-log on failure. A stale or broken atlas_paths.py
+    is now treated identically to "missing", so the resolver moves
+    on to the next candidate.
+
+    Original (b137484 R1 F1) concern still addressed: a stale
+    ATLAS_DIR/lib copy that pre-dates the env_or_home rename probes
+    fail-importable here for the same reason it would have failed
+    the substring scan, but with stronger guarantees on partial-rename
+    or broken-deps trees the substring scan missed.
+
+    Subprocess hardening matches _resolve_atlas_lib_path exactly:
+      - cwd='/' so Python's implicit '' on sys.path can't shadow.
+      - `-I` (isolated: ignores PYTHONPATH/user-site/cwd-prepend)
+        + `-S` (skip site init).
+      - sys.path narrowed to [lib_dir] + non-empty stdlib paths,
+        so ONLY the candidate lib is importable during validation.
+      - PYTHONDONTWRITEBYTECODE=1 — no __pycache__ writes (defensive).
+
+    Fail-closed: any non-zero exit, timeout, or launch error returns
+    False (treat as "missing"), letting the caller fall through to
+    the next candidate. Empty-key startup failures from a false-pass
+    are far more dangerous than a noisy stderr line that surfaces
+    legitimate breakage.
     """
     f = lib_dir / "atlas_paths.py"
     if not f.is_file():
         return False
+    probe_script = "; ".join([
+        "import sys",
+        f"sys.path[:] = [{repr(str(lib_dir))}] + [p for p in sys.path if p]",
+        "from atlas_paths import env_or_home",
+    ])
+    probe_env = dict(os.environ)
+    probe_env.pop("PYTHONPATH", None)  # -I ignores it but be explicit
+    probe_env["PYTHONDONTWRITEBYTECODE"] = "1"
     try:
-        return "def env_or_home" in f.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+        result = subprocess.run(
+            [sys.executable, "-I", "-S", "-c", probe_script],
+            env=probe_env,
+            cwd="/",
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        sys.stderr.write(
+            f"[atlas-paths-probe] subprocess failed under {lib_dir} ({e}); "
+            f"treating as missing\n"
+        )
         return False
+    if result.returncode != 0:
+        stderr_excerpt = (result.stderr or "").strip().replace("\n", " ")[:300]
+        sys.stderr.write(
+            f"[atlas-paths-probe] env_or_home not importable under {lib_dir} "
+            f"(exit={result.returncode}); treating as missing. "
+            f"stderr: {stderr_excerpt}\n"
+        )
+        return False
+    return True
 
 
 if _atlas_paths_has_env_or_home(_override_lib):
