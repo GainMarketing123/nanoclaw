@@ -23,25 +23,45 @@ TIMESTAMP=$(date +%Y-%m-%dT%H:%M:%S%z)
 # unit's `EnvironmentFile=-/etc/atlas/atlas.env` leading-dash
 # optional-load semantics).
 #
-# Strict parser matches systemd EnvironmentFile= semantics:
-#   - Comments: lines starting with `#` or `;` (after whitespace strip).
-#   - Blank lines skipped.
-#   - Format: KEY=VALUE only — no spaces around `=`, no `KEY VALUE`.
-#   - KEY must match [A-Za-z_][A-Za-z0-9_]*.
-#   - Surrounding quotes (single or double) stripped (systemd treats
-#     quoted values as literal too — within double quotes systemd
-#     processes C-escapes which bash also handles for `\\`, `\n`, etc.,
-#     but those C-escapes ARE drift sources between the two parsers,
-#     so any `\` in the value is rejected to be safe).
-#   - $ / backtick / backslash REJECTED with FAIL log line — these are
-#     the actual cron-vs-systemd drift vectors. Bash sources would
-#     expand them; systemd would not.
-#   - Line continuations (trailing `\`) rejected — systemd supports
-#     them, we don't, log the case so operators avoid the construct.
-# A bad line skips that single assignment but leaves cron running
-# (defensive — an env-file typo shouldn't kill the whole sync pipeline,
-# given that downstream defaults exist for ATLAS_DIR/NANOCLAW_DIR
-# below).
+# Strict parser matches the SUBSET of systemd EnvironmentFile= semantics
+# operationally relevant to ATLAS_DIR / NANOCLAW_DIR (path values without
+# escapes). Each rule below has a precise scope statement.
+#
+#   - Comments (`#` or `;` after whitespace strip), blank lines: skipped.
+#   - Format: literal KEY=VALUE.
+#   - KEY validated `[A-Za-z_][A-Za-z0-9_]*`. Bad keys logged + skipped.
+#   - Leading whitespace on the line is stripped (matches systemd).
+#   - Trailing whitespace on the value is stripped (matches systemd
+#     unquoted-value behavior — codex e0085eb R2 BLOCKING #1 close
+#     2026-05-09: pre-fix would export `ATLAS_DIR=/srv/atlas   ` while
+#     systemd would store `/srv/atlas`, recreating split-brain).
+#   - Surrounding single OR double quotes stripped before export (matches
+#     systemd quote-strip semantics for the value's outer wrapper).
+#   - Line continuations (trailing `\` before newline) REJECTED with FAIL
+#     log line. systemd accepts them; we deliberately don't, because
+#     ATLAS_DIR/NANOCLAW_DIR are short path values that never need
+#     continuation. Documented limitation, not silent drift.
+#   - VALUE CONTENTS are exported via `export "$key=$value"` which does
+#     NOT re-expand `$VAR`, backtick, or backslash inside the value
+#     string (bash double-quoted-variable expansion is one-pass). So
+#     literal `$`, backtick, and backslash in the value are stored
+#     verbatim — matching systemd's literal-storage of the same input.
+#     Codex e0085eb R2 BLOCKING #2 close 2026-05-09: pre-fix blanket-
+#     rejected backslash assuming bash would expand it; the parser
+#     architecture already prevents that, so the rejection silently
+#     dropped values systemd would have honored. Rejection removed.
+#   - DOCUMENTED SCOPE LIMITATION: double-quoted values with C-style
+#     escapes (`"foo\nbar"`) are stored as literal `foo\nbar` here while
+#     systemd would interpret `\n` as newline. ATLAS_DIR / NANOCLAW_DIR
+#     are absolute path strings, never containing C-escapes; this drift
+#     surface is theoretical for the operational scope. If a future
+#     consumer needs C-escape interpretation, parsing should move to a
+#     Python helper that fully implements systemd grammar — out of scope
+#     for path-only ATLAS_DIR / NANOCLAW_DIR consumption.
+#
+# A malformed line skips that single assignment but leaves cron running
+# (defensive — an env-file typo shouldn't kill the whole sync pipeline;
+# downstream defaults exist for ATLAS_DIR/NANOCLAW_DIR below).
 if [ -r /etc/atlas/atlas.env ]; then
     # `|| [ -n "$line" ]` runs the loop body once more for a final line
     # that lacks a trailing newline. Codex a988431 R1 BLOCKING (2026-05-09):
@@ -69,14 +89,25 @@ if [ -r /etc/atlas/atlas.env ]; then
         esac
         key="${line%%=*}"
         value="${line#*=}"
+        # Strip trailing whitespace from value (codex e0085eb R2 BLOCKING #1 close,
+        # matches systemd unquoted-value behavior — pre-fix exported the raw value
+        # including trailing spaces while systemd stripped them, recreating the
+        # split-brain on `ATLAS_DIR=/srv/atlas   ` style entries).
+        # `${value##*[![:space:]]}` returns the trailing-whitespace-only suffix
+        # of the value (everything after the last non-whitespace character);
+        # `${value%"<that suffix>"}` strips it from the end.
+        value="${value%"${value##*[![:space:]]}"}"
         # Validate KEY: [A-Za-z_][A-Za-z0-9_]*
         case "$key" in
             ''|[0-9]*|*[!A-Za-z0-9_]*) echo "$TIMESTAMP | FAIL | atlas.env | invalid key: $key" >> "$LOG"; continue ;;
         esac
-        # Reject non-literal values ($ / backtick / backslash = cron-vs-systemd drift)
-        case "$value" in
-            *\$*|*\`*|*\\*) echo "$TIMESTAMP | FAIL | atlas.env | non-literal value rejected (cron-vs-systemd drift): ${line:0:80}" >> "$LOG"; continue ;;
-        esac
+        # NOTE: $ / backtick / backslash inside values are NOT rejected (codex
+        # e0085eb R2 BLOCKING #2 close 2026-05-09). `export "$key=$value"` below
+        # uses bash one-pass double-quoted-variable expansion which does NOT
+        # re-expand the value's contents, so literal `$`, backtick, and `\` are
+        # stored verbatim — matching systemd's literal-storage of the same input.
+        # The pre-fix blanket-rejection was based on the wrong mental model
+        # (sourced shell expansion) and silently dropped values systemd honored.
         # Strip surrounding single or double quotes (matches systemd literal-quotes semantics)
         case "$value" in
             \'*\') value="${value#\'}"; value="${value%\'}" ;;
