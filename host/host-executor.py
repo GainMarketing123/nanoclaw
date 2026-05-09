@@ -735,6 +735,46 @@ def send_telegram_alert(message: str) -> None:
         log(f"Failed to send Telegram alert: {e}")
 
 
+def send_telegram_result(callback_group: str, content: str, task_id: str, entity: str) -> None:
+    """Deliver task result text to the originating Telegram group via IPC.
+
+    Mirrors send_telegram_alert above but routes to a specific callback_group
+    (a JID/chat identifier the originating task included in its request) rather
+    than the registered main group. Used by the mission-task and atlas-route
+    branches of process_task() so the conversational thread that asked for the
+    work gets the answer back, not just the CEO main group.
+
+    Surfaced 2026-05-08 via fast_screen on the 1.A.6 carry-over commit — the
+    two call sites in process_task() (mission branch + atlas-route branch)
+    were added in commits fa35855 / 28a506b but the function definition was
+    never landed. The surrounding try/except Exception caught the NameError
+    silently, so callback_group routing has been a no-op (just logged the
+    failure) since those commits. Defining at root closes the latent gap.
+    """
+    try:
+        IPC_DIR.mkdir(parents=True, exist_ok=True)
+        if not callback_group:
+            log(f"Telegram result skipped — empty callback_group for task {task_id}")
+            return
+        # Truncate large payloads to keep the IPC message size bounded —
+        # Telegram itself caps at 4096 chars; we leave headroom for the
+        # entity / task_id prefix and any wrapper the channel adds.
+        max_chars = 3500
+        body = content if len(content) <= max_chars else (
+            content[:max_chars] + f"\n... (truncated, full output in ~/.atlas/host-tasks/outputs/{task_id}.txt)"
+        )
+        prefix = f"[{entity}] task {task_id}\n"
+        result_file = IPC_DIR / f"result-{int(time.time() * 1000)}-{task_id}.json"
+        result_file.write_text(json.dumps({
+            "type": "message",
+            "chatJid": callback_group,
+            "text": prefix + body,
+        }))
+        log(f"Telegram result sent via IPC to {callback_group} for task {task_id} ({len(body)} chars)")
+    except Exception as e:
+        log(f"Failed to send Telegram result for task {task_id}: {e}")
+
+
 def is_auth_error(stdout: str, stderr: str) -> bool:
     """Detect authentication failures in claude -p output."""
     combined = (stdout + stderr).lower()
