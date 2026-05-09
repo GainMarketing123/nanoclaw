@@ -49,20 +49,26 @@ from pathlib import Path
 # (Path.home() under a different User= still resolves cleanly, just to the
 # wrong tree). Laptop / dev / manual `python3 host-executor.py --test` runs
 # without ATLAS_HOST_MODE set, so the dev fallback still works.
-def _resolve_dir(env_var: str, dev_default: Path) -> Path:
-    val = os.environ.get(env_var)
-    if val:
-        return Path(val)
-    if os.environ.get("ATLAS_HOST_MODE") == "production":
-        raise RuntimeError(
-            f"{env_var} must be set when ATLAS_HOST_MODE=production. "
-            f"Add {env_var}=<absolute-path> to the systemd unit's "
-            f"EnvironmentFile= or remove ATLAS_HOST_MODE for dev mode."
-        )
-    return dev_default
+#
+# 1.A.6 carry-over close (2026-05-08): the resolution logic itself moved
+# into the shared lib/atlas_paths.env_or_home(strict=...) helper now that
+# nanoclaw carries its own byte-identical copy of atlas_paths.py. The
+# bootstrap-shim block below mirrors agent-runner.py's pattern (chicken-
+# and-egg loader exception — atlas_paths cannot locate atlas_paths) and
+# falls back to the sibling lib/ when ATLAS_DIR/lib is missing or stale.
+# The strict-mode flag stays generic in atlas_paths; this entrypoint is
+# the one that picks ATLAS_HOST_MODE=production as the trigger.
+_atlas_dir_env = os.environ.get("ATLAS_DIR")
+_atlas_dir_resolved = Path(_atlas_dir_env) if _atlas_dir_env else Path.home() / ".atlas"
+_lib_path = _atlas_dir_resolved / "lib"
+if not (_lib_path / "atlas_paths.py").is_file():
+    _lib_path = Path(__file__).resolve().parent.parent / "lib"
+sys.path.insert(0, str(_lib_path))
+from atlas_paths import env_or_home  # noqa: E402
 
-ATLAS_DIR = _resolve_dir("ATLAS_DIR", Path.home() / ".atlas")
-NANOCLAW_DIR = _resolve_dir("NANOCLAW_DIR", Path.home() / "nanoclaw")
+_HOST_STRICT = os.environ.get("ATLAS_HOST_MODE") == "production"
+ATLAS_DIR = env_or_home("ATLAS_DIR", ".atlas", strict=_HOST_STRICT)
+NANOCLAW_DIR = env_or_home("NANOCLAW_DIR", "nanoclaw", strict=_HOST_STRICT)
 # Phase 3.0 (1.A.6): on the VPS, atlas lib code lives at root-owned
 # /usr/local/lib/atlas (synced by git-sync.sh after every atlas-core pull;
 # chattr +i seal arrives in Phase 3.1+). On the laptop and on any pre-cutover

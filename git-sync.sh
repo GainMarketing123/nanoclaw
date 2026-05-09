@@ -6,14 +6,14 @@ LOG=/home/atlas/nanoclaw/logs/git-sync.log
 TIMESTAMP=$(date +%Y-%m-%dT%H:%M:%S%z)
 
 # Codex 5e17091 R2 BLOCKING follow-up: parameterize ATLAS_DIR rather than
-# hardcoding /home/atlas/.atlas. host-executor.py uses ATLAS_DIR (its line 64,
-# `_resolve_dir("ATLAS_DIR", Path.home() / ".atlas")`) as the canonical
-# atlas-core checkout path, supporting an env-var override. This script
-# previously hardcoded /home/atlas/.atlas, which on any host where
-# ATLAS_DIR points elsewhere would cause: (a) atlas-core presence check
-# false-negative → ATLAS_CORE_PRESENT=0, (b) the bottom-gate restart fires
-# treating "absent" as safe even though the executor IS using a real
-# atlas-core checkout that wasn't synced this cycle. Default matches
+# hardcoding /home/atlas/.atlas. host-executor.py uses ATLAS_DIR via the
+# shared lib/atlas_paths.env_or_home("ATLAS_DIR", ".atlas", strict=...)
+# helper as the canonical atlas-core checkout path, supporting an env-var
+# override. This script previously hardcoded /home/atlas/.atlas, which on
+# any host where ATLAS_DIR points elsewhere would cause: (a) atlas-core
+# presence check false-negative → ATLAS_CORE_PRESENT=0, (b) the bottom-gate
+# restart fires treating "absent" as safe even though the executor IS using
+# a real atlas-core checkout that wasn't synced this cycle. Default matches
 # host-executor.py's default ($HOME/.atlas → /home/atlas/.atlas for the
 # atlas user); allow the same env-var override host-executor.py honors so
 # both consumers resolve the same path on any deployment.
