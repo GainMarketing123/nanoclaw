@@ -31,15 +31,6 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=atlas-host-executor
 
-# Codex 30f5e5f R1 F1 + d0d744d R1 F1 BLOCKING follow-up (2026-05-08): pull
-# canonical paths from a shared file that git-sync.sh ALSO sources. Without
-# this, cron and systemd read independent process envs and an operator who
-# sets ATLAS_DIR/NANOCLAW_DIR only here would see cron continue to use its
-# own defaults — running services and the auto-sync/restart pipeline operating
-# on different repos. Leading dash makes the file optional: the per-Environment=
-# defaults below stay authoritative until /etc/atlas/atlas.env is created.
-EnvironmentFile=-/etc/atlas/atlas.env
-
 # Environment
 Environment=HOME=/home/atlas
 Environment=TZ=America/New_York
@@ -48,11 +39,26 @@ Environment=PATH=/usr/local/bin:/usr/bin:/bin:/home/atlas/.local/bin
 # silently re-resolve via the new user's $HOME. host-executor.py reads these
 # at module load with `Path.home() / ...` defaults if unset, so deployments
 # that haven't picked up the new unit (or that haven't run daemon-reload
-# after the unit lands) continue to behave as before. EnvironmentFile= above
-# overrides these per-line when the shared file sets them (systemd merges
-# EnvironmentFile entries on top of inline Environment=).
+# after the unit lands) continue to behave as before.
 Environment=ATLAS_DIR=/home/atlas/.atlas
 Environment=NANOCLAW_DIR=/home/atlas/nanoclaw
+
+# Codex 30f5e5f R1 F1 + d0d744d R1 F1 BLOCKING follow-up (2026-05-08): pull
+# canonical paths from a shared file that git-sync.sh ALSO sources. Without
+# this, cron and systemd read independent process envs and an operator who
+# sets ATLAS_DIR/NANOCLAW_DIR only here would see cron continue to use its
+# own defaults — running services and the auto-sync/restart pipeline operating
+# on different repos.
+#
+# ORDER MATTERS — codex review on cea04e4 (2026-05-08) caught the inverse:
+# EnvironmentFile= MUST come AFTER the Environment= defaults above. systemd
+# applies env assignments in source order and last-write-wins, so a shared
+# file listed BEFORE Environment=ATLAS_DIR=/home/atlas/.atlas would be
+# silently overwritten in the very override scenario this is meant to enable.
+# Listing it AFTER the defaults makes /etc/atlas/atlas.env authoritative when
+# present, with the per-Environment= lines as the in-tree fallback when the
+# shared file is absent (leading dash on EnvironmentFile= = optional load).
+EnvironmentFile=-/etc/atlas/atlas.env
 # Codex 7c7401b F2 BLOCKING revert: a previous version of this file added
 # Environment=CLAUDE_CONFIG_DIR=/home/nanoclaw-he/.claude here, but this
 # unit still runs as User=atlas. The atlas user cannot read a 0600
