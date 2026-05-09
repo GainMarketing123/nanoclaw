@@ -5,17 +5,77 @@
 LOG=/home/atlas/nanoclaw/logs/git-sync.log
 TIMESTAMP=$(date +%Y-%m-%dT%H:%M:%S%z)
 
-# Codex 30f5e5f R1 F1 + d0d744d R1 F1 BLOCKING follow-up (2026-05-08): source
-# the same shared env file the systemd unit reads via EnvironmentFile=, BEFORE
-# computing ATLAS_DIR/NANOCLAW_DIR below. Without this, an operator who sets
-# ATLAS_DIR=/foo or NANOCLAW_DIR=/foo only on the systemd unit would see the
-# service use /foo while cron still defaults to $HOME/.atlas — running
-# services and the auto-sync/restart pipeline operating on different repos.
-# Optional via test+source so this stays a no-op until /etc/atlas/atlas.env is
-# created (matches the systemd unit's `EnvironmentFile=-/etc/atlas/atlas.env`
-# leading-dash optional-load semantics).
+# CO-1.A.6-FU-3 fix (2026-05-09): pre-fix `set -a; . /etc/atlas/atlas.env;
+# set +a` shell-sourced the file, performing $VAR expansion and command
+# substitution. systemd's EnvironmentFile= treats the same file as literal
+# KEY=VALUE pairs only — no expansion, no command substitution. A value
+# like `NANOCLAW_DIR=$HOME/nanoclaw` would resolve differently between cron
+# (here) and systemd (the unit at infra/atlas-host-executor.service:61),
+# recreating the split-brain that this shared file was meant to ELIMINATE.
+# Original purpose preserved (codex 30f5e5f R1 F1 + d0d744d R1 F1 BLOCKING
+# follow-up, 2026-05-08): source the same env file the systemd unit reads
+# via EnvironmentFile=, BEFORE computing ATLAS_DIR/NANOCLAW_DIR below.
+# Without this, an operator who sets ATLAS_DIR=/foo or NANOCLAW_DIR=/foo
+# only on the systemd unit would see the service use /foo while cron still
+# defaults to $HOME/.atlas — running services and the auto-sync/restart
+# pipeline operating on different repos. Optional via test guard so this
+# stays a no-op until /etc/atlas/atlas.env is created (matches the systemd
+# unit's `EnvironmentFile=-/etc/atlas/atlas.env` leading-dash
+# optional-load semantics).
+#
+# Strict parser matches systemd EnvironmentFile= semantics:
+#   - Comments: lines starting with `#` or `;` (after whitespace strip).
+#   - Blank lines skipped.
+#   - Format: KEY=VALUE only — no spaces around `=`, no `KEY VALUE`.
+#   - KEY must match [A-Za-z_][A-Za-z0-9_]*.
+#   - Surrounding quotes (single or double) stripped (systemd treats
+#     quoted values as literal too — within double quotes systemd
+#     processes C-escapes which bash also handles for `\\`, `\n`, etc.,
+#     but those C-escapes ARE drift sources between the two parsers,
+#     so any `\` in the value is rejected to be safe).
+#   - $ / backtick / backslash REJECTED with FAIL log line — these are
+#     the actual cron-vs-systemd drift vectors. Bash sources would
+#     expand them; systemd would not.
+#   - Line continuations (trailing `\`) rejected — systemd supports
+#     them, we don't, log the case so operators avoid the construct.
+# A bad line skips that single assignment but leaves cron running
+# (defensive — an env-file typo shouldn't kill the whole sync pipeline,
+# given that downstream defaults exist for ATLAS_DIR/NANOCLAW_DIR
+# below).
 if [ -r /etc/atlas/atlas.env ]; then
-    set -a; . /etc/atlas/atlas.env; set +a
+    while IFS= read -r line; do
+        # Strip leading whitespace via parameter-expansion glob trick
+        line="${line#"${line%%[![:space:]]*}"}"
+        # Skip blanks and comments
+        case "$line" in
+            ''|'#'*|';'*) continue ;;
+        esac
+        # Reject line continuations (systemd supports, we don't)
+        case "$line" in
+            *\\) echo "$TIMESTAMP | FAIL | atlas.env | line continuation not supported: ${line:0:80}" >> "$LOG"; continue ;;
+        esac
+        # Must contain `=`
+        case "$line" in
+            *=*) ;;
+            *) echo "$TIMESTAMP | FAIL | atlas.env | not KEY=VALUE: ${line:0:80}" >> "$LOG"; continue ;;
+        esac
+        key="${line%%=*}"
+        value="${line#*=}"
+        # Validate KEY: [A-Za-z_][A-Za-z0-9_]*
+        case "$key" in
+            ''|[0-9]*|*[!A-Za-z0-9_]*) echo "$TIMESTAMP | FAIL | atlas.env | invalid key: $key" >> "$LOG"; continue ;;
+        esac
+        # Reject non-literal values ($ / backtick / backslash = cron-vs-systemd drift)
+        case "$value" in
+            *\$*|*\`*|*\\*) echo "$TIMESTAMP | FAIL | atlas.env | non-literal value rejected (cron-vs-systemd drift): ${line:0:80}" >> "$LOG"; continue ;;
+        esac
+        # Strip surrounding single or double quotes (matches systemd literal-quotes semantics)
+        case "$value" in
+            \'*\') value="${value#\'}"; value="${value%\'}" ;;
+            \"*\") value="${value#\"}"; value="${value%\"}" ;;
+        esac
+        export "$key=$value"
+    done < /etc/atlas/atlas.env
 fi
 
 # Codex 5e17091 R2 BLOCKING follow-up: parameterize ATLAS_DIR rather than
