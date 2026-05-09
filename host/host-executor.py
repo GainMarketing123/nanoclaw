@@ -60,9 +60,41 @@ from pathlib import Path
 # the one that picks ATLAS_HOST_MODE=production as the trigger.
 _atlas_dir_env = os.environ.get("ATLAS_DIR")
 _atlas_dir_resolved = Path(_atlas_dir_env) if _atlas_dir_env else Path.home() / ".atlas"
-_lib_path = _atlas_dir_resolved / "lib"
-if not (_lib_path / "atlas_paths.py").is_file():
-    _lib_path = Path(__file__).resolve().parent.parent / "lib"
+_override_lib = _atlas_dir_resolved / "lib"
+_sibling_lib = Path(__file__).resolve().parent.parent / "lib"
+
+
+def _atlas_paths_has_env_or_home(lib_dir: Path) -> bool:
+    """Symbol-level probe: does this lib_dir's atlas_paths.py expose env_or_home?
+
+    Codex b137484 R1 F1 BLOCKING fix: file-existence alone false-passes
+    on a stale ATLAS_DIR/lib (e.g. /usr/local/lib/atlas left behind by a
+    partial rsync rollout) where atlas_paths.py exists but pre-dates the
+    env_or_home rename. The bare `from atlas_paths import env_or_home`
+    that follows would then crash startup before the sibling fallback
+    is considered. Source-text scan instead of import-and-introspect
+    keeps this dirt-cheap (no module-init side effects, no sys.modules
+    pollution before bootstrap) and avoids the chicken-and-egg of
+    importing the very module we're trying to validate.
+    """
+    f = lib_dir / "atlas_paths.py"
+    if not f.is_file():
+        return False
+    try:
+        return "def env_or_home" in f.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+
+
+if _atlas_paths_has_env_or_home(_override_lib):
+    _lib_path = _override_lib
+elif _atlas_paths_has_env_or_home(_sibling_lib):
+    _lib_path = _sibling_lib
+else:
+    # Neither validates — fall back to override path so the resulting
+    # ImportError surfaces loudly and the operator sees the real cause
+    # rather than a silent old-API mismatch later.
+    _lib_path = _override_lib if _override_lib.exists() else _sibling_lib
 sys.path.insert(0, str(_lib_path))
 from atlas_paths import env_or_home  # noqa: E402
 

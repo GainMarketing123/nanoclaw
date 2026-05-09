@@ -87,7 +87,17 @@ sync_repo() {
 }
 
 # NanoClaw — detect source changes, auto-rebuild and restart
-NANOCLAW_DIR=/home/atlas/nanoclaw
+#
+# Codex b137484 R1 F2 BLOCKING follow-up (2026-05-08): parameterize
+# NANOCLAW_DIR the same way ATLAS_DIR is parameterized at line 20 above.
+# host/host-executor.py now reads NANOCLAW_DIR via lib/atlas_paths.env_or_home
+# (overrideable via systemd EnvironmentFile=), so this script must respect the
+# same override or cron will sync/build/restart against /home/atlas/nanoclaw
+# while host-executor reads IPC, DB, and quality-check prompt files from a
+# different override checkout — leaving the running services on stale code
+# indefinitely. Default matches host-executor.py's default ($HOME/nanoclaw →
+# /home/atlas/nanoclaw for the atlas user).
+NANOCLAW_DIR="${NANOCLAW_DIR:-$HOME/nanoclaw}"
 if [ -d "$NANOCLAW_DIR/.git" ]; then
     cd "$NANOCLAW_DIR"
     HEAD_BEFORE=$(git rev-parse HEAD 2>/dev/null)
