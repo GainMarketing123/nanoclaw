@@ -63,19 +63,45 @@ EnvironmentFile=-/etc/atlas/atlas.env
 # CO-1.A.6-FU-1 in-tree drift close (2026-05-09) — Phase 3.1 (LANDED 2026-05-05)
 # delivered ANTHROPIC_API_KEY through systemd's LoadCredential= injection on
 # the live VPS unit, but the in-tree copy in this repo was never updated to
-# match. host/host-executor.py:_load_anthropic_api_key() reads
-# $CREDENTIALS_DIRECTORY/anthropic-api-key first; absent that directory, it
-# falls through to env var, then to ATLAS_DIR/.env. On a fresh-host install
-# from this repo (without manual unit editing), no env var is injected
-# (Phase 3.1 removed ANTHROPIC_API_KEY from EnvironmentFile= sources) and
-# the laptop .env fallback isn't present, so the service would start with
-# an empty key. systemd resolves LoadCredential= paths as root before
-# dropping to User=, so the root-owned 0400 secret file at
+# match. systemd resolves LoadCredential= paths as root before dropping to
+# User=, so the root-owned 0400 secret file at
 # /etc/atlas/anthropic-api-key.secret stays inaccessible to the atlas user
 # via direct path read; the rendered copy lives at
 # $CREDENTIALS_DIRECTORY/anthropic-api-key inside the unit's private
 # credential namespace, readable only by the running service. No production
 # change required — the live unit on the VPS already carries this line.
+#
+# DEPLOYMENT REQUIREMENT (codex 0bed06e R1 BLOCKING follow-up, 2026-05-09):
+# the secret source file at /etc/atlas/anthropic-api-key.secret MUST be
+# provisioned root-owned mode 0400 BEFORE this unit is started/restarted on
+# a production host (Phase 3.1 cutover runbook step at 12 AM EDT 2026-05-05
+# did this; the file is persistent across deploys). systemd reads
+# LoadCredential= sources at unit start; on systemd that fails-hard on a
+# missing source, the unit will not start and host/host-executor.py never
+# runs. On systemd >= 247 a missing source is typically a silent skip
+# (CREDENTIALS_DIRECTORY/anthropic-api-key absent), in which case the
+# Python fallback chain in host/host-executor.py:_load_anthropic_api_key()
+# (lines 280-335) DOES run. The production runbook does NOT rely on the
+# silent-skip path — it provisions the file deterministically.
+#
+# The Python fallback chain (LoadCredential -> env var -> ATLAS_DIR/.env)
+# is reachable only in these scopes, NOT in post-Phase-3.1 production with
+# a missing source:
+#   - LAPTOP / DEV: no systemd; LoadCredential= never executes; ATLAS_DIR/
+#     .env serves the key.
+#   - PRE-PHASE-3.1 OR PARTIAL DEPLOYMENT: ANTHROPIC_API_KEY=... still
+#     listed in EnvironmentFile= for backward compatibility while the
+#     LoadCredential migration is in flight. systemd injects the env var,
+#     LoadCredential silently skips (modern) or is absent (pre-cutover);
+#     the fallback chain reads the env var. This scope ends as soon as
+#     EnvironmentFile= drops the line, after which production hosts need
+#     the secret file in place.
+#   - HOSTS WITH MODERN SYSTEMD AND NO SECRET FILE: the unit starts, the
+#     fallback chain runs, all three sources fail, _load_anthropic_api_key()
+#     returns "" and main() surfaces a clear startup error per the
+#     existing contract at host-executor.py:280-310. This is NOT a
+#     supported deployment mode — it exists only as a defense against
+#     incomplete provisioning.
 LoadCredential=anthropic-api-key:/etc/atlas/anthropic-api-key.secret
 
 # Codex 7c7401b F2 BLOCKING revert: a previous version of this file added
