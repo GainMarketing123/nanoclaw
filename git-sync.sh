@@ -43,7 +43,15 @@ TIMESTAMP=$(date +%Y-%m-%dT%H:%M:%S%z)
 # given that downstream defaults exist for ATLAS_DIR/NANOCLAW_DIR
 # below).
 if [ -r /etc/atlas/atlas.env ]; then
-    while IFS= read -r line; do
+    # `|| [ -n "$line" ]` runs the loop body once more for a final line
+    # that lacks a trailing newline. Codex a988431 R1 BLOCKING (2026-05-09):
+    # systemd's EnvironmentFile= STILL loads that unterminated last line,
+    # so dropping it here recreates the cron-vs-systemd split-brain this
+    # parser was built to eliminate (e.g. final-line `ATLAS_DIR=/srv/atlas`
+    # would be honored by systemd while cron silently fell back to
+    # $HOME/.atlas — running services and the auto-sync pipeline against
+    # different trees).
+    while IFS= read -r line || [ -n "$line" ]; do
         # Strip leading whitespace via parameter-expansion glob trick
         line="${line#"${line%%[![:space:]]*}"}"
         # Skip blanks and comments
