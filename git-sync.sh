@@ -5,6 +5,19 @@
 LOG=/home/atlas/nanoclaw/logs/git-sync.log
 TIMESTAMP=$(date +%Y-%m-%dT%H:%M:%S%z)
 
+# Codex 30f5e5f R1 F1 + d0d744d R1 F1 BLOCKING follow-up (2026-05-08): source
+# the same shared env file the systemd unit reads via EnvironmentFile=, BEFORE
+# computing ATLAS_DIR/NANOCLAW_DIR below. Without this, an operator who sets
+# ATLAS_DIR=/foo or NANOCLAW_DIR=/foo only on the systemd unit would see the
+# service use /foo while cron still defaults to $HOME/.atlas — running
+# services and the auto-sync/restart pipeline operating on different repos.
+# Optional via test+source so this stays a no-op until /etc/atlas/atlas.env is
+# created (matches the systemd unit's `EnvironmentFile=-/etc/atlas/atlas.env`
+# leading-dash optional-load semantics).
+if [ -r /etc/atlas/atlas.env ]; then
+    set -a; . /etc/atlas/atlas.env; set +a
+fi
+
 # Codex 5e17091 R2 BLOCKING follow-up: parameterize ATLAS_DIR rather than
 # hardcoding /home/atlas/.atlas. host-executor.py uses ATLAS_DIR via the
 # shared lib/atlas_paths.env_or_home("ATLAS_DIR", ".atlas", strict=...)
@@ -152,10 +165,18 @@ if [ -d "$NANOCLAW_DIR/.git" ]; then
   # another restart. Defer the restart to AFTER atlas-core pull + rsync so
   # the new process imports against the fresh lib (whether served from
   # /usr/local/lib/atlas or ATLAS_DIR/lib fallback).
-  HOST_CHANGED=$(git diff --name-only "$HEAD_BEFORE" "$HEAD_AFTER" -- host/ infra/ 2>/dev/null)
+  # Codex 30f5e5f R1 F3 BLOCKING follow-up (2026-05-08): include lib/ in the
+  # restart-trigger diff set. host/host-executor.py:67 imports env_or_home
+  # from lib/atlas_paths.py during module init, so a future pull that changes
+  # only lib/ would land on disk without restarting the long-running service —
+  # the old in-memory helper would keep executing indefinitely. The atlas-lib
+  # mirror that already triggers the bottom-gate restart at line ~265 covers
+  # changes from atlas-engineering's lib/, but THIS lib/ is nanoclaw's own
+  # bootstrap-shim copy of atlas_paths.py and needs its own restart signal.
+  HOST_CHANGED=$(git diff --name-only "$HEAD_BEFORE" "$HEAD_AFTER" -- host/ infra/ lib/ 2>/dev/null)
   if [ -n "$HOST_CHANGED" ]; then
     NEEDS_HOST_EXECUTOR_RESTART=1
-    NEEDS_HOST_EXECUTOR_RESTART_REASON="nanoclaw host/ or infra/ changed"
+    NEEDS_HOST_EXECUTOR_RESTART_REASON="nanoclaw host/ or infra/ or lib/ changed"
     echo "$TIMESTAMP | DEFER_RESTART | atlas-host-executor | $NEEDS_HOST_EXECUTOR_RESTART_REASON" >> "$LOG"
   fi
   # MC_CHANGED restart block removed 2026-05-01: the legacy
