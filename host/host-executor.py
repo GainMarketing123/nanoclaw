@@ -238,10 +238,51 @@ def _resolve_atlas_lib_path() -> str:
     Probe statements are the literal `from M import X` callers issue (codex
     cb3ae9c F1 fix; bare `import M` would false-pass on missing symbols).
 
-    On any failure: fall back to ATLAS_DIR/lib, loud-log to stderr.
+    On any failure: fall back to a vetted lib path that bootstrap and
+    downstream import resolution AGREE on. The bootstrap shim above
+    selected `_lib_path` based on whether `env_or_home` was importable
+    — but that probe doesn't validate the FULL set of runtime modules
+    callers need (`mission_executor`, `providers`, `ssrf`, etc.). A
+    partial override tree could pass the bootstrap probe but lack
+    runtime modules, so the resolver does its own required-modules
+    completeness check before threading `_lib_path` into the fallback.
+    Pattern mirrors agent-runner.py:201-229 exactly per lockstep note
+    above (codex 18823ea F1 BLOCKING fix to that file).
+
+    Codex c975b35 R3 BLOCKING #2 follow-up close (2026-05-09): pre-fix
+    hardcoded `ATLAS_DIR/lib` as the fallback. If the bootstrap probe
+    rejected the override and selected the sibling, this resolver still
+    returned the rejected override path whenever /usr/local/lib/atlas
+    was absent or probe-invalid. Downstream lazy imports (`from ssrf ...`,
+    `from mission_executor ...`, etc.) would then resolve against the
+    rejected override tree and raise at task time.
     """
     prod = Path("/usr/local/lib/atlas")
-    fallback = str(ATLAS_DIR / "lib")
+    # Validate the bootstrap-chosen `_lib_path` against the FULL required-
+    # modules set before threading as fallback. Bootstrap probe only checked
+    # `env_or_home` importability — partial trees can pass that probe but
+    # lack runtime modules.
+    _bootstrap_complete = all(
+        (_lib_path / m).is_file() for m in _ATLAS_LIB_REQUIRED_MODULES
+    )
+    _sibling_complete = all(
+        (_sibling_lib / m).is_file() for m in _ATLAS_LIB_REQUIRED_MODULES
+    )
+    if _bootstrap_complete:
+        fallback = str(_lib_path)
+    elif _sibling_complete:
+        sys.stderr.write(
+            f"[atlas-lib-resolver] {_lib_path} is incomplete (missing required "
+            f"modules); using source-tree sibling {_sibling_lib} as fallback\n"
+        )
+        fallback = str(_sibling_lib)
+    else:
+        sys.stderr.write(
+            f"[atlas-lib-resolver] BOTH bootstrap path {_lib_path} and sibling "
+            f"{_sibling_lib} are incomplete; using bootstrap path; runtime "
+            f"imports will raise ImportError loud\n"
+        )
+        fallback = str(_lib_path)
     if not prod.is_dir():
         return fallback
     if not all((prod / m).is_file() for m in _ATLAS_LIB_REQUIRED_MODULES):
