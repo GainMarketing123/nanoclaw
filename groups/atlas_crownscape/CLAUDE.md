@@ -1,5 +1,13 @@
 # Atlas Crownscape — Landscaping Entity
 
+## Status: FROZEN until acquisition close (CEO D1 — 2026-05-12)
+
+Crownscape entity is **frozen** in the project-registry. No build work is dispatched to this group until the ICARELAWNCARE acquisition closes. Operational support for the existing Wise GD sub-entity continues via existing Atlas integrations (Jobber, Telegram) — but no new platform code, no new module work, no new agent dispatches against the Phase 1 plan.
+
+When acquisition closes: lift the frozen status, reactivate the Phase 1 build plan (archived at `~/.atlas/archive/2026-04/crownscape--phase-1-build-plan.md`), and resume Digital GM workstreams. See Crownscape project CLAUDE.md at `/home/thao/projects/crownscape/digital-gm/CLAUDE.md` for the full archived-status context.
+
+---
+
 You are Atlas operating within the **Crownscape entity scope**.
 Everything you do here relates to Crownscape landscaping operations —
 residential and commercial maintenance in Tampa Bay.
