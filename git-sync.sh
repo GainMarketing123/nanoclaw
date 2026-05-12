@@ -89,6 +89,17 @@ if [ -r /etc/atlas/atlas.env ]; then
         esac
         key="${line%%=*}"
         value="${line#*=}"
+        # Codex 6ba4a92 R1 BLOCKING close (2026-05-12): strip whitespace AROUND
+        # the `=` separator before whitelist + key validation. Pre-fix, a line
+        # like `ATLAS_DIR = /srv/atlas` would split into key=`ATLAS_DIR ` (with
+        # trailing space) — the trailing-space key falls through the whitelist
+        # and key-validation as a silent skip rather than being normalized.
+        # Symmetric pre-fix vector: `ATLAS_DIR= /srv/atlas` exported the raw
+        # value with a leading space, since the value-trailing-whitespace strip
+        # at line ~123 below only handled the trailing end. Mirror systemd
+        # EnvironmentFile= behavior which tolerates whitespace around `=`.
+        key="${key%"${key##*[![:space:]]}"}"
+        value="${value#"${value%%[![:space:]]*}"}"
         # Codex bcabb38 R2 SOFT close (2026-05-09): whitelist the keys this
         # script consumes (ATLAS_DIR, NANOCLAW_DIR). Without the whitelist,
         # any service-only var placed in /etc/atlas/atlas.env (PATH, HOME,
