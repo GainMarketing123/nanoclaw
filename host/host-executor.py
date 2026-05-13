@@ -1338,19 +1338,42 @@ def process_task(task_path: Path) -> None:
         # from the child env so `claude -p` uses the OAuth Max subscription
         # rather than the metered API key. claude -p prefers ANTHROPIC_API_KEY
         # over OAuth when both are available and does NOT fall back to OAuth
-        # on API-key 401 — verified in-session. The earlier `env={**os.environ,
-        # ...}` form silently inherited ANTHROPIC_API_KEY (loaded by
-        # _load_anthropic_api_key for the direct-API quality-check path) into
-        # every host-executed task, making the module's "Max subscription"
-        # cost claim wrong for two months.
+        # on API-key 401 — verified in-session.
         #
         # This strip is path-specific to the `claude -p` spawn. The
         # _call_haiku() function above intentionally KEEPS the API key —
         # its docstring documents that exemption explicitly so future
         # env-strip sweeps don't accidentally regress it.
-        _child_env = {**os.environ, "CLAUDE_CODE_ENTRY_POINT": "host-executor"}
-        _child_env.pop("ANTHROPIC_API_KEY", None)
-        _child_env.pop("ANTHROPIC_AUTH_TOKEN", None)
+        #
+        # Phase 3 (post-vendor 2026-05-13): use the vendored
+        # claude_subprocess_env() helper. Single source of truth across
+        # atlas-engineering / atlas-operations / nanoclaw. Module-level
+        # _ATLAS_LIB_PATH (probe-validated by _resolve_atlas_lib_path
+        # above) is added to sys.path here in a try-block, with inline-
+        # strip fallback if subprocess_env is missing on a partial-tree
+        # override (preserves prior behavior on a broken install instead
+        # of letting host-executor crash on import).
+        #
+        # Tokyo v2 (2026-05-13): pass strip_auth_token=False to preserve
+        # ANTHROPIC_AUTH_TOKEN for documented custom-endpoint mode
+        # (ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN per README:189-203 —
+        # third-party Claude-compatible backends like Ollama proxies,
+        # Together AI, Fireworks). ANTHROPIC_API_KEY is still
+        # unconditionally stripped — the $76 spend-leak invariant. The
+        # inline fallback below also preserves AUTH_TOKEN to match.
+        try:
+            if _ATLAS_LIB_PATH not in sys.path:
+                sys.path.insert(0, _ATLAS_LIB_PATH)
+            from subprocess_env import claude_subprocess_env
+            _child_env = claude_subprocess_env(
+                {"CLAUDE_CODE_ENTRY_POINT": "host-executor"},
+                strip_auth_token=False,
+            )
+        except Exception:
+            _child_env = {**os.environ, "CLAUDE_CODE_ENTRY_POINT": "host-executor"}
+            _child_env.pop("ANTHROPIC_API_KEY", None)
+            # NOTE: AUTH_TOKEN NOT stripped here — see custom-endpoint
+            # rationale above. Mirrors the helper's strip_auth_token=False.
 
         start_time = time.time()
         result = subprocess.run(
