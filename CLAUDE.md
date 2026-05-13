@@ -1,48 +1,66 @@
 # NanoClaw
 
-Personal Claude assistant (v2.0.0). See [README.md](README.md) for philosophy and setup. See [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) for architecture decisions.
+## Identity
 
-## Quick Context
+Personal Claude assistant (v2.0.0). The Atlas runtime that sits on the VPS — a single Node.js orchestrator that routes messages from chat channels (Telegram, WhatsApp, Slack, Discord, Gmail) into containerized Claude Agent SDK sessions. Each "group" is an isolated filesystem + memory boundary. Three-layer execution: orchestrator → host-executor (`claude -p` on the VPS host) → containers (Tier 2+ uses `--worktree` isolation for parallel work).
 
-Single Node.js process with skill-based channel system. Channels (WhatsApp, Telegram, Slack, Discord, Gmail) are skills that self-register at startup. Messages route to Claude Agent SDK running in containers (Linux VMs). Each group has isolated filesystem and memory.
+The README + `docs/REQUIREMENTS.md` are the deeper architecture references.
 
-Three execution layers: (1) NanoClaw orchestrator handles message routing and scheduling, (2) host-executor runs `claude -p` tasks on the VPS host with full Python hooks, (3) containers run agent sessions with governance guardrails. Tier 2+ tasks use `--worktree` isolation for safe parallel execution.
+## Current State
 
-Mission control redesign (v2.0.0): bridge-first architecture with SQLite state for missions. Mission lifecycle: create -> pending_approval -> approved -> executing -> synthesis -> complete. Missions flow through Atlas Bridge (HTTP) for Paperclip integration, constraint enforcement, and security evaluation. Telegram inline keyboards for CEO approve/reject. CEO-only commands gated by TELEGRAM_CEO_USER_ID.
+- **Version:** v2.0.0 (Mission Control redesign — bridge-first, SQLite-backed mission lifecycle).
+- **Mission lifecycle:** `create → pending_approval → approved → executing → synthesis → complete`. Missions flow through the Atlas Bridge (HTTP) for Paperclip integration, constraint enforcement, security evaluation. CEO approves/rejects via Telegram inline keyboards.
+- **Auth gating:** CEO-only commands gated by `TELEGRAM_CEO_USER_ID`.
+- **Atlas paths quartet (post-2026-05-08):** nanoclaw carries a byte-identical copy of `lib/atlas_paths.py` matching atlas-engineering / atlas-operations / atlas-shared. `host/host-executor.py` uses the shared `env_or_home(strict=...)` helper.
+- **Phase 3.0 (1.A.6) landed 2026-05-04:** host-executor paths block fail-closes when `ATLAS_HOST_MODE=production`. Module-level `_ATLAS_LIB_PATH` prefers root-owned `/usr/local/lib/atlas` when complete, else falls back to `ATLAS_DIR/lib`. SSRF `ImportError` handler fail-closes (rejects task) instead of logging-and-continuing. `git-sync.sh` mirrors `~/.atlas/lib` into `/usr/local/lib/atlas` after every atlas-core pull (sudoers grant at `infra/sudoers.d/atlas-rsync`).
+- **Phase 3.1 (1.A.6) landed 2026-05-05:** `ANTHROPIC_API_KEY` migrated from `EnvironmentFile=` to systemd `LoadCredential=` (root-owned source `/etc/atlas/anthropic-api-key.secret`, mode 0400). `_load_anthropic_api_key()` order: `$CREDENTIALS_DIRECTORY/anthropic-api-key` → env var → `.env`. Verified end-to-end via synthetic `/quality-check` probe (Haiku grading, 6.2s).
+- **Phase 3.2 (1.A.6) in flight 2026-05-06:** atlas-host-executor service identity migrating from `User=gateway` to dedicated `User=nanoclaw-he`. SSH + Claude OAuth credentials moving to `/home/nanoclaw-he/.{ssh,claude,gitconfig}`. Two ed25519 deploy keys (one per repo per GitHub policy) replace the gateway shared key. Plan: `~/.atlas/plans/1-a-6-phase-3-2-user-split.md`.
+- **2026-05-12 sweep:** `git-sync.sh` env parser hardened to strip whitespace around `=` (matches systemd `EnvironmentFile=` behavior). `groups/atlas_crownscape/CLAUDE.md` carries FROZEN-until-acquisition-close status (CEO D1).
+- **Mission Control dashboard:** the live CEO dashboard is `atlas-command` (separate repo, Next.js 15.3) reverse-proxied behind Caddy at https://atlas.gainpropertygroup.com/. As of 2026-05-01 the systemd `atlas-mission-control.service` runs `atlas-command` under user `nanoclaw-mc` (Wave 1.A.6 Phase 2). The unit file is no longer tracked in this repo's `infra/` — live config lives on the VPS at `/etc/systemd/system/atlas-mission-control.service`. The in-repo `mission-control/server.cjs` is DEPRECATED.
 
-2026-05-12 updates: Atlas Sprint 1.1 docs cleanup landed the `atlas_crownscape` FROZEN-until-acquisition-close status section in `groups/atlas_crownscape/CLAUDE.md` (CEO D1). Same day, `git-sync.sh` env parser hardened to strip whitespace around the `=` separator — pre-fix `ATLAS_DIR = /srv/atlas` was silently dropped by the whitelist (trailing-space key) and `ATLAS_DIR= /srv/atlas` exported a leading-space value. Both vectors now normalize before whitelist + validation, matching systemd EnvironmentFile= behavior.
+## Tech Stack
 
-Phase 3.0 (1.A.6) shipped 2026-05-04: `host/host-executor.py` paths block now production-fail-closes when `ATLAS_HOST_MODE=production` — originally via a local `_resolve_dir` helper, refactored 2026-05-08 to use the shared `lib/atlas_paths.env_or_home(strict=...)` helper after nanoclaw was added as the 4th byte-identical source-of-truth copy of `atlas_paths.py`. Module-level `_ATLAS_LIB_PATH` (computed by `_resolve_atlas_lib_path`) prefers root-owned `/usr/local/lib/atlas` when all required modules exist there, falls back to `ATLAS_DIR/lib` otherwise. SSRF `ImportError` handler now fail-closes (rejects task) instead of logging-and-continuing. `git-sync.sh` mirrors `~/.atlas/lib` into `/usr/local/lib/atlas` after every atlas-core pull (sudo, guarded by directory-existence). Sudoers grant artifact at `infra/sudoers.d/atlas-rsync`.
+| Layer | Tech |
+|-------|------|
+| Runtime | Node.js (orchestrator) + Python 3 (host-executor) |
+| Language | TypeScript (orchestrator) + Python (hooks/host) |
+| State store | SQLite (`src/db.ts`) for missions, tasks, audit |
+| Channels | Telegram (Grammy), WhatsApp, Slack, Discord, Gmail — self-register at startup |
+| Agent runtime | Claude Agent SDK inside Linux VMs (containers) |
+| Container isolation | `--worktree` isolation for Tier 2+ tasks |
+| Credentials | systemd `LoadCredential=` for `ANTHROPIC_API_KEY`; per-user SSH/OAuth |
+| Service identity | `gateway` (legacy) → `nanoclaw-he` (Phase 3.2 in flight) |
+| Dashboard | external `atlas-command` repo (Next.js 15.3), reverse-proxied via Caddy |
 
-Phase 3.1 (1.A.6) shipped 2026-05-05: `ANTHROPIC_API_KEY` migrated from `EnvironmentFile=` to systemd `LoadCredential=` (root-owned source at `/etc/atlas/anthropic-api-key.secret`, mode 0400). `host/host-executor.py:_load_anthropic_api_key()` reads from `$CREDENTIALS_DIRECTORY/anthropic-api-key` first, falls back to env var, then `.env`. Production verification: synthetic `/quality-check` probe returned HTTP 200 with structured Haiku grading in 6.2s, confirming end-to-end credential delivery.
+## Dependencies
 
-Phase 3.2 (1.A.6) in flight 2026-05-06: atlas-host-executor service identity migrating from `User=gateway` to a dedicated `User=nanoclaw-he` POSIX user. SSH/Claude OAuth credentials moving from `/home/atlas/.{ssh,claude,gitconfig}` to `/home/nanoclaw-he/.{ssh,claude,gitconfig}`; two ed25519 deploy keys (one per repo per GitHub policy) replace the gateway's shared key. `host/refresh-claude-auth.sh`, error messages in `host/host-executor.py` and `src/credential-proxy.ts`, and the `detectAuthMode()` precedence in `src/credential-proxy.ts` updated in lockstep so script-side and service-side stay aligned. Plan: `~/.atlas/plans/1-a-6-phase-3-2-user-split.md`.
+- **Atlas paths quartet:** byte-identical `lib/atlas_paths.py` shared with atlas-engineering, atlas-operations, atlas-shared. Drift breaks production fail-close semantics.
+- **VPS `/usr/local/lib/atlas`:** root-owned mirror of `~/.atlas/lib` populated by `git-sync.sh`. Module-level `_ATLAS_LIB_PATH` prefers this when complete.
+- **Atlas Bridge** (HTTP): Paperclip integration, constraint enforcement, security evaluation. Missions traverse the bridge before approval.
+- **Systemd:** `atlas-host-executor.service` (host-executor), `atlas-mission-control.service` (atlas-command dashboard), `nanoclaw` (orchestrator).
+- **GitHub deploy keys** (Phase 3.2): two ed25519 keys, one per repo per GitHub policy. Replace the gateway-era shared key.
+- **Sudoers grant:** `infra/sudoers.d/atlas-rsync` — narrow grant for `git-sync.sh` to rsync `~/.atlas/lib` → `/usr/local/lib/atlas`.
 
-## Key Files
+## Key Decisions
 
-| File | Purpose |
-|------|---------|
-| `src/index.ts` | Orchestrator: state, message loop, agent invocation |
-| `src/channels/registry.ts` | Channel registry (self-registration at startup) |
-| `src/channels/telegram.ts` | Telegram channel (Grammy bot, Markdown formatting) |
-| `src/ipc.ts` | IPC watcher, task processing, document uploads |
-| `src/router.ts` | Message formatting and outbound routing |
-| `src/config.ts` | Trigger pattern, paths, intervals |
-| `src/commands.ts` | Telegram slash commands: /pause, /resume, /status, /approve, /reject, /quota, /reset-mode, /codex |
-| `src/container-runner.ts` | Spawns agent containers with mounts |
-| `src/credential-proxy.ts` | Proxy that injects API credentials into containers (OAuth auto-refresh) |
-| `src/remote-control.ts` | Spawns `claude -p` sessions from Telegram, returns Remote Control URL |
-| `src/auto-pause.ts` | Consecutive failure tracking, group-level pause with CEO escalation |
-| `src/task-planner.ts` | Parallelization safety (observability only — worktree isolation is primary) |
-| `src/task-scheduler.ts` | Runs scheduled tasks, M2 graduation evaluation |
-| `src/db.ts` | SQLite operations |
-| `host/host-executor.py` | VPS host bridge: watches pending tasks, runs `claude -p`, auto-pushes commits |
-| `mission-control/server.cjs` | DEPRECATED — legacy single-file dashboard. The live CEO dashboard is `atlas-command` (separate repo, Next.js 15.3) reverse-proxied behind Caddy at https://atlas.gainpropertygroup.com/. As of 2026-05-01 the systemd `atlas-mission-control.service` runs `atlas-command` under user `nanoclaw-mc` (Wave 1.A.6 Phase 2). The unit file is no longer tracked in this repo's `infra/` — live config lives on the VPS at `/etc/systemd/system/atlas-mission-control.service` with backup. |
-| `DESIGN.md` | Atlas Command cockpit design system (Sprint 1P.5) — typography, color, layout source of truth |
-| `git-sync.sh` | VPS sync: pull updates, restart services on changes |
-| `groups/{name}/CLAUDE.md` | Per-group memory (isolated) |
-| `container/agent-runner/src/governance/` | Governance module: quota, tier-gate, canary, audit, response interceptor |
-| `container/skills/agent-browser.md` | Browser automation tool (available to all agents via Bash) |
+1. **Bridge-first mission architecture (v2.0.0).** Missions go through HTTP boundary before execution. Constraint enforcement and security evaluation live in the bridge, not duplicated in every container. Trade-off: bridge is a single point of failure — outages stall all mission approvals.
+2. **Worktree isolation for parallel work (Tier 2+).** Containers run inside isolated git worktrees so parallel branches don't fight. Cleanup of stale worktrees is a known operational chore.
+3. **`LoadCredential=` for Anthropic key (Phase 3.1).** Pulls the secret from a root-owned `/etc/atlas/anthropic-api-key.secret` (mode 0400) into the service's `$CREDENTIALS_DIRECTORY`. Service-account can't `cat` the secret file. Removes the env-var-leak vector.
+4. **Production fail-close on path resolution (Phase 3.0).** When `ATLAS_HOST_MODE=production` the host-executor will not start unless every required Atlas path resolves. Replaces the "log and continue" behavior that masked broken installs.
+5. **Dedicated `nanoclaw-he` POSIX user (Phase 3.2 in flight).** Splits the host-executor's identity from the legacy `gateway` user. Each service gets its own SSH + Claude OAuth + gitconfig home. Limits credential-blast-radius if one service is compromised.
+6. **Mission Control moved to `atlas-command`.** This repo's `mission-control/server.cjs` is deprecated; the live dashboard is the separate `atlas-command` Next.js 15.3 app. Don't add features to the legacy server.
+
+## Known Issues
+
+- **Container build cache is sticky.** `--no-cache` does NOT invalidate COPY steps — the buildkit volume retains stale files. For a truly clean rebuild, prune the builder then re-run `./container/build.sh`.
+- **WhatsApp upgrades after a refactor:** WhatsApp is a separate channel fork now, not bundled in core. After core upgrade, run `/add-whatsapp` to reinstall.
+- **`mission-control/server.cjs` still in the repo** but DEPRECATED. Live dashboard is `atlas-command` (separate repo). Don't extend the legacy server; PRs against it will get redirected.
+- **Atlas-shared submodule pointer bumps** without pushing the pointed commit have caused review-time `not present in object database` failures in the past. Always push the submodule pointer before bumping its parent.
+
+## What would make me worry
+
+1. **`atlas_paths.py` quartet drift.** Four byte-identical copies live across atlas-engineering / atlas-operations / atlas-shared / nanoclaw. A one-off edit to any of them silently breaks the production fail-close contract (Phase 3.0) in only one of the four runtimes — and the cross-review hook only catches it on the repo where the edit landed. We have no automated cross-repo SHA check.
+2. **Mission lifecycle stuck in `executing` or `synthesis` after a container crash.** If a container OOMs mid-mission and the cleanup path doesn't fire (which has happened during worktree-cleanup races), the SQLite row stays in `executing` forever. The CEO sees a stale "approved, running" mission with no actual process behind it. Manual SQL pokes are the only recovery path today.
 
 ## Telegram Commands
 
@@ -74,10 +92,6 @@ Injected into every container session. Components:
 
 Runs on VPS host (not containerized). Watches `~/.atlas/host-tasks/pending/` for task JSON. Runs `claude -p` with tier-appropriate flags (Tier 2+ uses `--worktree`). Auto-pushes commits. Includes M2 graduation evaluation and self-healing for auth/outage failures. Systemd: `atlas-host-executor.service`.
 
-## Mission Control (mission-control/server.cjs)
-
-Single-file CEO dashboard. Server-rendered HTML, dark theme, auto-refresh 10s. Shows conversation pairs with status icons, escalations, graduation progress. Auth via `MISSION_CONTROL_USER`/`MISSION_CONTROL_PASS` env vars. Port: `MC_PORT` (default 8080).
-
 ## Safety Features
 
 - **Auto-pause** (`src/auto-pause.ts`): Tracks consecutive failures per group. After threshold, pauses group and sends CEO Telegram alert. `/resume` clears.
@@ -108,22 +122,21 @@ Self-knowledge (`~/.atlas/atlas-self-knowledge.md`) injected into container syst
 | `/qodo-pr-resolver` | Fetch and fix Qodo PR review issues interactively or in batch |
 | `/get-qodo-rules` | Load org- and repo-level coding rules from Qodo before code tasks |
 
-## Development
-
-Run commands directly—don't tell the user to run them.
+## Development commands
 
 ```bash
-npm run dev          # Run with hot reload
-npm run build        # Compile TypeScript
-./container/build.sh # Rebuild agent container
+npm run dev           # Orchestrator with hot reload
+npm run build         # Compile TypeScript
+./container/build.sh  # Rebuild agent container (prune buildkit first if COPY steps look stale)
 ```
 
 Service management:
+
 ```bash
 # macOS (launchd)
 launchctl load ~/Library/LaunchAgents/com.nanoclaw.plist
 launchctl unload ~/Library/LaunchAgents/com.nanoclaw.plist
-launchctl kickstart -k gui/$(id -u)/com.nanoclaw  # restart
+launchctl kickstart -k gui/$(id -u)/com.nanoclaw   # restart
 
 # Linux (systemd)
 systemctl --user start nanoclaw
@@ -131,30 +144,12 @@ systemctl --user stop nanoclaw
 systemctl --user restart nanoclaw
 ```
 
-## Troubleshooting
+## Skill routing (Claude Code only)
 
-**WhatsApp not connecting after upgrade:** WhatsApp is now a separate channel fork, not bundled in core. Run `/add-whatsapp` (or `git remote add whatsapp https://github.com/qwibitai/nanoclaw-whatsapp.git && git fetch whatsapp main && (git merge whatsapp/main || { git checkout --theirs package-lock.json && git add package-lock.json && git merge --continue; }) && npm run build`) to install it. Existing auth credentials and groups are preserved.
+If the runtime is Claude Code and these skills are registered in the user's environment, prefer them for the following request types — otherwise ignore this section.
 
-## Container Build Cache
-
-The container buildkit caches the build context aggressively. `--no-cache` alone does NOT invalidate COPY steps — the builder's volume retains stale files. To force a truly clean rebuild, prune the builder then re-run `./container/build.sh`.
-
-## Skill routing
-
-When the user's request matches an available skill, ALWAYS invoke it using the Skill
-tool as your FIRST action. Do NOT answer directly, do NOT use other tools first.
-The skill has specialized workflows that produce better results than ad-hoc answers.
-
-Key routing rules:
-- Product ideas, "is this worth building", brainstorming → invoke office-hours
-- Bugs, errors, "why is this broken", 500 errors → invoke investigate
-- Ship, deploy, push, create PR → invoke ship
-- QA, test the site, find bugs → invoke qa
-- Code review, check my diff → invoke review
-- Update docs after shipping → invoke document-release
-- Weekly retro → invoke retro
-- Design system, brand → invoke design-consultation
-- Visual audit, design polish → invoke design-review
-- Architecture review → invoke plan-eng-review
-- Save progress, checkpoint, resume → invoke checkpoint
-- Code quality, health check → invoke health
+- Bugs / errors / "why is this broken" → `investigate`
+- Ship / deploy / create PR → `ship`
+- Code review → `review`
+- Architecture review → `plan-eng-review`
+- Code quality / health check → `health`
