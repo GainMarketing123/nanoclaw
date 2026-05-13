@@ -16,6 +16,24 @@
  *   token (standard OAuth2 flow), updates the credentials file, and
  *   retries the request. Only alerts CEO if the refresh token itself fails.
  *   Access token expiration never causes downtime.
+ *
+ * INTENTIONAL ANTHROPIC_API_KEY USAGE — do NOT include in env-strip sweeps.
+ * ------------------------------------------------------------------------
+ * Cost-burn audit 2026-05-12 (the $76 XgAA-key leak) introduced an
+ * `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` env-strip pattern that gets
+ * applied to every site that spawns `claude -p` so the CLI falls through
+ * to OAuth Max subscription instead of silently billing the metered key.
+ * THAT PATTERN DOES NOT APPLY HERE. This file is an HTTP proxy: it loads
+ * ANTHROPIC_API_KEY via loadAnthropicApiKey() (systemd LoadCredential →
+ * env → ATLAS_DIR/.env, mirroring host-executor) and either injects it
+ * as an x-api-key header on api-key deployments, or runs in OAuth mode
+ * and never touches the key. There is no child_process spawn, no
+ * `claude -p`, and nothing for an env strip to act on. Removing the key
+ * here would silently break api-key-mode deployments (containers would
+ * see "missing x-api-key" on every upstream call).
+ *
+ * Future env-strip sweeps: this file is OUT OF SCOPE. Leave the key
+ * loading path in place.
  */
 import fs from 'fs';
 import os from 'os';

@@ -654,6 +654,24 @@ def _call_haiku(response_text: str) -> dict:
       timeout       — request timeout. Retryable; soft-window alert.
       parse         — Haiku JSON unparseable. NOT retryable; loud-log only.
       api_error     — other 4xx / unclassified exception. NOT retryable; loud-log.
+
+    INTENTIONAL ANTHROPIC_API_KEY USAGE — do NOT include in env-strip sweeps.
+    --------------------------------------------------------------------------
+    Cost-burn audit 2026-05-12 (the $76 XgAA-key leak) introduced an
+    `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` env-strip pattern that gets
+    applied to every site that spawns `claude -p` so the CLI falls through
+    to OAuth Max subscription instead of silently billing the metered key.
+    THAT PATTERN DOES NOT APPLY HERE. This function is a direct HTTPS POST
+    to `https://api.anthropic.com/v1/messages` carrying the API key in the
+    `x-api-key` header — no `claude -p`, no subprocess, no child env. The
+    OAuth Max subscription does not support `/v1/messages` (see comment at
+    L428-432 above), so the metered API key is the only viable auth here.
+    Stripping it would break quality-check entirely, returning every grade
+    as `token_missing` and degrading the governance gate.
+
+    Future env-strip sweeps: this site is OUT OF SCOPE — leave the key in
+    place. The in-scope leak surface in this file is the `claude -p` spawn
+    in `process_task()` around L1336-L1361 (handled in this same commit).
     """
     api_key = _load_anthropic_api_key()
     if not api_key:
@@ -1315,6 +1333,25 @@ def process_task(task_path: Path) -> None:
             cmd.append("--worktree")
 
         # Run claude -p with the prompt on stdin
+        # Cost-burn fix 2026-05-12 (the $76 XgAA-key leak; CEO directive
+        # after diagnosis): strip ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN
+        # from the child env so `claude -p` uses the OAuth Max subscription
+        # rather than the metered API key. claude -p prefers ANTHROPIC_API_KEY
+        # over OAuth when both are available and does NOT fall back to OAuth
+        # on API-key 401 — verified in-session. The earlier `env={**os.environ,
+        # ...}` form silently inherited ANTHROPIC_API_KEY (loaded by
+        # _load_anthropic_api_key for the direct-API quality-check path) into
+        # every host-executed task, making the module's "Max subscription"
+        # cost claim wrong for two months.
+        #
+        # This strip is path-specific to the `claude -p` spawn. The
+        # _call_haiku() function above intentionally KEEPS the API key —
+        # its docstring documents that exemption explicitly so future
+        # env-strip sweeps don't accidentally regress it.
+        _child_env = {**os.environ, "CLAUDE_CODE_ENTRY_POINT": "host-executor"}
+        _child_env.pop("ANTHROPIC_API_KEY", None)
+        _child_env.pop("ANTHROPIC_AUTH_TOKEN", None)
+
         start_time = time.time()
         result = subprocess.run(
             cmd,
@@ -1323,7 +1360,7 @@ def process_task(task_path: Path) -> None:
             capture_output=True,
             text=True,
             timeout=TASK_TIMEOUT,
-            env={**os.environ, "CLAUDE_CODE_ENTRY_POINT": "host-executor"},
+            env=_child_env,
         )
         duration_ms = int((time.time() - start_time) * 1000)
 
