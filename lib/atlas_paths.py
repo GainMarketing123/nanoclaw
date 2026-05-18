@@ -89,14 +89,20 @@ def _extract_module_symbols(module_path: Path) -> frozenset[str]:
     """Return all top-level names bound in a Python source file (AST, no import).
 
     Handles: def/async def/class, assignments (=, +=), annotated assignments,
-    top-level `import X` and `from X import Y` re-exports. Returns frozenset()
-    on any parse or read error (fail-open — symbol check is best-effort).
+    top-level `import X` and `from X import Y` re-exports.
+
+    Returns None on any parse or read error (fail-open SENTINEL — callers
+    treat None as "inconclusive, skip symbol validation"). Returning
+    frozenset() instead would silently fail-closed: any required symbol
+    would be missing and the candidate would be rejected, which is the
+    opposite of the documented "best-effort" intent. Codex 6a4b64a F2
+    BLOCKING fix.
     """
     try:
         source = module_path.read_text(encoding="utf-8", errors="replace")
         tree = ast.parse(source, filename=str(module_path))
     except (SyntaxError, OSError, ValueError):
-        return frozenset()
+        return None
     names: set[str] = set()
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -154,10 +160,24 @@ def _path_satisfies(
                 return False
     if required_symbols:
         for module_name, symbols in required_symbols.items():
+            # Resolve BOTH module shapes: plain file (name.py) OR package
+            # directory (name/__init__.py). Codex 6a4b64a F1 BLOCKING fix —
+            # the prior code only probed the plain-file form, which made
+            # symbol validation silently fail-closed on every package-form
+            # module the manifest could reference.
             module_file = lib_path / f"{module_name}.py"
             if not module_file.is_file():
-                return False
+                pkg_init = lib_path / module_name / "__init__.py"
+                if pkg_init.is_file():
+                    module_file = pkg_init
+                else:
+                    return False
             exported = _extract_module_symbols(module_file)
+            if exported is None:
+                # Parse/read failed — fail-OPEN per the docstring's
+                # "best-effort" contract. Skip symbol validation for this
+                # module; presence check already passed.
+                continue
             for sym in symbols:
                 if sym not in exported:
                     return False
