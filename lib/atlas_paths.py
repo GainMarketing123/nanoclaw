@@ -37,6 +37,7 @@ Any change to one MUST be propagated to the other three in the same arc.
 
 from __future__ import annotations
 
+import ast
 import os
 from pathlib import Path
 from typing import Iterable
@@ -84,13 +85,62 @@ ATLAS_OPS_DIR: Path = env_or_home("ATLAS_OPS_DIR", ".atlas-operations")
 CLAUDE_CONFIG_DIR: Path = env_or_home("CLAUDE_CONFIG_DIR", ".claude")
 
 
-def _path_satisfies(lib_path: Path, required_modules: Iterable[str]) -> bool:
-    """True if lib_path is a directory containing every required module.
+def _extract_module_symbols(module_path: Path) -> frozenset[str]:
+    """Return all top-level names bound in a Python source file (AST, no import).
 
-    Supports two declaration shapes:
+    Handles: def/async def/class, assignments (=, +=), annotated assignments,
+    top-level `import X` and `from X import Y` re-exports. Returns frozenset()
+    on any parse or read error (fail-open — symbol check is best-effort).
+    """
+    try:
+        source = module_path.read_text(encoding="utf-8", errors="replace")
+        tree = ast.parse(source, filename=str(module_path))
+    except (SyntaxError, OSError, ValueError):
+        return frozenset()
+    names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    names.add(target.id)
+                elif isinstance(target, ast.Tuple):
+                    for elt in target.elts:
+                        if isinstance(elt, ast.Name):
+                            names.add(elt.id)
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name):
+                names.add(node.target.id)
+        elif isinstance(node, ast.AugAssign):
+            if isinstance(node.target, ast.Name):
+                names.add(node.target.id)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                names.add(alias.asname if alias.asname else alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name != "*":
+                    names.add(alias.asname if alias.asname else alias.name)
+    return frozenset(names)
+
+
+def _path_satisfies(
+    lib_path: Path,
+    required_modules: Iterable[str],
+    required_symbols: "dict[str, list[str]] | None" = None,
+) -> bool:
+    """True iff lib_path contains every required module AND exports required symbols.
+
+    Supports two module declaration shapes:
       - "name.py"  — must be a regular file at lib_path/name.py
       - "name"     — must be a package directory at lib_path/name/ with
                      an __init__.py inside
+
+    required_symbols (optional): dict mapping module-name (no .py suffix) to
+    symbol names that must appear as top-level bindings in that module. Checked
+    via _extract_module_symbols (AST, no import side effects). A candidate
+    fails if any listed symbol is absent from the module's top-level namespace.
     """
     if not lib_path.is_dir():
         return False
@@ -102,12 +152,22 @@ def _path_satisfies(lib_path: Path, required_modules: Iterable[str]) -> bool:
             pkg = lib_path / m
             if not (pkg.is_dir() and (pkg / "__init__.py").is_file()):
                 return False
+    if required_symbols:
+        for module_name, symbols in required_symbols.items():
+            module_file = lib_path / f"{module_name}.py"
+            if not module_file.is_file():
+                return False
+            exported = _extract_module_symbols(module_file)
+            for sym in symbols:
+                if sym not in exported:
+                    return False
     return True
 
 
 def resolve_lib_path_for(
     required_modules: Iterable[str],
     source_fallback: "Path | str | None" = None,
+    required_symbols: "dict[str, list[str]] | None" = None,
 ) -> Path:
     """Return a lib/ Path validated to contain every required module.
 
@@ -204,12 +264,13 @@ def resolve_lib_path_for(
         deduped.append(c)
 
     for cand in deduped:
-        if _path_satisfies(cand, required):
+        if _path_satisfies(cand, required, required_symbols):
             return cand
 
     raise FileNotFoundError(
-        f"No lib/ path satisfies required modules {required}. "
-        f"Tried: {[str(c) for c in deduped]}"
+        f"No lib/ path satisfies required modules {required}"
+        + (f" with symbols {required_symbols}" if required_symbols else "")
+        + f". Tried: {[str(c) for c in deduped]}"
     )
 
 
