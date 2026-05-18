@@ -91,12 +91,19 @@ def _extract_module_symbols(module_path: Path) -> "frozenset[str] | None":
     Handles: def/async def/class, assignments (=, +=), annotated assignments,
     top-level `import X` and `from X import Y` re-exports.
 
-    Returns None on any parse or read error (fail-open SENTINEL — callers
-    treat None as "inconclusive, skip symbol validation"). Returning
-    frozenset() instead would silently fail-closed: any required symbol
-    would be missing and the candidate would be rejected, which is the
-    opposite of the documented "best-effort" intent. Codex 6a4b64a F2
-    BLOCKING fix.
+    Returns None on any parse or read error. Callers treat None as
+    "candidate cannot be verified, reject" — _path_satisfies returns False
+    for the lib/ candidate so the resolver falls back to the next one.
+    Rationale: required_symbols validation is a GATE — its job is to keep
+    bootstrap from selecting a lib/ that will crash on actual import. A
+    module we cannot parse cannot be safely imported, so it is not
+    "satisfied" under resolve_lib_path_for's contract.
+    History: Codex 6a4b64a F2 BLOCKING (round 1) flagged the original
+    frozenset()-on-error as silent-reject and recommended a None sentinel
+    callers could ignore; Codex 8ace103 BLOCKING (round 2) reopened —
+    silent-skip-on-error defeats the Wave 1 Lane C stated intent;
+    Codex tiebreaker consult (round 3, 2026-05-18) picked fail-closed
+    as the resolution, restoring the original Wave 1 Lane C intent.
     """
     try:
         source = module_path.read_text(encoding="utf-8", errors="replace")
@@ -180,10 +187,22 @@ def _path_satisfies(
                     return False
             exported = _extract_module_symbols(module_file)
             if exported is None:
-                # Parse/read failed — fail-OPEN per the docstring's
-                # "best-effort" contract. Skip symbol validation for this
-                # module; presence check already passed.
-                continue
+                # Parse/read failed — reject this candidate. The whole
+                # point of required_symbols validation is to prevent
+                # bootstrap from selecting a lib/ that crashes on actual
+                # import. A module we cannot parse/read cannot be verified,
+                # so the candidate is NOT "satisfied" under
+                # resolve_lib_path_for's contract — fall back to the next
+                # candidate instead of silently passing through to an
+                # ImportError at runtime.
+                # Task #11 round-3 tiebreaker (codex 2026-05-18 consult):
+                # round-1 fix (codex 6a4b64a) moved from silent-reject via
+                # frozenset() to silent-skip via None sentinel + continue.
+                # Round-2 finding (codex 8ace103) reopened — silent-skip
+                # defeats the Wave 1 Lane C stated intent. Round-3 consult
+                # picked option B (fail-closed) as the tiebreaker; this
+                # restores the original intent.
+                return False
             for sym in symbols:
                 if sym not in exported:
                     return False
