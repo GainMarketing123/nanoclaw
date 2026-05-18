@@ -85,7 +85,7 @@ ATLAS_OPS_DIR: Path = env_or_home("ATLAS_OPS_DIR", ".atlas-operations")
 CLAUDE_CONFIG_DIR: Path = env_or_home("CLAUDE_CONFIG_DIR", ".claude")
 
 
-def _extract_module_symbols(module_path: Path) -> frozenset[str]:
+def _extract_module_symbols(module_path: Path) -> "frozenset[str] | None":
     """Return all top-level names bound in a Python source file (AST, no import).
 
     Handles: def/async def/class, assignments (=, +=), annotated assignments,
@@ -160,17 +160,23 @@ def _path_satisfies(
                 return False
     if required_symbols:
         for module_name, symbols in required_symbols.items():
-            # Resolve BOTH module shapes: plain file (name.py) OR package
-            # directory (name/__init__.py). Codex 6a4b64a F1 BLOCKING fix —
-            # the prior code only probed the plain-file form, which made
-            # symbol validation silently fail-closed on every package-form
-            # module the manifest could reference.
-            module_file = lib_path / f"{module_name}.py"
-            if not module_file.is_file():
-                pkg_init = lib_path / module_name / "__init__.py"
-                if pkg_init.is_file():
-                    module_file = pkg_init
-                else:
+            # Resolve BOTH module shapes: package directory (name/__init__.py)
+            # OR plain file (name.py). Package-FIRST matches Python import
+            # semantics — CPython's FileFinder probes regular packages before
+            # plain module files, so `import foo` against a lib/ that contains
+            # both `foo/__init__.py` and `foo.py` loads the package. Validating
+            # the symbol manifest against the same file Python will actually
+            # import prevents a false-positive "manifest passed" against the
+            # plain file while runtime imports a package with a different API.
+            # Codex 6a4b64a F1 BLOCKING fix (initial both-shapes support).
+            # Task #11 design ratification 2026-05-18: order flipped to
+            # package-first to close the latent import-vs-validate mismatch.
+            pkg_init = lib_path / module_name / "__init__.py"
+            if pkg_init.is_file():
+                module_file = pkg_init
+            else:
+                module_file = lib_path / f"{module_name}.py"
+                if not module_file.is_file():
                     return False
             exported = _extract_module_symbols(module_file)
             if exported is None:
@@ -189,15 +195,17 @@ def resolve_lib_path_for(
     source_fallback: "Path | str | None" = None,
     required_symbols: "dict[str, list[str]] | None" = None,
 ) -> Path:
-    """Return a lib/ Path validated to contain every required module.
+    """Return a lib/ Path validated to contain every required module and symbol.
 
     Resolution order:
       1. ATLAS_DIR env override + lib/, if every required module is present
+         and every required symbol is exported by its module
       2. Caller-provided source_fallback (the in-flight checkout's lib),
-         if every required module is present
+         if every required module is present (and symbols)
       3. Sibling lib/ of this file (where atlas_paths was loaded from),
-         if every required module is present
-      4. ~/.atlas/lib (default home install), if every required module is present
+         if every required module is present (and symbols)
+      4. ~/.atlas/lib (default home install), if every required module is
+         present (and symbols)
 
     Each entrypoint declares the FULL set of files (.py modules, or
     package directories with __init__.py) it will import after this
@@ -222,7 +230,14 @@ def resolve_lib_path_for(
     imports fail silently after bootstrap "succeeded" against a
     partial-tree override.
 
-    Hook entrypoint pattern:
+    Wave 1 Lane C symbol-manifest fix: required_symbols extends the
+    presence-only check with an AST-based symbol export verification.
+    Mixed-version override deployments where a candidate lib/ has the
+    required module files but an older API (missing emit_block,
+    emit_pass, etc.) now fall back to the next candidate instead of
+    crashing with ImportError after bootstrap "succeeds".
+
+    Hook entrypoint pattern (with symbol manifest):
         # 1. Tiny inline probe — find atlas_paths.py
         _atlas_dir_env = os.environ.get("ATLAS_DIR")
         _atlas_dir = Path(_atlas_dir_env) if _atlas_dir_env else Path.home() / ".atlas"
@@ -232,17 +247,37 @@ def resolve_lib_path_for(
         sys.path.insert(0, str(_lib))
         # 2. Full validation via shared resolver
         from atlas_paths import resolve_lib_path_for
-        _BOOTSTRAP_LIB_PATH = resolve_lib_path_for(
-            ("atlas_paths.py", "hook_io.py", ...top-level imports only...),
-            source_fallback=Path(__file__).resolve().parent.parent / "lib",
+        _HAS_REQUIRED_SYMBOLS = (
+            "required_symbols"
+            in resolve_lib_path_for.__code__.co_varnames[
+                :resolve_lib_path_for.__code__.co_argcount
+            ]
         )
+        _SYMBOL_MANIFEST = {
+            "hook_io": ["emit_block", "emit_pass", ...unconditional imports only...],
+        }
+        if _HAS_SOURCE_FALLBACK and _HAS_REQUIRED_SYMBOLS:
+            _BOOTSTRAP_LIB_PATH = resolve_lib_path_for(
+                ("atlas_paths.py", "hook_io.py", ...),
+                source_fallback=Path(__file__).resolve().parent.parent / "lib",
+                required_symbols=_SYMBOL_MANIFEST,
+            )
+        elif _HAS_SOURCE_FALLBACK:
+            _BOOTSTRAP_LIB_PATH = resolve_lib_path_for(
+                ("atlas_paths.py", "hook_io.py", ...),
+                source_fallback=Path(__file__).resolve().parent.parent / "lib",
+            )
+        else:
+            _BOOTSTRAP_LIB_PATH = resolve_lib_path_for(
+                ("atlas_paths.py", "hook_io.py", ...),
+            )
 
     Required-module tuple guidance: include ONLY modules imported
     unconditionally before main() (top-level imports). Lazy / fail-
     open imports (try/except wrapped, or inside conditional branches)
     must be left out — making them required would convert a fail-open
     hook into a hard startup failure when the optional module is
-    missing.
+    missing. Same rule applies to required_symbols entries.
 
     Args:
         required_modules: iterable of file/package names relative to
@@ -253,6 +288,14 @@ def resolve_lib_path_for(
             resolution order — preferred over atlas_paths' sibling
             (candidate 3) because the caller knows its own checkout
             location while atlas_paths only knows where it loaded from.
+        required_symbols: optional dict mapping module-name (no .py
+            suffix) to the list of symbol names that must be top-level
+            bindings in that module. Checked via AST — no import side
+            effects. A candidate lib/ path fails if any listed symbol
+            is absent from the module's top-level namespace. Use for
+            modules where the exact API surface matters across versions
+            (e.g. emit_block/emit_pass/emit_allow_with_context in
+            hook_io). Default None preserves pre-Wave-1 behavior.
 
     Returns:
         Path to the lib/ that satisfies the contract.
