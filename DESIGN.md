@@ -29,8 +29,8 @@
   - Surface hover: #17171C
   - Surface active: #1C1C24
 - **Border:** #2A2A36 (1px solid, no shadows — borders create depth)
-- **Accent:** #3B82F6 (blue — trust, authority, action)
-- **Accent dim:** #2563EB (hover/pressed state)
+- **Accent:** SHIPPED REALITY (2026-05-21) is teal #0F4D5C (light #1a6b7d). Original spec was blue #3B82F6; teal was blessed as the live accent (DX review D-DX2 — see Decisions Log). Gold-for-money carries the real signal either way.
+- **Accent dim:** #2563EB (original spec; live uses the teal pair above)
 - **Gold:** #E7DBB3 (distinctive secondary — used ONLY for money/cost values)
 - **Gold dim:** #A89968 (muted gold)
 - **Text primary:** #F0F0F5 (high contrast against backgrounds)
@@ -81,7 +81,7 @@
 - No centered-everything layouts
 - No decorative blobs, waves, or floating shapes
 - No box-shadows for depth (use 1px borders only)
-- No Montserrat, Inter, Roboto, or other overused fonts
+- No Inter, Roboto, or other overused fonts (SHIPPED EXCEPTION 2026-05-21: app currently ships Montserrat; blessed as live body font for now — Satoshi/Geist deferred, no glance-speed payoff. See Decisions Log.)
 - No generic "Welcome to..." hero copy
 - No uniform border-radius on everything
 
@@ -92,3 +92,5 @@
 | 2026-04-16 | Satoshi + Geist typography | Replaces Montserrat. Geist has superior tabular-nums for data tables. Satoshi for display adds confidence. |
 | 2026-04-16 | Text contrast bump | --text-muted from #52526B to #7B7B94, --text-secondary from #8B8B9E to #A0A0B8. Original was too hard to read. |
 | 2026-04-16 | Cockpit visual language | SVG gauges, sparklines, progress rings. CEO feedback: "like a car dashboard." |
+| 2026-05-21 | Doc reconciled to shipped reality (DX review D-DX2) | App drifted from spec: accent shipped teal #0F4D5C not blue; body font shipped Montserrat not Satoshi/Geist. CEO chose to KEEP shipped look (near-zero glance payoff to repaint ~20 pages) and only fix the too-dark gray labels (--text-muted/-secondary/-dim lightened). Doc updated so it stops contradicting the app. Original blue/Satoshi intent retained as historical. |
+| 2026-05-21 | Stale-data contract (DX review, Codex blind-spot) | A green status must never lie: cockpit tracks per-source freshness; past threshold, status flips to UNKNOWN (neutral --status-unknown), never stale-green. Triggered by finding system-health.json 7 weeks stale. |
