@@ -1474,8 +1474,12 @@ def process_task(task_path: Path) -> None:
                 status=status,
                 session_id=task_id,
             )
-        except Exception:
-            pass
+        except Exception as e:
+            # Fail-open (never break task execution), but leave a trail —
+            # silent suppression would let the cockpit Agent-activity panel sit
+            # empty while tasks look healthy, making prod diagnosis hard (codex
+            # FAIL_SOFT). host-executor logs everywhere else, so match that.
+            log(f"subagent-audit emit failed (non-blocking): {e}")
 
         # Audit log
         log_audit(entity, {
