@@ -1230,7 +1230,10 @@ def process_task(task_path: Path) -> None:
         # (codex flag). Fail-closed: reject any present `type` we don't support.
         # See plans/host-executor-lib-security-finding-2026-05-23.md.
         _task_type_tag = task.get("type")
-        if _task_type_tag:
+        # Presence, NOT truthiness: a fail-closed guard must also reject
+        # falsy-but-present types ({"type": ""}, 0, false), else the hard-stop
+        # has a silent bypass (codex 5a80a71 FAIL_BLOCKING).
+        if "type" in task:
             write_result(task_id, entity, "rejected", 1,
                          f"Unsupported task 'type' field: {_task_type_tag!r}. "
                          f"Host-task files carry no 'type' in this architecture; "
