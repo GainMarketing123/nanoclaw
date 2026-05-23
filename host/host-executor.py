@@ -186,6 +186,17 @@ NANOCLAW_DIR = env_or_home("NANOCLAW_DIR", "nanoclaw", strict=_HOST_STRICT)
 # atlas-lib module host-executor.py imports below; adding a new lib import
 # requires adding the module file name here too (otherwise the validator
 # false-passes on a partial tree that's missing the new module).
+# REQUIRED (fail-closed): every atlas-lib module host-executor.py imports that
+# MUST be importable for the sealed prod tree to be SELECTED; each maps to a
+# probe statement below. `mission_executor.py` + `performance_tracker.py` were
+# REMOVED 2026-05-23 (session 2fa8e36e; see
+# plans/host-executor-lib-security-finding-2026-05-23.md): both were deleted in
+# the CP4 repo split (3ac53438) and exist in NO repo. mission_executor's host-
+# task path is dead (missions are bridge+SQLite in v2.0.0); performance_tracker's
+# runtime import is non-blocking (try/except), so an optional dep must NOT gate
+# tree selection. Per-file probe sets legitimately DIFFER from agent-runner.py
+# (each entrypoint imports a different subset); the lockstep is the probe SHAPE,
+# not the module list.
 _ATLAS_LIB_REQUIRED_MODULES = (
     "ssrf.py",
     # Phase 3.0 cutover bug fix (2026-05-05 session 1e456cce): `providers` is a
@@ -201,24 +212,24 @@ _ATLAS_LIB_REQUIRED_MODULES = (
     # this file's drift was a single-line typo that the partial-migration
     # discipline caught only when the prod tree finally existed at runtime.
     "providers/__init__.py",
-    "performance_tracker.py",
     "autonomy_tracker.py",
-    "mission_executor.py",
 )
+# OPTIONAL (non-blocking): modules imported behind a runtime try/except that
+# logs-and-continues; a missing OPTIONAL module must NOT fail tree selection.
+# Empty today — `performance_tracker.py` (deleted in the CP4 split) would belong
+# here if/when restored, never in the REQUIRED set above.
+_ATLAS_LIB_OPTIONAL_MODULES = ()
 # Probe-import statement set: the actual `from X import Y` statements
 # callers issue downstream. Bare `import M` would false-pass when a same-
 # named package exists but doesn't re-export the called symbol — codex
 # cb3ae9c R1 F1 BLOCKING (lockstep finding from agent-runner.py review,
 # same shape applies here). Each statement is the literal call-site form
-# (mission SSRF validate, mission_executor entry, providers route,
-# performance_tracker track, autonomy_tracker M2 evaluation). Subprocess
+# (SSRF validate, providers route, autonomy_tracker M2 evaluation). Subprocess
 # executes them in order; the first one to fail surfaces as ImportError
 # on stderr.
 _ATLAS_LIB_PROBE_STATEMENTS = (
     "from ssrf import validate_endpoint_url",
-    "from mission_executor import process_mission",
     "from providers import route",
-    "from performance_tracker import track",
     "from autonomy_tracker import evaluate_m2_clean_run",
 )
 
@@ -1208,32 +1219,24 @@ def process_task(task_path: Path) -> None:
             task_path.unlink()
             return
 
-        # --- MISSION TASK ROUTING ---
-        # If task type is "mission", delegate to mission_executor module
-        if task.get("type") == "mission":
-            try:
-                import sys as _m_sys
-                _m_sys.path.insert(0, _ATLAS_LIB_PATH)
-                # SSRF scan on mission prompts
-                import re as _mission_re
-                from ssrf import validate_endpoint_url as _m_validate
-                _m_urls = _mission_re.findall(r'https?://[^\s\"\'<>]+', prompt)
-                for _m_url in _m_urls:
-                    _m_validate(_m_url)
-                from mission_executor import process_mission
-                mission_result = process_mission(task, log_fn=log)
-                write_result(task_id, entity,
-                             mission_result.get("status", "error"), 0,
-                             json.dumps(mission_result, indent=2),
-                             [], False)
-                if callback_group:
-                    summary = f"Mission {task_id}: {mission_result.get('status')}"
-                    outputs = mission_result.get("outputs", {})
-                    summary += f" | {len([v for v in outputs.values() if v])}/{len(outputs)} outputs"
-                    send_telegram_result(callback_group, summary, task_id, entity)
-            except Exception as e:
-                log(f"Mission execution error: {e}")
-                write_result(task_id, entity, "error", 1, str(e), [], False)
+        # --- TASK TYPE GUARD (fail-closed) ---
+        # The host-task queue carries NO `type` field in the v2.0.0 architecture
+        # (verified 2026-05-23, session 2fa8e36e: zero producers set it — missions
+        # flow through the Atlas Bridge + SQLite, never a host-task file). The
+        # former `type=="mission"` inline path delegated to mission_executor,
+        # DELETED in the CP4 repo split (3ac53438) and gone from every repo.
+        # Removing that block without a guard would let any future or injected
+        # `type` value SILENTLY fall through to normal `claude -p` execution
+        # (codex flag). Fail-closed: reject any present `type` we don't support.
+        # See plans/host-executor-lib-security-finding-2026-05-23.md.
+        _task_type_tag = task.get("type")
+        if _task_type_tag:
+            write_result(task_id, entity, "rejected", 1,
+                         f"Unsupported task 'type' field: {_task_type_tag!r}. "
+                         f"Host-task files carry no 'type' in this architecture; "
+                         f"missions run via the Atlas Bridge, not the host queue. "
+                         f"Task rejected for safety.",
+                         [], False)
             task_path.unlink()
             return
 
