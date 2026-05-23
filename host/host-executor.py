@@ -1451,6 +1451,32 @@ def process_task(task_path: Path) -> None:
                      new_commits, pushed, str(full_output_path),
                      duration_ms, callback_group, prompt)
 
+        # Cockpit feed (1P.5 producer): emit a subagent-audit event so the
+        # Atlas Command "Agent activity" panel populates on the VPS. host-executor
+        # is the primary VPS agent-execution path (the claude -p task runner) and
+        # does NOT go through agent-runner.py, so it needs its own producer call.
+        # Missions are tracked by a separate cockpit panel (NanoClaw SQLite), so
+        # only this claude -p task path needs instrumenting for the agent feed.
+        # Fail-open and lazily imported: subagent_audit swallows all errors, so a
+        # missing/partial lib tree can never break task execution. Mirrors the
+        # bare-sys lib-path guard used above at the claude -p spawn site.
+        # See atlas-command/docs/cockpit-feeds-spec.md section 1.
+        try:
+            if _ATLAS_LIB_PATH not in sys.path:
+                sys.path.insert(0, _ATLAS_LIB_PATH)
+            from subagent_audit import log_subagent_event
+            log_subagent_event(
+                agent_name=f"host-executor:{entity}",
+                subagent_type="host-executor",
+                input_summary=prompt,
+                output_summary=result_summary,
+                duration_seconds=duration_ms / 1000.0,
+                status=status,
+                session_id=task_id,
+            )
+        except Exception:
+            pass
+
         # Audit log
         log_audit(entity, {
             "timestamp": datetime.now(timezone.utc).isoformat(),
