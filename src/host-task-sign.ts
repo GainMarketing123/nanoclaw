@@ -22,7 +22,9 @@ function sha256Hex(value: string): string {
   return createHash('sha256').update(Buffer.from(value, 'utf8')).digest('hex');
 }
 
-export function canonicalSigInput(task: HostTask): Record<string, string | number> {
+export function canonicalSigInput(
+  task: HostTask,
+): Record<string, string | number> {
   return {
     cb: sha256Hex(task.callback_group),
     ent: task.entity,
@@ -88,7 +90,42 @@ export function sign(task: HostTask, key: Buffer): string {
 }
 
 function isHexString(value: unknown): value is string {
-  return typeof value === 'string' && value.length > 0 && /^[0-9a-fA-F]+$/.test(value);
+  return (
+    typeof value === 'string' &&
+    value.length > 0 &&
+    /^[0-9a-fA-F]+$/.test(value)
+  );
+}
+
+// Fields canonicalSigInput() reads. If any is missing or a hashed string field
+// is the wrong type, sign() throws (sha256Hex -> Buffer.from(undefined)).
+// verify() must fail closed with a reason, never throw on hostile queue input
+// (cross-review F2). Mirrors the Python _validate_shape().
+const REQUIRED_STRING_FIELDS = [
+  'task_id',
+  'source_group',
+  'entity',
+  'model',
+  'project_dir',
+  'prompt',
+  'callback_group',
+  'nonce',
+] as const;
+const REQUIRED_NUMBER_FIELDS = ['tier', 'issued_at', 'expires_at'] as const;
+
+function validateShape(task: HostTask): string | null {
+  const record = task as unknown as Record<string, unknown>;
+  for (const field of REQUIRED_STRING_FIELDS) {
+    if (typeof record[field] !== 'string') {
+      return 'bad_task';
+    }
+  }
+  for (const field of REQUIRED_NUMBER_FIELDS) {
+    if (record[field] === undefined) {
+      return 'bad_task';
+    }
+  }
+  return null;
 }
 
 export function verify(
@@ -103,6 +140,14 @@ export function verify(
 
   if (!isHexString(task._sig)) {
     return { ok: false, reason: 'missing_sig' };
+  }
+
+  // Validate shape BEFORE signing so a malformed/hostile task fails closed
+  // with a reason instead of throwing inside canonicalSigInput()/sign()
+  // (cross-review F2).
+  const shapeReason = validateShape(task);
+  if (shapeReason !== null) {
+    return { ok: false, reason: shapeReason };
   }
 
   const expected = Buffer.from(sign(task, key), 'hex');

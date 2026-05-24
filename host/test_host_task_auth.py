@@ -41,6 +41,29 @@ def main() -> int:
     ok, reason = verify(missing_sig, key, now=missing_sig["issued_at"])
     assert (ok, reason) == (False, "missing_sig")
 
+    # cross-review F1: a malformed task fails closed with a reason, never raises.
+    missing_field = copy.deepcopy(task)
+    missing_field.pop("project_dir", None)
+    ok, reason = verify(missing_field, key, now=task["issued_at"])
+    assert (ok, reason) == (False, "bad_task")
+
+    non_str_field = copy.deepcopy(task)
+    non_str_field["prompt"] = 123
+    ok, reason = verify(non_str_field, key, now=task["issued_at"])
+    assert (ok, reason) == (False, "bad_task")
+
+    # cross-review F3: an upper/mixed-case hex signature still verifies.
+    upper_sig = copy.deepcopy(task)
+    upper_sig["_sig"] = upper_sig["_sig"].upper()
+    ok, reason = verify(upper_sig, key, now=task["issued_at"])
+    assert (ok, reason) == (True, "ok")
+
+    # cross-review F4: a non-hex _sig is missing_sig (strict), not bad_sig.
+    bad_hex_sig = copy.deepcopy(task)
+    bad_hex_sig["_sig"] = "+" + task["_sig"][1:]
+    ok, reason = verify(bad_hex_sig, key, now=task["issued_at"])
+    assert (ok, reason) == (False, "missing_sig")
+
     print("OK")
     return 0
 
