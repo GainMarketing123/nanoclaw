@@ -52,6 +52,13 @@ def main() -> int:
     ok, reason = verify(non_str_field, key, now=task["issued_at"])
     assert (ok, reason) == (False, "bad_task")
 
+    # cross-review round 2: a null/non-int numeric field is bad_task, not a
+    # crash (TS) or a divergent bad_sig (Python).
+    null_numeric = copy.deepcopy(task)
+    null_numeric["tier"] = None
+    ok, reason = verify(null_numeric, key, now=task["issued_at"])
+    assert (ok, reason) == (False, "bad_task")
+
     # cross-review F3: an upper/mixed-case hex signature still verifies.
     upper_sig = copy.deepcopy(task)
     upper_sig["_sig"] = upper_sig["_sig"].upper()

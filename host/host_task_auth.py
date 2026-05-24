@@ -70,7 +70,12 @@ def _validate_shape(task: Dict[str, Any]) -> Optional[str]:
         if not isinstance(task.get(field), str):
             return "bad_task"
     for field in _REQUIRED_INT_FIELDS:
-        if field not in task:
+        # Require an actual int (type is int, which excludes bool), not merely
+        # present. None/str/float would pass a presence check; Python's
+        # json.dumps tolerates them (so sign() would not raise) but the reason
+        # code would diverge from TS, which returns bad_task. Keep the two
+        # implementations in lockstep (cross-review round 2).
+        if type(task.get(field)) is not int:
             return "bad_task"
     return None
 

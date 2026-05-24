@@ -121,7 +121,11 @@ function validateShape(task: HostTask): string | null {
     }
   }
   for (const field of REQUIRED_NUMBER_FIELDS) {
-    if (record[field] === undefined) {
+    // Require an actual integer, not merely "defined" — null/string/float
+    // would pass an undefined-only check and then throw in canonicalBytes
+    // (escapeAsciiJsonString(null).length) instead of failing closed
+    // (cross-review round 2). Matches the Python `type(...) is int` check.
+    if (!Number.isInteger(record[field])) {
       return 'bad_task';
     }
   }

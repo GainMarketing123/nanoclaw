@@ -70,6 +70,16 @@ describe('host-task-sign', () => {
       reason: 'bad_task',
     });
 
+    // cross-review round 2: a null numeric field is bad_task, not a throw.
+    const nullNumeric = {
+      ...fixture.task,
+      tier: null,
+    } as unknown as HostTask;
+    expect(verify(nullNumeric, key, fixture.task.issued_at)).toEqual({
+      ok: false,
+      reason: 'bad_task',
+    });
+
     // cross-review F3: an upper/mixed-case hex signature still verifies.
     const upperSig: HostTask = {
       ...fixture.task,
