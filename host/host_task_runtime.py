@@ -92,11 +92,28 @@ class NonceCache:
             ) as tmp:
                 tmp_path = Path(tmp.name)
                 tmp.write(json.dumps(state))
+                # Durability for a security replay cache (cross-review F2): a
+                # bare os.replace is atomic but not crash-durable. fsync the data
+                # before the rename so a power-loss cannot roll the cache back and
+                # let an already-burned nonce replay.
+                tmp.flush()
+                os.fsync(tmp.fileno())
             try:
                 os.chmod(tmp_path, 0o600)
             except Exception:
                 pass
             os.replace(str(tmp_path), str(self.path))
+            # fsync the parent dir so the rename itself is durable. Best-effort:
+            # O_DIRECTORY/dir-fsync is not portable to every platform, but the
+            # host-executor runs on Linux where it works.
+            try:
+                dir_fd = os.open(str(self.path.parent), os.O_DIRECTORY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except (OSError, AttributeError):
+                pass
         except Exception:
             try:
                 if tmp_path is not None and tmp_path.exists():
@@ -106,6 +123,12 @@ class NonceCache:
 
 
 def gate_decision(task, key, now, nonce_cache, max_skew=60):
+    # Fail closed if the replay cache is missing/invalid (cross-review F3):
+    # without it we cannot check replay, so reject rather than raise into the
+    # caller's generic error path. The normal call path always passes a built
+    # NonceCache, so this only fires on a regression or out-of-band reuse.
+    if nonce_cache is None or not hasattr(nonce_cache, "is_seen"):
+        return (False, "nonce_cache_unavailable")
     ok, reason = host_task_auth.verify(task, key, now, max_skew)
     if not ok:
         return (False, reason)

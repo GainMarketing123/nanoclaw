@@ -82,6 +82,12 @@ def main():
         got = host_task_runtime.gate_decision(task, key, 2000000100, cache)
         assert_eq(got, (False, "replayed"), "recorded nonce should reject as replayed")
 
+        # F3: gate_decision fails closed (no raise) when the cache is missing/invalid
+        fresh = build_task(key)
+        none_guard = host_task_runtime.gate_decision(fresh, key, 2000000100, None)
+        assert_eq(none_guard, (False, "nonce_cache_unavailable"),
+                  "None cache should fail closed, not raise")
+
         # NonceCache persistence + prune across reload
         mixed_cache_path = td_path / "mixed-nonces.json"
         mixed_cache_path.write_text(

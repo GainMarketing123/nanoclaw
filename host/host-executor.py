@@ -1625,8 +1625,25 @@ def process_task(task_path: Path) -> None:
             if _verified_nonce is not None and _NONCE_CACHE is not None:
                 try:
                     _NONCE_CACHE.record(_verified_nonce, task["expires_at"])
-                except Exception:
-                    pass
+                except Exception as _burn_err:
+                    # SEC-1 (cross-review F1): a failed nonce burn silently
+                    # degrades replay defense. The task already executed, so a
+                    # retry would double-run (worse) — instead fail LOUD: log +
+                    # one operator alert so the degraded replay window is visible
+                    # and the operator can fix the nonce-cache disk/permissions.
+                    log(f"SECURITY: nonce burn FAILED for {task_id} "
+                        f"(nonce={_verified_nonce}): {_burn_err}. Replay defense "
+                        f"degraded for this nonce until it expires — check "
+                        f"nonce-cache disk space and permissions.")
+                    try:
+                        send_telegram_alert(
+                            f"*Host-Executor SEC-1*\n\nNonce burn FAILED for task "
+                            f"{task_id}: {_burn_err}. Replay defense degraded for "
+                            f"this task until it expires. Check the nonce-cache "
+                            f"disk space and permissions."
+                        )
+                    except Exception:
+                        pass  # alert best-effort; the loud log is the durable signal
 
 
 def write_result(
