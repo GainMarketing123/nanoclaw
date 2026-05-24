@@ -34,7 +34,10 @@ export function evaluateHostTaskRequest(
   key: Buffer,
   now: number,
 ): EvalResult {
-  if (key.length === 0) {
+  // Require the full key size the signer expects (cross-review 3a75c45 F3).
+  // loadHostTaskKey already returns empty or >=32 bytes; this also rejects a
+  // short key passed directly by any other caller before it reaches sign().
+  if (key.length < 32) {
     return { ok: false, reason: 'no_key' };
   }
 
@@ -96,10 +99,11 @@ export function evaluateHostTaskRequest(
     model,
     project_dir: realDir,
     prompt: payload.prompt,
-    callback_group:
-      typeof payload.callback_group === 'string'
-        ? payload.callback_group
-        : sourceGroup,
+    // callback_group is ALWAYS the requester's own group, never a container
+    // claim (cross-review 3a75c45 F1): the executor routes results by this
+    // field, so honoring a container-supplied value would enable cross-group
+    // result delivery / exfiltration.
+    callback_group: sourceGroup,
     nonce: randomBytes(16).toString('hex'),
     issued_at: now,
     expires_at: now + HOST_TASK_TTL_S,
@@ -137,7 +141,10 @@ export function writeSignedHostTask(task: HostTask, atlasDir: string): void {
   }
 }
 
-export function hostTaskRateOk(group: string, now: number = Date.now()): boolean {
+export function hostTaskRateOk(
+  group: string,
+  now: number = Date.now(),
+): boolean {
   const minTs = now - HOST_TASK_RATE_WINDOW_MS;
   const kept = (rateByGroup.get(group) ?? []).filter((ts) => ts > minTs);
   if (kept.length >= HOST_TASK_RATE_MAX) {

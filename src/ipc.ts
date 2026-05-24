@@ -383,21 +383,21 @@ export async function processTaskIpc(
         logger.warn({ sourceGroup }, 'host_task rejected: rate limit exceeded');
         break;
       }
-      const hostTaskResult = evaluateHostTaskRequest(
-        data,
-        sourceGroup,
-        hostTaskPolicy,
-        loadHostTaskKey(),
-        Math.floor(Date.now() / 1000),
-      );
-      if (!hostTaskResult.ok) {
-        logger.warn(
-          { sourceGroup, reason: hostTaskResult.reason },
-          'host_task rejected',
-        );
-        break;
-      }
       try {
+        const hostTaskResult = evaluateHostTaskRequest(
+          data,
+          sourceGroup,
+          hostTaskPolicy,
+          loadHostTaskKey(),
+          Math.floor(Date.now() / 1000),
+        );
+        if (!hostTaskResult.ok) {
+          logger.warn(
+            { sourceGroup, reason: hostTaskResult.reason },
+            'host_task rejected',
+          );
+          break;
+        }
         writeSignedHostTask(hostTaskResult.task, ATLAS_DIR);
         logger.info(
           {
@@ -410,9 +410,14 @@ export async function processTaskIpc(
           'host_task signed and queued',
         );
       } catch (err) {
+        // Defense-in-depth (cross-review 3a75c45 F2): loadHostTaskKey and
+        // evaluateHostTaskRequest are designed not to throw, but wrap the whole
+        // key-load + evaluate + sign + write path so any unexpected throw
+        // becomes a clean logged rejection — never an unsigned task, never an
+        // exception bubbling up to the watcher's generic error handler.
         logger.error(
           { sourceGroup, err },
-          'host_task: failed to write signed task',
+          'host_task rejected: unexpected error during evaluate/sign/write',
         );
       }
       break;

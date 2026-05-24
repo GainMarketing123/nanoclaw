@@ -31,8 +31,17 @@ export function loadHostTaskKey(etcPath?: string): Buffer {
       if (key.length >= MIN_KEY_BYTES) {
         return key;
       }
-    } catch {
-      // Try next path.
+    } catch (err) {
+      // ENOENT is the expected fail-closed case (key not provisioned on this
+      // host yet) and stays silent. Surface anything else (permission/IO) so a
+      // misconfigured secret is observable rather than silently fail-closed
+      // (cross-review cd490b3 F1).
+      const code = (err as { code?: string }).code;
+      if (code !== 'ENOENT') {
+        console.warn(
+          `host-task key: unexpected error reading ${path}: ${String(err)}`,
+        );
+      }
     }
   }
 
