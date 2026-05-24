@@ -71,23 +71,10 @@ Use Telegram Markdown (MarkdownV1):
 ## Host-Executor Delegation
 
 When you receive a coding task that involves modifying project files:
-1. Do NOT code directly in the container
-2. Write a host-executor task request JSON to /workspace/extra/atlas-state/host-tasks/pending/
-3. The request format:
-   ```json
-   {
-     "task_id": "uuid",
-     "project_dir": "/home/atlas/projects/{entity}/{project}",
-     "entity": "{entity}",
-     "prompt": "{what to do}",
-     "tier": 2,
-     "model": "sonnet",
-     "callback_group": "atlas_main",
-     "requested_at": "ISO timestamp"
-   }
-   ```
-4. Wait for the result in /workspace/extra/atlas-state/host-tasks/completed/{task-id}.json
-5. Send the result summary to the CEO
+1. Do NOT code directly in the container.
+2. Call the `request_host_task` tool with `prompt` and `project_dir` (optionally `model` and `tier`). Do NOT write a JSON file to a host-tasks folder — that path has been removed for security.
+3. The host orchestrator derives your identity from your group, assigns your entity, and enforces your group's policy (allowed project dirs, max tier, allowed models). You cannot pick another group's entity, raise your tier above policy, choose a disallowed model, or target a directory outside your allowlist — anything beyond policy is clamped or the request is rejected. You no longer generate a task_id (the orchestrator assigns it).
+4. The task runs `claude -p` on the host with full governance hooks. It is **fire-and-notify**: the result is delivered to your chat when it completes. Do NOT poll for a result file — none is mounted.
 
 ## Cross-Entity Access
 

@@ -81,31 +81,16 @@ atlas_main.
 ## Host-Executor Delegation
 
 When you receive a coding task that involves modifying project files:
-1. Do NOT code directly in the container
-2. Write a host-executor task request JSON to /workspace/extra/atlas-state/host-tasks/pending/
-3. Request format:
-   ```json
-   {
-     "task_id": "<uuid>",
-     "project_dir": "/home/atlas/projects/crownscape/<project-name>",
-     "entity": "crownscape",
-     "prompt": "<what to do>",
-     "tier": 2,
-     "model": "sonnet",
-     "callback_group": "atlas_crownscape",
-     "requested_at": "<ISO timestamp>"
-   }
-   ```
-4. Generate a unique task_id (use Bash: `uuidgen` or `python3 -c "import uuid; print(uuid.uuid4())"`)
-5. After writing the request, tell the CEO you've submitted the task
-6. The host-executor will pick it up, run `claude -p` with full hooks, and write the result to /workspace/extra/atlas-state/host-tasks/completed/<task-id>.json
-7. Check for the result file and report back
+1. Do NOT code directly in the container.
+2. Call the `request_host_task` tool with `prompt` and `project_dir` (optionally `model` and `tier`). Do NOT write a JSON file to a host-tasks folder — that path has been removed for security.
+3. The host orchestrator derives your identity from your group, assigns your entity (crownscape), and enforces your group's policy (allowed project dirs, max tier, allowed models). You cannot pick another group's entity, raise your tier above policy, choose a disallowed model, or target a directory outside your allowlist — anything beyond policy is clamped or the request is rejected. You no longer generate a task_id.
+4. The task runs `claude -p` on the host with full hooks. It is **fire-and-notify**: the result is delivered to your chat when it completes. Do NOT poll for a result file — none is mounted.
 
 ## State Paths (Container)
 
 - Crownscape projects: /workspace/extra/projects/ (RW — mounted from /home/atlas/projects/crownscape/)
 - Crownscape audit: /workspace/extra/atlas-state/audit/crownscape/ (RW)
 - Crownscape memory: /workspace/extra/atlas-state/memory/crownscape/ (RW)
-- Host tasks: /workspace/extra/atlas-state/host-tasks/ (RW)
+- Host tasks: use the `request_host_task` tool (the old RW host-tasks mount was removed for security; results arrive in chat)
 - Config: /workspace/extra/atlas-state/config.json (RO)
 - Agents: /workspace/extra/atlas-state/agents/ (RO)

@@ -39,14 +39,12 @@ NEVER auto-send:
 ## Host-Executor Delegation
 
 When you receive a coding task that involves modifying project files:
-1. Do NOT code directly in the container
-2. Write a host-executor task request JSON to /workspace/extra/atlas-state/host-tasks/pending/
-3. The request must include: task_id (UUID), project_dir, entity, prompt, tier, model, callback_group, requested_at
-4. Wait for the result in /workspace/extra/atlas-state/host-tasks/completed/{task-id}.json
-5. Send the result summary to the CEO via Telegram
+1. Do NOT code directly in the container.
+2. Call the `request_host_task` tool with `prompt` and `project_dir` (optionally `model` and `tier`). Do NOT write files to a host-tasks folder — that path has been removed for security.
+3. The host orchestrator derives your identity from your group, assigns your entity, and enforces your group's policy (allowed project dirs, max tier, allowed models). You cannot pick another group's entity, raise your tier above policy, choose a disallowed model, or target a directory outside your allowlist — anything beyond policy is clamped or the request is rejected.
+4. The task runs `claude -p` on the host with full governance hooks (PreToolUse, PostToolUse, etc.). It is **fire-and-notify**: the result is delivered to your group's chat when it completes. Do NOT poll for a result file — none is mounted.
 
-This ensures full governance hooks fire (PreToolUse, PostToolUse, etc.)
-on the host. Containers are for analysis and orchestration, not code edits.
+Containers are for analysis and orchestration, not code edits.
 
 ## Data Classification
 

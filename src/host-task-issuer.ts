@@ -1,10 +1,11 @@
 import {
   closeSync,
   fsyncSync,
+  linkSync,
   mkdirSync,
   openSync,
   realpathSync,
-  renameSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { randomBytes } from 'node:crypto';
@@ -131,7 +132,20 @@ export function writeSignedHostTask(task: HostTask, atlasDir: string): void {
   } finally {
     closeSync(fd);
   }
-  renameSync(tempPath, finalPath);
+  // Exclusive publish (cross-review 0ac2f6a F2): linkSync fails EEXIST on a
+  // task_id collision instead of silently overwriting an already-queued task
+  // the way renameSync would. TOCTOU-free. On success the final path is a
+  // hardlink to the fully-written+fsync'd temp; unlink the temp, leaving the
+  // durable final. A collision throws out to the caller's logged rejection.
+  try {
+    linkSync(tempPath, finalPath);
+  } finally {
+    try {
+      unlinkSync(tempPath);
+    } catch {
+      // temp already removed
+    }
+  }
 
   const dirFd = openSync(pendingDir, 'r');
   try {
