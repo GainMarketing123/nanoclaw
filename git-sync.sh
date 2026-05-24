@@ -383,6 +383,9 @@ if [ -d "$ATLAS_DIR/.git" ]; then
             # sudoers grant (infra/sudoers.d/atlas-rsync) pins the exact rsync
             # command and MUST be updated to -aL together with this line, or the
             # NOPASSWD match breaks and the mirror prompts for a password.
+            if [ "$ATLAS_DIR/lib/" != "/home/atlas/.atlas/lib/" ]; then
+                echo "$TIMESTAMP | WARN | atlas-lib-sync | rsync source $ATLAS_DIR/lib/ does not match the sudoers-pinned /home/atlas/.atlas/lib/ (infra/sudoers.d/atlas-rsync); the NOPASSWD match will break and the mirror below will fail (sudo cannot prompt under cron). Update the sudoers grant in lockstep before overriding ATLAS_DIR, or the prod tree goes stale and host-executor fail-closes on restart." >> "$LOG"
+            fi
             rsync_out=$(sudo rsync -aL --delete "$ATLAS_DIR/lib/" /usr/local/lib/atlas/ 2>&1)
             rsync_status=$?
             if [ $rsync_status -eq 0 ]; then
@@ -406,6 +409,12 @@ if [ -d "$ATLAS_DIR/.git" ]; then
                 # Marker NOT updated — next cron cycle's tree-hash comparison
                 # will see drift again and re-attempt automatically.
             fi
+        elif [ ! -d /usr/local/lib/atlas ] && [ -f "$RSYNC_STATE_FILE" ]; then
+            # Prod tree previously mirrored (marker exists) but the dir is now
+            # gone — this host WAS cut over. Under ATLAS_HOST_MODE=production the
+            # fail-closed resolver (_fallback_or_die) will SystemExit on the next
+            # restart. Log loud; recreation is intentionally NOT attempted here.
+            echo "$TIMESTAMP | FAIL | atlas-lib-sync | /usr/local/lib/atlas missing but rsync marker $RSYNC_STATE_FILE exists (host was cut over); host-executor will fail-closed on restart under production. Recreate the prod tree (see infra/sudoers.d/atlas-rsync header)." >> "$LOG"
         fi
         # Restart trigger (A): HEAD advanced AND lib/ changed in this pull.
         # Codex 6282087 R3 F1 BLOCKING fix: trigger (A) only fires when the
