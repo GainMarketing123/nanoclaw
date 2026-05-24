@@ -372,7 +372,18 @@ if [ -d "$ATLAS_DIR/.git" ]; then
         # block and rely on trigger (A) below for restart on lib changes.
         if [ -d /usr/local/lib/atlas ] && [ -n "$CURRENT_LIB_TREE" ] && [ "$LAST_RSYNCED_TREE" != "$CURRENT_LIB_TREE" ]; then
             rsync_attempted=1
-            rsync_out=$(sudo rsync -a --delete "$ATLAS_DIR/lib/" /usr/local/lib/atlas/ 2>&1)
+            # -aL (follow symlinks): de-symlink the lib tree into prod so the
+            # `providers` package + other shared/lib-targeted symlinks resolve
+            # as REAL files in /usr/local/lib/atlas. Under plain -a they were
+            # copied as symlinks pointing at ../shared/lib/X, which dangle in
+            # prod (shared/ is not mirrored there) — so the prod-tree probe
+            # failed and the resolver silently fell back to the user-writable
+            # tree. Required for the prod tree to be selectable once the
+            # fail-closed resolver (_fallback_or_die) is live. LOCKSTEP: the
+            # sudoers grant (infra/sudoers.d/atlas-rsync) pins the exact rsync
+            # command and MUST be updated to -aL together with this line, or the
+            # NOPASSWD match breaks and the mirror prompts for a password.
+            rsync_out=$(sudo rsync -aL --delete "$ATLAS_DIR/lib/" /usr/local/lib/atlas/ 2>&1)
             rsync_status=$?
             if [ $rsync_status -eq 0 ]; then
                 # Codex cb17ab2 R2 F2 SOFT fix: each step checked. If any

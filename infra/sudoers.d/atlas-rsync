@@ -27,4 +27,9 @@
 #   sudo rm /etc/sudoers.d/atlas-rsync
 #   sudo visudo -c
 #
-atlas ALL=(root) NOPASSWD: /usr/bin/rsync -a --delete /home/atlas/.atlas/lib/ /usr/local/lib/atlas/
+# 2026-05-23 (session 2fa8e36e): -a -> -aL (follow symlinks). The mirror now
+# de-symlinks shared/lib-targeted refs (the `providers` package etc.) into real
+# files in the root-owned prod tree, so the prod-tree import probe passes and the
+# fail-closed resolver can select it. LOCKSTEP with the rsync invocation in
+# nanoclaw/git-sync.sh. Re-install this file on the VPS (see header) when changing.
+atlas ALL=(root) NOPASSWD: /usr/bin/rsync -aL --delete /home/atlas/.atlas/lib/ /usr/local/lib/atlas/

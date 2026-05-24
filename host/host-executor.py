@@ -287,6 +287,27 @@ def _probe_lib_path(lib_path: str) -> bool:
     return True
 
 
+def _fallback_or_die(fallback: str, reason: str) -> str:
+    """Fail-closed in production: the sealed root-owned /usr/local/lib/atlas is
+    the ONLY acceptable lib source when ATLAS_HOST_MODE=production. Returning a
+    user-writable fallback (e.g. ATLAS_DIR/lib, mode 775) is a privilege
+    downgrade -- a privileged executor must not load code from a user-writable
+    tree. Refuse to start instead (codex security finding 2026-05-23 gap #1,
+    downgrade-on-failure; see host-executor-lib-security-finding-2026-05-23.md).
+    In dev/test (ATLAS_HOST_MODE unset / non-production) the fallback is intended.
+    """
+    if os.environ.get("ATLAS_HOST_MODE") == "production":
+        sys.stderr.write(
+            f"[atlas-lib-resolver] FATAL ({reason}): ATLAS_HOST_MODE=production "
+            f"requires the sealed prod tree /usr/local/lib/atlas, but it is "
+            f"unavailable/incomplete and the only alternative is the user-writable "
+            f"fallback {fallback}. Refusing to start (fail-closed). Repopulate or "
+            f"repair the prod tree, then restart.\n"
+        )
+        raise SystemExit(1)
+    return fallback
+
+
 def _resolve_atlas_lib_path() -> str:
     """Pick the prod path only if it imports cleanly in an isolated subprocess.
 
@@ -357,13 +378,13 @@ def _resolve_atlas_lib_path() -> str:
         )
         fallback = str(_lib_path)
     if not prod.is_dir():
-        return fallback
+        return _fallback_or_die(fallback, "prod tree is not a directory")
     if not all((prod / m).is_file() for m in _ATLAS_LIB_REQUIRED_MODULES):
         sys.stderr.write(
             f"[atlas-lib-resolver] {prod} present but missing required module file(s); "
             f"falling back to {fallback}\n"
         )
-        return fallback
+        return _fallback_or_die(fallback, "prod tree missing required module(s)")
     # Codex d6faf12 R2 F1 BLOCKING fix (lockstep with agent-runner.py):
     # PYTHONPATH alone only PREPENDS to sys.path; the subprocess still
     # searches global site-packages, so a transitive import satisfied by
@@ -392,7 +413,7 @@ def _resolve_atlas_lib_path() -> str:
             f"[atlas-lib-resolver] probe subprocess failed to launch under {prod} ({e}); "
             f"falling back to {fallback}\n"
         )
-        return fallback
+        return _fallback_or_die(fallback, "prod probe subprocess failed to launch")
     if result.returncode != 0:
         stderr_excerpt = (result.stderr or "").strip().replace("\n", " ")[:300]
         sys.stderr.write(
@@ -400,7 +421,7 @@ def _resolve_atlas_lib_path() -> str:
             f"(exit={result.returncode}); falling back to {fallback}. "
             f"stderr: {stderr_excerpt}\n"
         )
-        return fallback
+        return _fallback_or_die(fallback, "prod probe-import failed")
     return str(prod)
 _ATLAS_LIB_PATH = _resolve_atlas_lib_path()
 PENDING_DIR = ATLAS_DIR / "host-tasks" / "pending"
