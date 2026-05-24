@@ -434,6 +434,20 @@ IPC_DIR = NANOCLAW_DIR / "data" / "ipc" / "atlas_main" / "messages"
 POLL_INTERVAL = 5  # seconds
 TASK_TIMEOUT = 600  # 10 minutes max per task
 MAX_OUTPUT_SIZE = 50_000  # chars to keep in result summary
+
+# --- SEC-1 host-task origin auth (verify wiring; plan §12) ---
+# host_task_runtime is a sibling module in host/. Running as a script puts
+# host/ on sys.path[0], but the bootstrap shim above reorders sys.path for the
+# lib tree, so add host/ explicitly to keep the sibling import robust to CWD.
+_HOST_DIR = str(Path(__file__).resolve().parent)
+if _HOST_DIR not in sys.path:
+    sys.path.insert(0, _HOST_DIR)
+import host_task_runtime  # noqa: E402  (sibling import after sys.path setup)
+
+HOST_TASK_NONCE_PATH = ATLAS_DIR / "state" / "host-task-nonces.json"
+MAX_TASKS_PER_POLL = 20  # consumer-side flood bound (plan §12.7-D4)
+_HOST_TASK_HMAC_KEY = b""  # loaded in main(); empty => fail-closed reject all
+_NONCE_CACHE = None        # built in main()
 AUTH_ERROR_PATTERNS = ["authentication_error", "OAuth token has expired", "401", "token expired"]
 OUTAGE_ERROR_PATTERNS = [
     "500 internal server error", "502 bad gateway", "503 service",
@@ -1217,6 +1231,7 @@ def process_task(task_path: Path) -> None:
     """Process a single task request."""
     task_id = None
     entity = "unknown"
+    _verified_nonce = None  # set after the SEC-1 gate passes; drives consume-time burn
 
     try:
         task = json.loads(task_path.read_text())
@@ -1227,6 +1242,29 @@ def process_task(task_path: Path) -> None:
         tier = task.get("tier", 2)
         model = task.get("model", "sonnet")
         callback_group = task.get("callback_group", "")
+
+        # --- SEC-1 ORIGIN AUTH GATE (fail-closed; before any execution) ---
+        # Nothing below runs unless the task carries a valid host-only HMAC
+        # signature, is unexpired, and its nonce is unseen. The orchestrator is
+        # the sole legitimate signer; entity/tier/model/project_dir above are
+        # authoritative ONLY because this gate authenticates them (plan §12).
+        if not _HOST_TASK_HMAC_KEY:
+            write_result(task_id, entity, "rejected", 1,
+                         "Host-task signing key unavailable; task rejected fail-closed.",
+                         [], False)
+            log(f"REJECT {task_id}: no HMAC key (fail-closed)")
+            task_path.unlink()
+            return
+        _allow, _reason = host_task_runtime.gate_decision(
+            task, _HOST_TASK_HMAC_KEY, int(time.time()), _NONCE_CACHE)
+        if not _allow:
+            write_result(task_id, entity, "rejected", 1,
+                         f"Host-task origin auth failed: {_reason}. Task rejected.",
+                         [], False)
+            log(f"REJECT {task_id}: origin auth {_reason}")
+            task_path.unlink()
+            return
+        _verified_nonce = task["nonce"]  # gate passed -> burn at consume time (finally)
 
         log(f"Processing task {task_id} | entity={entity} tier={tier} model={model}")
         log(f"  project: {project_dir}")
@@ -1563,6 +1601,10 @@ def process_task(task_path: Path) -> None:
                      f"Task timed out after {TASK_TIMEOUT} seconds", [], False)
     except json.JSONDecodeError as e:
         log(f"Invalid task JSON in {task_path}: {e}")
+        # SEC-1 (§12.4-7): make the reject result-visible, not log-only. task_id
+        # is unparsed here, so use the file stem. No nonce burn (never verified).
+        write_result(task_path.stem, "unknown", "rejected", 1,
+                     f"Malformed task JSON; rejected. ({e})", [], False)
     except Exception as e:
         log(f"Task {task_id} error: {e}")
         write_result(task_id or "unknown", entity, "error", 1,
@@ -1575,6 +1617,16 @@ def process_task(task_path: Path) -> None:
                     task_path.unlink()
             except Exception:
                 pass
+            # SEC-1: burn the nonce at consume time (only when the file is
+            # actually consumed). Skipped on outage-hold above so a retried task
+            # is NOT mis-rejected as a replay (plan §12.4-5 / §12.5 residual).
+            # _verified_nonce is None unless the gate passed, so gate-rejected or
+            # malformed tasks never record an (untrusted) nonce.
+            if _verified_nonce is not None and _NONCE_CACHE is not None:
+                try:
+                    _NONCE_CACHE.record(_verified_nonce, task["expires_at"])
+                except Exception:
+                    pass
 
 
 def write_result(
@@ -1699,6 +1751,7 @@ def check_escalations() -> None:
 
 def main() -> None:
     global health_check_attempt, QUALITY_CHECK_TOKEN, QUALITY_CHECK_PROMPT, QUALITY_CHECK_PROMPT_SHA
+    global _HOST_TASK_HMAC_KEY, _NONCE_CACHE
     log("Atlas Host-Executor starting")
     log(f"  Watching: {PENDING_DIR}")
     log(f"  Output:   {COMPLETED_DIR}")
@@ -1765,6 +1818,46 @@ def main() -> None:
     for d in [PENDING_DIR, COMPLETED_DIR, OUTPUTS_DIR]:
         d.mkdir(parents=True, exist_ok=True)
 
+    # --- SEC-1 host-task origin auth: load HMAC key + nonce cache (fail-closed) ---
+    # The key is host-only (/etc/atlas via systemd LoadCredential). Empty key =>
+    # every task is rejected by the per-task gate (plan §12.5, A1). We log loud +
+    # alert ONCE here, but DO NOT abort: escalations/auto-push keep running.
+    _HOST_TASK_HMAC_KEY = host_task_runtime.load_hmac_key()
+    _NONCE_CACHE = host_task_runtime.NonceCache(HOST_TASK_NONCE_PATH)
+    if not _HOST_TASK_HMAC_KEY:
+        log("  Host-task origin auth: FAIL-CLOSED — HMAC key missing/empty. ALL host "
+            "tasks will be REJECTED until /etc/atlas/host-task-hmac.secret is provisioned "
+            "and the unit has LoadCredential=host-task-hmac.")
+        try:
+            send_telegram_alert(
+                "*Host-Executor SEC-1*\n\nHost-task signing key missing — ALL host tasks "
+                "are being REJECTED fail-closed. Provision /etc/atlas/host-task-hmac.secret "
+                "+ LoadCredential on the unit, then restart."
+            )
+        except Exception:
+            pass  # alert best-effort; the per-task gate enforces regardless
+    else:
+        log(f"  Host-task origin auth: enabled (key len={len(_HOST_TASK_HMAC_KEY)})")
+    # Replay-cache integrity invariant (plan §12.3): the nonce cache lives under
+    # ATLAS_DIR/state, which is RO-mounted into containers (write-untamperable).
+    # Warn loud if a future mount-topology drift ever made it group/other-writable
+    # or non-owned — replay defense would be silently degraded otherwise.
+    try:
+        _nc_dir = HOST_TASK_NONCE_PATH.parent
+        _nc_stat = _nc_dir.stat()
+        if (_nc_stat.st_mode & 0o022) or (_nc_stat.st_uid != os.getuid()):
+            log(f"  WARNING: nonce-cache dir {_nc_dir} is group/other-writable or not "
+                f"owned by uid {os.getuid()} — replay-defense integrity degraded.")
+            try:
+                send_telegram_alert(
+                    f"*Host-Executor SEC-1*\n\nNonce-cache dir {_nc_dir} is writable by a "
+                    f"non-owner — replay defense degraded. Check permissions."
+                )
+            except Exception:
+                pass
+    except Exception:
+        pass  # best-effort posture check; never block startup
+
     # Seed seen escalations with existing files (don't alert on old ones at startup)
     seen = load_seen_escalations()
     if not seen and SHARED_DIR.exists():
@@ -1800,7 +1893,7 @@ def main() -> None:
                     continue
 
             # --- Normal mode: process pending tasks ---
-            pending = sorted(PENDING_DIR.glob("*.json"))
+            pending = sorted(PENDING_DIR.glob("*.json"))[:MAX_TASKS_PER_POLL]
 
             for task_path in pending:
                 # If a task triggered outage mode, stop processing remaining tasks
