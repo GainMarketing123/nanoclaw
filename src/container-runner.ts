@@ -495,17 +495,15 @@ function buildVolumeMounts(
     readonly: false,
   });
 
-  // Writable host-tasks directory — containers can request host-executor work
-  // by writing JSON to this directory. Separate mount so the RO ~/.atlas
-  // doesn't block host-task delegation.
-  const hostTasksDir = path.join(ATLAS_STATE_DIR, 'host-tasks');
-  fs.mkdirSync(path.join(hostTasksDir, 'pending'), { recursive: true });
-  fs.mkdirSync(path.join(hostTasksDir, 'completed'), { recursive: true });
-  mounts.push({
-    hostPath: hostTasksDir,
-    containerPath: '/workspace/extra/atlas-state/host-tasks',
-    readonly: false,
-  });
+  // SEC-1: the shared RW host-tasks mount was REMOVED here. It previously
+  // mounted ATLAS_STATE_DIR/host-tasks read-write into EVERY container, which
+  // let any container write any pending task and read ALL groups' completed
+  // results (cross-group leak + origin-auth hole). Containers now request host
+  // work via the request_host_task MCP tool, which writes to the group's OWN
+  // /workspace/ipc/tasks/; the orchestrator validates against a host-only
+  // policy, assigns entity, clamps tier/model, HMAC-signs, and writes pending/.
+  // Results are delivered to the group's chat (send_telegram_result), not read
+  // from a shared folder. See plan §5 + §14.
 
   // Per-group Claude sessions directory (isolated from other groups)
   // Each group gets their own .claude/ to prevent cross-group session access

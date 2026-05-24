@@ -11,7 +11,7 @@ import os from 'os';
 import path from 'path';
 import pino from 'pino';
 
-import { HOME_DIR, MOUNT_ALLOWLIST_PATH } from './config.js';
+import { DATA_DIR, HOME_DIR, MOUNT_ALLOWLIST_PATH } from './config.js';
 import { AdditionalMount, AllowedRoot, MountAllowlist } from './types.js';
 
 const logger = pino({
@@ -324,6 +324,19 @@ export function validateMount(
     return {
       allowed: false,
       reason: `Host path does not exist: "${mount.hostPath}" (expanded: "${expandedPath}")`,
+    };
+  }
+
+  // SEC-1 hardening #6: never allow an additional mount whose HOST path is a
+  // per-group IPC root (DATA_DIR/ipc/...). The per-group IPC directory is the
+  // unforgeable identity anchor (directory = identity); remounting another
+  // group's IPC root via the allowlist would defeat origin authentication.
+  // Hard reject regardless of allowlist.
+  const ipcRoot = path.join(DATA_DIR, 'ipc');
+  if (realPath === ipcRoot || realPath.startsWith(ipcRoot + path.sep)) {
+    return {
+      allowed: false,
+      reason: `Host path "${realPath}" is under the per-group IPC root "${ipcRoot}"; remounting IPC directories is forbidden (SEC-1 hardening #6)`,
     };
   }
 
