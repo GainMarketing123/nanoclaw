@@ -1,35 +1,56 @@
-# Phase 3.0 (1.A.6) — atlas-rsync sudoers grant
+# atlas-rsync sudoers grant (filename retained for install-path continuity:
+# /etc/sudoers.d/atlas-rsync). Superseded the raw-rsync grant on 2026-05-24.
 #
-# Allows the unprivileged atlas user to mirror atlas lib code into
-# root-owned /usr/local/lib/atlas via the rsync invocation in
-# nanoclaw/git-sync.sh. The grant is locked to the exact command line —
-# any deviation (other source/dest, other flags) requires a password.
-# Atlas user has no general sudo elsewhere; this is the narrowest grant
-# that lets the daily git-sync mirror the lib without opening the door
-# to broader privilege escalation.
+# Lets the unprivileged atlas user refresh the root-owned, chattr+i-sealed
+# production lib tree /usr/local/lib/atlas from the atlas-core source tree, via a
+# SINGLE pinned wrapper with NO arguments. Any deviation from the exact command
+# requires a password. Atlas has no other sudo; this is the narrowest grant that
+# lets the scheduled git-sync mirror the lib while keeping the anti-tamper seal
+# intact.
 #
-# Why root-owned destination: Phase 3.1+ will chattr +i seal
-# /usr/local/lib/atlas to block tamper from a compromised atlas account.
-# The seal works only if the directory + contents are root-owned; rsync
-# under sudo writes as root, preserving that ownership invariant.
+# 2026-05-24 (session 3969d6a0 follow-up — git-sync 3-copy reconciliation).
+# The prior grant was a raw `rsync -aL --delete /home/atlas/.atlas/lib/
+# /usr/local/lib/atlas/`. Two problems forced this change:
+#   (1) gap-2 sealed the prod tree with `chattr -R +i`, so a raw `rsync --delete`
+#       into it now FAILS (immutable files). The mirror needs unseal -> rsync ->
+#       reseal, which rsync alone cannot do.
+#   (2) granting atlas a raw `chattr -i` verb would let a compromised atlas
+#       account unseal the prod tree at will, defeating the seal.
+# Fix: grant atlas NOPASSWD on a single root-owned wrapper that performs the
+# whole unseal -> rsync (from a root-only staging tree, only AFTER an import-probe
+# passes) -> reseal -> verify cycle, fail-closed. Atlas can trigger the exact
+# sanctioned cycle but cannot run arbitrary chattr/rsync, and never sees the
+# unsealed tree as writable (prod stays root:root throughout the brief window).
 #
-# Install on the VPS (one-time Phase 3.0 cutover step, requires real root):
+# WRAPPER INTEGRITY IS LOAD-BEARING: the wrapper MUST be installed root:root 0755
+# in the root-only dir /usr/local/libexec/atlas AND sealed `chattr +i`. If atlas
+# can modify the wrapper, this grant degrades to arbitrary-root-exec. Wrapper
+# source of truth: atlas-engineering scripts/mirror-lib.sh. Invoked by the
+# scheduled atlas-engineering scripts/git-sync.sh (deployed to
+# /home/atlas/git-sync.sh). Full runbook + threat notes:
+# ~/.atlas/plans/host-executor-lib-security-finding-2026-05-23.md §10.
 #
-#   sudo install -d -m 755 -o root -g root /usr/local/lib/atlas
-#   sudo install -m 440 -o root -g root \
+# Why root-owned destination: the seal works only if the dir + contents are
+# root-owned; the wrapper's rsync runs as root, preserving that invariant.
+#
+# Install on the VPS (supervised root step, requires real root / docker-root):
+#
+#   install -d -m 755 -o root -g root /usr/local/libexec/atlas
+#   install -m 0755 -o root -g root \
+#       /home/atlas/.atlas/scripts/mirror-lib.sh \
+#       /usr/local/libexec/atlas/mirror-lib.sh
+#   chattr +i /usr/local/libexec/atlas/mirror-lib.sh
+#   install -m 440 -o root -g root \
 #       /home/atlas/nanoclaw/infra/sudoers.d/atlas-rsync \
 #       /etc/sudoers.d/atlas-rsync
-#   sudo visudo -c                              # validate, must report OK
-#   sudo -u atlas sudo -n rsync --version >/dev/null && echo OK   # smoke test
+#   visudo -c                                   # validate, must report OK
+#   sudo -u atlas sudo -n /usr/local/libexec/atlas/mirror-lib.sh; echo "rc=$?"  # smoke
 #
 # Removal (rollback):
 #
-#   sudo rm /etc/sudoers.d/atlas-rsync
-#   sudo visudo -c
+#   rm /etc/sudoers.d/atlas-rsync
+#   chattr -i /usr/local/libexec/atlas/mirror-lib.sh
+#   rm /usr/local/libexec/atlas/mirror-lib.sh
+#   visudo -c
 #
-# 2026-05-23 (session 2fa8e36e): -a -> -aL (follow symlinks). The mirror now
-# de-symlinks shared/lib-targeted refs (the `providers` package etc.) into real
-# files in the root-owned prod tree, so the prod-tree import probe passes and the
-# fail-closed resolver can select it. LOCKSTEP with the rsync invocation in
-# nanoclaw/git-sync.sh. Re-install this file on the VPS (see header) when changing.
-atlas ALL=(root) NOPASSWD: /usr/bin/rsync -aL --delete /home/atlas/.atlas/lib/ /usr/local/lib/atlas/
+atlas ALL=(root) NOPASSWD: /usr/local/libexec/atlas/mirror-lib.sh

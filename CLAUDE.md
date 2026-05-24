@@ -38,11 +38,11 @@ The README + `docs/REQUIREMENTS.md` are the deeper architecture references.
 ## Dependencies
 
 - **Atlas paths quartet:** byte-identical `lib/atlas_paths.py` shared with atlas-engineering, atlas-operations, atlas-shared. Drift breaks production fail-close semantics.
-- **VPS `/usr/local/lib/atlas`:** root-owned mirror of `~/.atlas/lib` populated by `git-sync.sh`. Module-level `_ATLAS_LIB_PATH` prefers this when complete.
+- **VPS `/usr/local/lib/atlas`:** root-owned, `chattr +i`-sealed mirror of `~/.atlas/lib`, refreshed by the root-owned wrapper `/usr/local/libexec/atlas/mirror-lib.sh` (which the scheduled atlas-engineering `git-sync.sh` invokes via a pinned sudoers grant). Module-level `_ATLAS_LIB_PATH` prefers this when complete; fail-closes in production if it's incomplete.
 - **Atlas Bridge** (HTTP): Paperclip integration, constraint enforcement, security evaluation. Missions traverse the bridge before approval.
 - **Systemd:** `atlas-host-executor.service` (host-executor), `atlas-mission-control.service` (atlas-command dashboard), `nanoclaw` (orchestrator).
 - **GitHub deploy keys** (Phase 3.2): two ed25519 keys, one per repo per GitHub policy. Replace the gateway-era shared key.
-- **Sudoers grant:** `infra/sudoers.d/atlas-rsync` — narrow grant for `git-sync.sh` to rsync `~/.atlas/lib` → `/usr/local/lib/atlas`.
+- **Sudoers grant:** `infra/sudoers.d/atlas-rsync` — narrow `NOPASSWD` grant for the scheduled `git-sync.sh` to run the root-owned, `chattr +i`-sealed wrapper `/usr/local/libexec/atlas/mirror-lib.sh` (no args), which does the seal-aware unseal→rsync→reseal mirror of `~/.atlas/lib` → `/usr/local/lib/atlas`. (Superseded the raw-rsync grant 2026-05-24; the scheduled script is atlas-engineering `scripts/git-sync.sh`, NOT this repo's now-retired `git-sync.sh` stub.)
 
 ## Key Decisions
 
