@@ -29,7 +29,11 @@ describe('host-task-key', () => {
     const dir = makeTempDir('host-task-key-valid-');
     cleanupPaths.push(dir);
     const key = Buffer.alloc(32, 0xab);
-    writeFileSync(join(dir, 'host-task-hmac'), key.toString('hex') + '\n', 'utf8');
+    writeFileSync(
+      join(dir, 'host-task-hmac'),
+      key.toString('hex') + '\n',
+      'utf8',
+    );
     process.env.CREDENTIALS_DIRECTORY = dir;
 
     expect(loadHostTaskKey(join(dir, 'unused-fallback.secret'))).toEqual(key);
@@ -41,7 +45,9 @@ describe('host-task-key', () => {
     writeFileSync(join(dir, 'host-task-hmac'), 'zz11', 'utf8');
     process.env.CREDENTIALS_DIRECTORY = dir;
 
-    expect(loadHostTaskKey(join(dir, 'missing.secret'))).toEqual(Buffer.alloc(0));
+    expect(loadHostTaskKey(join(dir, 'missing.secret'))).toEqual(
+      Buffer.alloc(0),
+    );
   });
 
   it('returns empty buffer for odd-length hex input', () => {
@@ -50,16 +56,24 @@ describe('host-task-key', () => {
     writeFileSync(join(dir, 'host-task-hmac'), 'abc', 'utf8');
     process.env.CREDENTIALS_DIRECTORY = dir;
 
-    expect(loadHostTaskKey(join(dir, 'missing.secret'))).toEqual(Buffer.alloc(0));
+    expect(loadHostTaskKey(join(dir, 'missing.secret'))).toEqual(
+      Buffer.alloc(0),
+    );
   });
 
   it('returns empty buffer for decoded key shorter than 32 bytes', () => {
     const dir = makeTempDir('host-task-key-short-');
     cleanupPaths.push(dir);
-    writeFileSync(join(dir, 'host-task-hmac'), Buffer.alloc(31, 0x11).toString('hex'), 'utf8');
+    writeFileSync(
+      join(dir, 'host-task-hmac'),
+      Buffer.alloc(31, 0x11).toString('hex'),
+      'utf8',
+    );
     process.env.CREDENTIALS_DIRECTORY = dir;
 
-    expect(loadHostTaskKey(join(dir, 'missing.secret'))).toEqual(Buffer.alloc(0));
+    expect(loadHostTaskKey(join(dir, 'missing.secret'))).toEqual(
+      Buffer.alloc(0),
+    );
   });
 
   it('returns empty buffer when no key file exists', () => {
@@ -67,7 +81,9 @@ describe('host-task-key', () => {
     cleanupPaths.push(dir);
     process.env.CREDENTIALS_DIRECTORY = dir;
 
-    expect(loadHostTaskKey(join(dir, 'missing.secret'))).toEqual(Buffer.alloc(0));
+    expect(loadHostTaskKey(join(dir, 'missing.secret'))).toEqual(
+      Buffer.alloc(0),
+    );
   });
 
   it('uses etcPath override when CREDENTIALS_DIRECTORY is unset', () => {

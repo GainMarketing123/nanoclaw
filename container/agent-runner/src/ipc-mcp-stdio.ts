@@ -376,6 +376,63 @@ Use available_groups.json to find the JID for a group. The folder name must be c
   },
 );
 
+server.tool(
+  'request_host_task',
+  `Request a host-level task: a full Claude agent run on the VPS HOST (not in this container) in a project directory your group is authorized for. Use this for code/maintenance work that must run on the host with full tooling.
+
+The host orchestrator derives your identity from your group, assigns your entity, and enforces your group's policy: you CANNOT pick another group's entity, raise your tier beyond policy, choose a model outside your allowlist, or target a directory outside your allowlist. You may request a LOWER tier or a cheaper allowed model; anything beyond policy is clamped. The result is delivered back to your group only.`,
+  {
+    prompt: z
+      .string()
+      .describe(
+        'What the host agent should do. Include all necessary context — it runs in a fresh host session.',
+      ),
+    project_dir: z
+      .string()
+      .describe(
+        'Absolute path to the project directory to run in. Must be within your group policy allowlist, else the request is rejected.',
+      ),
+    model: z
+      .string()
+      .optional()
+      .describe(
+        'Requested model (e.g. "sonnet", "haiku"). Clamped to your policy; substituted with the policy default if not allowed.',
+      ),
+    tier: z
+      .number()
+      .int()
+      .optional()
+      .describe(
+        'Requested tier (1=read-only, 2+=write/worktree). Clamped to your policy max_tier. Defaults to your max_tier.',
+      ),
+  },
+  async (args) => {
+    // entity and callback_group are NOT settable here — the orchestrator
+    // assigns entity from policy and always routes the result back to this
+    // group. The container can only express the request parameters below.
+    const data = {
+      type: 'host_task',
+      prompt: args.prompt,
+      project_dir: args.project_dir,
+      model: args.model,
+      tier: args.tier,
+      requestedBy: groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(TASKS_DIR, data);
+
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: `Host task requested in ${args.project_dir}. The orchestrator will validate it against your group policy, sign it, and run it on the host; the result returns to your group.`,
+        },
+      ],
+    };
+  },
+);
+
 // Start the stdio transport
 const transport = new StdioServerTransport();
 await server.connect(transport);
