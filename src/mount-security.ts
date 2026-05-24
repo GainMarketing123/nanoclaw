@@ -332,11 +332,19 @@ export function validateMount(
   // unforgeable identity anchor (directory = identity); remounting another
   // group's IPC root via the allowlist would defeat origin authentication.
   // Hard reject regardless of allowlist.
-  const ipcRoot = path.join(DATA_DIR, 'ipc');
-  if (realPath === ipcRoot || realPath.startsWith(ipcRoot + path.sep)) {
+  // Canonicalize the IPC root too (cross-review ed38ebb): realPath is already
+  // realpath-resolved, so comparing it against a non-canonical DATA_DIR/ipc
+  // string would MISS a match when DATA_DIR resolves through a symlink — a
+  // real bypass on hosts with symlinked paths. getRealPath returns null if the
+  // dir does not exist yet (nothing to protect → skip the guard).
+  const realIpcRoot = getRealPath(path.join(DATA_DIR, 'ipc'));
+  if (
+    realIpcRoot !== null &&
+    (realPath === realIpcRoot || realPath.startsWith(realIpcRoot + path.sep))
+  ) {
     return {
       allowed: false,
-      reason: `Host path "${realPath}" is under the per-group IPC root "${ipcRoot}"; remounting IPC directories is forbidden (SEC-1 hardening #6)`,
+      reason: `Host path "${realPath}" is under the per-group IPC root "${realIpcRoot}"; remounting IPC directories is forbidden (SEC-1 hardening #6)`,
     };
   }
 
