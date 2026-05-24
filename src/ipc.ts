@@ -3,13 +3,20 @@ import path from 'path';
 
 import { CronExpressionParser } from 'cron-parser';
 
-import { DATA_DIR, IPC_POLL_INTERVAL, TIMEZONE } from './config.js';
+import { ATLAS_DIR, DATA_DIR, IPC_POLL_INTERVAL, TIMEZONE } from './config.js';
 import { resolveGroupIpcPath } from './group-folder.js';
 import { AvailableGroup } from './container-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
 import { RegisteredGroup } from './types.js';
+import { loadHostTaskKey } from './host-task-key.js';
+import { policyForGroup } from './host-task-policy.js';
+import {
+  evaluateHostTaskRequest,
+  writeSignedHostTask,
+  hostTaskRateOk,
+} from './host-task-issuer.js';
 
 export interface IpcDeps {
   sendMessage: (jid: string, text: string) => Promise<void>;
@@ -355,6 +362,61 @@ export async function processTaskIpc(
         );
       }
       break;
+
+    case 'host_task': {
+      // SEC-1 trusted producer (plan §13.3). Identity = sourceGroup
+      // (directory-derived, unforgeable). entity is policy-assigned; tier/model
+      // are container-requestable but policy-bounded; project_dir is realpath-
+      // checked against the policy allowlist; signed with the host-only key the
+      // host-executor verifier reads; atomic+fsync write to the shared queue.
+      // All security logic lives in src/host-task-issuer.ts (unit-tested); this
+      // case is thin wiring: policy lookup -> rate-limit -> evaluate -> write.
+      const hostTaskPolicy = policyForGroup(sourceGroup);
+      if (!hostTaskPolicy) {
+        logger.warn(
+          { sourceGroup },
+          'host_task rejected: no host-task policy for group (fail-closed)',
+        );
+        break;
+      }
+      if (!hostTaskRateOk(sourceGroup)) {
+        logger.warn({ sourceGroup }, 'host_task rejected: rate limit exceeded');
+        break;
+      }
+      const hostTaskResult = evaluateHostTaskRequest(
+        data,
+        sourceGroup,
+        hostTaskPolicy,
+        loadHostTaskKey(),
+        Math.floor(Date.now() / 1000),
+      );
+      if (!hostTaskResult.ok) {
+        logger.warn(
+          { sourceGroup, reason: hostTaskResult.reason },
+          'host_task rejected',
+        );
+        break;
+      }
+      try {
+        writeSignedHostTask(hostTaskResult.task, ATLAS_DIR);
+        logger.info(
+          {
+            taskId: hostTaskResult.task.task_id,
+            sourceGroup,
+            entity: hostTaskResult.task.entity,
+            tier: hostTaskResult.task.tier,
+            model: hostTaskResult.task.model,
+          },
+          'host_task signed and queued',
+        );
+      } catch (err) {
+        logger.error(
+          { sourceGroup, err },
+          'host_task: failed to write signed task',
+        );
+      }
+      break;
+    }
 
     case 'pause_task':
       if (data.taskId) {
