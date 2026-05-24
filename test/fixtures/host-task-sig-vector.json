@@ -1,0 +1,20 @@
+{
+  "key_hex": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+  "task": {
+    "task_id": "task-0001",
+    "source_group": "group-alpha",
+    "entity": "crownscape",
+    "tier": 2,
+    "model": "claude-sonnet-4-5",
+    "project_dir": "/srv/projects/crownscape-app",
+    "prompt": "Café plan ✓",
+    "callback_group": "group-alpha",
+    "nonce": "0123456789abcdef0123456789abcdef",
+    "issued_at": 1760000000,
+    "expires_at": 1760003600,
+    "schema_version": "ht1",
+    "_sig": "fe1c524604b1a7039263bcfe19995c138ea4aa84e260914ab27eb35143b649b8"
+  },
+  "expected_canonical": "{\"cb\":\"90adb9befe77f6fe14209a539e0762ab5b746efc1a1e095dc8b07a6f70bb4ecc\",\"ent\":\"crownscape\",\"exp\":1760003600,\"grp\":\"group-alpha\",\"iat\":1760000000,\"model\":\"claude-sonnet-4-5\",\"nonce\":\"0123456789abcdef0123456789abcdef\",\"pdir\":\"e32cea27f420cd069bbc5da5e357b74d02090b7efa4535ce37a5a7aab14a6835\",\"ph\":\"751cfffe94909951c9e86662bee7c7e46a38af3fc363bc6107fe7dddf78350ba\",\"tid\":\"task-0001\",\"tier\":2,\"v\":\"ht1\"}",
+  "expected_sig": "fe1c524604b1a7039263bcfe19995c138ea4aa84e260914ab27eb35143b649b8"
+}
