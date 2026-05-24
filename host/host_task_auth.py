@@ -107,13 +107,9 @@ def verify(
     if not hmac.compare_digest(computed, sig.lower()):
         return (False, "bad_sig")
 
-    if (
-        type(task.get("tier")) is not int
-        or type(task.get("issued_at")) is not int
-        or type(task.get("expires_at")) is not int
-    ):
-        return (False, "bad_types")
-
+    # Numeric type validation lives in _validate_shape() (pre-sign), so by
+    # here tier/issued_at/expires_at are already ints. No separate bad_types
+    # branch — it was unreachable dead code (cross-review round 3).
     if now > task["expires_at"]:
         return (False, "expired")
 

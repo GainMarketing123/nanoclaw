@@ -160,14 +160,9 @@ export function verify(
     return { ok: false, reason: 'bad_sig' };
   }
 
-  if (
-    !Number.isInteger(task.tier) ||
-    !Number.isInteger(task.issued_at) ||
-    !Number.isInteger(task.expires_at)
-  ) {
-    return { ok: false, reason: 'bad_types' };
-  }
-
+  // Numeric type validation lives in validateShape() (pre-sign), so by here
+  // tier/issued_at/expires_at are already integers. No separate bad_types
+  // branch — it was unreachable dead code (cross-review round 3).
   if (now > task.expires_at) {
     return { ok: false, reason: 'expired' };
   }
