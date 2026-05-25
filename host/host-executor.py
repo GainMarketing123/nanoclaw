@@ -444,7 +444,12 @@ if _HOST_DIR not in sys.path:
     sys.path.insert(0, _HOST_DIR)
 import host_task_runtime  # noqa: E402  (sibling import after sys.path setup)
 
-HOST_TASK_NONCE_PATH = ATLAS_DIR / "state" / "host-task-nonces.json"
+# SEC-1 follow-up (2026-05-25): dedicated owner-only subdir for the replay-nonce
+# cache. ATLAS_DIR/state is shared + group-writable (atlas:atlas-svc 775), which
+# tripped the executor's own replay-defense integrity check below (the cache dir
+# must be owned by this uid and NOT group/other-writable). NonceCache mkdir's this
+# parent at mode 0700 owned by the executor uid, satisfying the invariant.
+HOST_TASK_NONCE_PATH = ATLAS_DIR / "state" / "host-task-auth" / "host-task-nonces.json"
 MAX_TASKS_PER_POLL = 20  # consumer-side flood bound (plan §12.7-D4)
 _HOST_TASK_HMAC_KEY = b""  # loaded in main(); empty => fail-closed reject all
 _NONCE_CACHE = None        # built in main()
