@@ -356,6 +356,134 @@ function writeContainerSettings(settingsFile: string): void {
   try {
     const hostSettings = JSON.parse(fs.readFileSync(hostSettingsPath, 'utf-8'));
 
+    // SECURITY GATE: validate the host settings.json against the Atlas
+    // enforcement manifest BEFORE propagating it into this container. The host
+    // file is supposed to be rendered + parity-checked by git-sync.sh's deploy
+    // step (~/.atlas/scripts/git-sync.sh + validate-settings-parity.py); this
+    // is the belt-and-suspenders check at the actual execution boundary, so an
+    // out-of-band edit that bypassed the deploy still cannot strip enforcement
+    // hooks from the container.
+    //
+    // On parity FAILURE: refuse to regenerate this container's settings, keep
+    // the previous per-group settings file (if any) live so existing containers
+    // do not degrade to no-hooks, and do NOT update the .source-mtime marker so
+    // the next spawn re-checks. Early-return (not throw) — the catch handler
+    // below strips ALL hooks on JSON/IO errors and must NOT fire for a parity
+    // refusal.
+    // Use the env-aware ATLAS_STATE_DIR (aliased to ATLAS_DIR in config) so this
+    // resolves correctly on the VPS where nanoclaw runs as a non-atlas service
+    // user — os.homedir() would resolve to the service user's home, not the
+    // atlas user's, silently defeating the gate. Same env-aware pattern the
+    // rest of this file uses (e.g. HOST_CLAUDE_DIR for settings.json).
+    const manifestPath = path.join(
+      ATLAS_STATE_DIR,
+      'enforcement-manifest.json',
+    );
+    let parityFailure: string | null = null;
+    let manifestRequired: Array<{
+      event: string;
+      matcher?: string;
+      script: string;
+    }> | null = null;
+    try {
+      // Narrow catch: ONLY manifest read+parse failures land here. Log loudly
+      // (on production VPS this is a deploy regression worth chasing) and let
+      // manifestRequired stay null so the check is SKIPPED below. Refusing
+      // spawn over a manifest hiccup would DoS the autonomous engine for what
+      // the deploy step (git-sync.sh + validate-settings-parity.py) is supposed
+      // to catch upstream. Iteration errors over hostSettings.hooks are handled
+      // defensively below — they do NOT land here.
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8')) as {
+        required_hooks?: Array<{
+          event: string;
+          matcher?: string;
+          script: string;
+        }>;
+      };
+      if (Array.isArray(manifest.required_hooks)) {
+        manifestRequired = manifest.required_hooks;
+      }
+    } catch (err) {
+      logger.warn(
+        {
+          event: 'enforcement_manifest_unavailable',
+          manifestPath,
+          message: (err as Error).message,
+        },
+        'Atlas enforcement manifest unreadable — container-spawn parity check SKIPPED. Not blocking spawn to avoid DoS; investigate the manifest deploy state.',
+      );
+    }
+
+    if (manifestRequired && manifestRequired.length > 0) {
+      // Build the required set as (event, matcher, atlas-relative path).
+      const requiredKeys = new Set<string>();
+      for (const req of manifestRequired) {
+        const script = req.script ?? '';
+        const rel = script.includes('/') ? script : `hooks/${script}`;
+        requiredKeys.add(`${req.event}|${req.matcher ?? ''}|${rel}`);
+      }
+      // Build the registered set DEFENSIVELY: any malformed shape in
+      // hostSettings.hooks contributes NOTHING, so the corresponding required
+      // keys flag as missing -> parityFailure -> fail-CLOSED refuse. Codex
+      // 2026-05-28 round-2 BLOCKING finding: the previous broad try/catch
+      // swallowed a TypeError on non-array hooks[event] as "manifest
+      // unavailable" and fell through fail-open. Every nested level is now
+      // type-checked before iteration.
+      const registeredKeys = new Set<string>();
+      const hostHooks =
+        hostSettings &&
+        typeof hostSettings.hooks === 'object' &&
+        hostSettings.hooks !== null
+          ? (hostSettings.hooks as Record<string, unknown>)
+          : {};
+      for (const [event, entries] of Object.entries(hostHooks)) {
+        if (!Array.isArray(entries)) continue;
+        for (const entry of entries) {
+          if (!entry || typeof entry !== 'object') continue;
+          const matcher = (entry as { matcher?: string }).matcher ?? '';
+          const hooks = (entry as { hooks?: unknown }).hooks;
+          if (!Array.isArray(hooks)) continue;
+          for (const hook of hooks) {
+            if (!hook || typeof hook !== 'object') continue;
+            const cmd = (hook as { command?: string }).command ?? '';
+            let rel: string;
+            const idx = cmd.indexOf('/.atlas/');
+            if (idx >= 0) {
+              rel = cmd
+                .substring(idx + '/.atlas/'.length)
+                .split(/\s+/)[0]
+                .replace(/\\/g, '/');
+            } else {
+              rel = cmd.trim();
+            }
+            registeredKeys.add(`${event}|${matcher}|${rel}`);
+          }
+        }
+      }
+      const missing: string[] = [];
+      for (const key of requiredKeys) {
+        if (!registeredKeys.has(key)) missing.push(key);
+      }
+      if (missing.length > 0) {
+        parityFailure = `host settings.json missing ${missing.length} required hook(s): ${missing
+          .slice(0, 3)
+          .join('; ')}${missing.length > 3 ? '; ...' : ''}`;
+      }
+    }
+
+    if (parityFailure) {
+      logger.warn(
+        {
+          event: 'container_settings_parity_refused',
+          detail: parityFailure,
+          settingsFile,
+          hostSettingsPath,
+        },
+        'Refusing to propagate host settings.json — manifest parity check failed at container-spawn. Keeping previous per-group settings file (if any) live; .source-mtime NOT updated so the next spawn re-checks.',
+      );
+      return;
+    }
+
     // Deep-clone hooks and rewrite all command paths
     const containerHooks: Record<string, unknown[]> = {};
     if (hostSettings.hooks && typeof hostSettings.hooks === 'object') {
