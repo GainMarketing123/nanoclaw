@@ -56,8 +56,9 @@ export function buildInboundMessage(activity: Partial<Activity>): {
   const timestamp = new Date().toISOString();
   const senderName = activity.from?.name ?? activity.from?.id ?? 'Unknown';
   // Teams "personal" conversations are 1:1; "groupChat"/"channel" are groups.
-  const conversationType = (activity.conversation as { conversationType?: string })
-    ?.conversationType;
+  const conversationType = (
+    activity.conversation as { conversationType?: string }
+  )?.conversationType;
   const isGroup =
     conversationType === 'groupChat' || conversationType === 'channel';
   const chatName = activity.conversation?.name ?? senderName;
@@ -92,7 +93,8 @@ function toBotResponse(res: http.ServerResponse): {
 } {
   return {
     socket: res.socket,
-    end: (...args: unknown[]) => (res.end as (...a: unknown[]) => unknown)(...args),
+    end: (...args: unknown[]) =>
+      (res.end as (...a: unknown[]) => unknown)(...args),
     header: (name: string, value: unknown) =>
       res.setHeader(name, value as string | number | string[]),
     send: (body?: unknown) => {
@@ -123,7 +125,10 @@ export class TeamsChannel implements Channel {
   private server: http.Server | null = null;
   private connected = false;
   // chatJid -> conversation reference, for proactive (outbound) sends.
-  private readonly references = new Map<string, Partial<ConversationReference>>();
+  private readonly references = new Map<
+    string,
+    Partial<ConversationReference>
+  >();
 
   constructor(
     appId: string,
@@ -141,6 +146,11 @@ export class TeamsChannel implements Channel {
 
   async connect(): Promise<void> {
     const auth = new ConfigurationBotFrameworkAuthentication({
+      // Single-tenant is mandatory: Microsoft deprecated multi-tenant bot
+      // creation after 2025-07-31, and all businesses share one M365 tenant.
+      // Without MicrosoftAppType the SDK assumes multi-tenant and token
+      // acquisition mismatches the single-tenant app registration (401s).
+      MicrosoftAppType: 'SingleTenant',
       MicrosoftAppId: this.appId,
       MicrosoftAppPassword: this.appPassword,
       MicrosoftAppTenantId: this.tenantId,
@@ -240,19 +250,29 @@ export class TeamsChannel implements Channel {
     );
     this.opts.onMessage(chatJid, message);
 
-    logger.info({ chatJid, sender: message.sender_name }, 'Teams message stored');
+    logger.info(
+      { chatJid, sender: message.sender_name },
+      'Teams message stored',
+    );
   }
 
   async sendMessage(jid: string, text: string): Promise<void> {
     const ref = this.references.get(jid);
     if (!this.adapter || !ref) {
-      logger.warn({ jid }, 'Teams: no saved conversation reference; cannot send');
+      logger.warn(
+        { jid },
+        'Teams: no saved conversation reference; cannot send',
+      );
       return;
     }
     try {
-      await this.adapter.continueConversationAsync(this.appId, ref, async (ctx) => {
-        await ctx.sendActivity(text);
-      });
+      await this.adapter.continueConversationAsync(
+        this.appId,
+        ref,
+        async (ctx) => {
+          await ctx.sendActivity(text);
+        },
+      );
       logger.info({ jid, length: text.length }, 'Teams message sent');
     } catch (err) {
       logger.error({ jid, err }, 'Failed to send Teams message');
@@ -286,9 +306,13 @@ export class TeamsChannel implements Channel {
     });
 
     try {
-      await this.adapter.continueConversationAsync(this.appId, ref, async (ctx) => {
-        await ctx.sendActivity({ attachments: [card] });
-      });
+      await this.adapter.continueConversationAsync(
+        this.appId,
+        ref,
+        async (ctx) => {
+          await ctx.sendActivity({ attachments: [card] });
+        },
+      );
       logger.info(
         { jid, buttonCount: buttons.flat().length },
         'Teams message with keyboard sent',
@@ -336,8 +360,10 @@ registerChannel('teams', (opts: ChannelOpts) => {
   const port = Number(
     process.env.TEAMS_ADAPTER_PORT || env.TEAMS_ADAPTER_PORT || 3978,
   );
-  if (!appId || !appPassword) {
-    logger.warn('Teams: MICROSOFT_APP_ID/PASSWORD not set — skipping');
+  if (!appId || !appPassword || !tenantId) {
+    logger.warn(
+      'Teams: MICROSOFT_APP_ID / MICROSOFT_APP_PASSWORD / TEAMS_BOT_TENANT_ID not all set — skipping (single-tenant bots require the tenant id)',
+    );
     return null;
   }
   return new TeamsChannel(appId, appPassword, tenantId, opts, { port });

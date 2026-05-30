@@ -5,25 +5,40 @@ Everything in the codebase is already built and tested; the Teams channel is
 **dormant** until step 7 flips the on-switch. None of these steps touch the
 live Telegram bot.
 
-Do these in order.
+Do these in order. Verified against Microsoft Learn docs (abs-quickstart /
+channel-connect-teams, updated 2025-12-16).
 
-## 1. Register the bot app in Azure
+> **MUST be single-tenant.** Microsoft deprecated *multi-tenant* bot creation
+> after 2025-07-31, so new bots are single-tenant. That fits us — all
+> businesses live in one M365 tenant. The code declares
+> `MicrosoftAppType: 'SingleTenant'`; the registration must match.
 
-1. Azure Portal → **App registrations** → **New registration**.
-2. Copy the **Application (client) ID** → this is `MICROSOFT_APP_ID`.
-3. Go to **Certificates & secrets** → **New client secret** → copy the secret
-   **value** (not the ID) → this is `MICROSOFT_APP_PASSWORD`.
-4. Copy the **Directory (tenant) ID** → this is `TEAMS_BOT_TENANT_ID`.
+## 1. Create the Azure Bot resource (this also creates the app identity)
 
-## 2. Create the Azure Bot resource
+1. Azure Portal → **Create a resource** → search `bot` → select the
+   **Azure Bot** card → **Create**.
+2. **Project details:** name the bot (e.g. `atlas-teams`), pick the
+   subscription + resource group, leave data residency global.
+3. **Microsoft App ID:** choose **Type of App = Single Tenant**, and
+   **Creation type = Create new Microsoft App ID**.
+4. **Review + create** → **Create**. Azure provisions the app registration and
+   an initial password for you.
 
-1. Azure Portal → **Azure Bot** → **Create**.
-2. Use the Application (client) ID from step 1.
-3. Set the **messaging endpoint** to `https://<vps-domain>/api/messages`.
+## 2. Collect the three credential values
 
-## 3. Add the Teams channel
+1. Open the new Azure Bot resource → **Settings → Configuration**.
+2. Copy **Microsoft App ID** → `MICROSOFT_APP_ID`.
+3. Copy **App Tenant ID** → `TEAMS_BOT_TENANT_ID`.
+4. Click **Manage** (next to Microsoft App ID) → **Certificates & secrets** →
+   **New client secret** → copy the secret **Value** immediately (it is hidden
+   after you leave the page) → `MICROSOFT_APP_PASSWORD`.
 
-1. In the Azure Bot resource → **Channels** → add **Microsoft Teams**.
+## 3. Set the messaging endpoint + add the Teams channel
+
+1. Still on **Configuration**, set **Messaging endpoint** to
+   `https://<vps-domain>/api/messages` → **Apply**.
+2. **Channels** → **Microsoft Teams** → agree to the terms → on the
+   **Messaging** tab pick the Azure (public) cloud → **Apply**.
 
 ## 4. Route the endpoint on the VPS
 
