@@ -17,18 +17,21 @@ groups/*
 !groups/atlas_gpg/
 !groups/atlas_crownscape/
 !groups/telegram_atlas-marketing/
+!groups/atlas_teams/
 groups/main/*
 groups/global/*
 groups/atlas_main/*
 groups/atlas_gpg/*
 groups/atlas_crownscape/*
 groups/telegram_atlas-marketing/*
+groups/atlas_teams/*
 !groups/main/CLAUDE.md
 !groups/global/CLAUDE.md
 !groups/atlas_main/CLAUDE.md
 !groups/atlas_gpg/CLAUDE.md
 !groups/atlas_crownscape/CLAUDE.md
 !groups/telegram_atlas-marketing/CLAUDE.md
+!groups/atlas_teams/CLAUDE.md
 
 # Secrets
 *.keys.json

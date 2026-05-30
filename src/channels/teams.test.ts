@@ -282,6 +282,64 @@ describe('TeamsChannel', () => {
     });
   });
 
+  describe('ensureOwnerMainGroup', () => {
+    it('calls ensureOwnerMainGroup for owner 1:1 (personal) chat', async () => {
+      const ensureOwnerMainGroup = vi.fn();
+      const opts = { ...createTestOpts(), ensureOwnerMainGroup };
+      const channel = makeChannel(opts);
+      await channel.connect();
+
+      await postActivity({
+        type: 'message',
+        id: 'act-dm',
+        text: 'hey atlas',
+        from: { id: 'u', name: 'CEO', aadObjectId: 'owner-aad-1' },
+        // No conversationType → isGroup=false → personal DM
+        conversation: { id: 'personal:conv-1' },
+      });
+
+      expect(ensureOwnerMainGroup).toHaveBeenCalledWith(
+        'msteams:personal:conv-1',
+      );
+    });
+
+    it('does NOT call ensureOwnerMainGroup for group/channel conversations', async () => {
+      const ensureOwnerMainGroup = vi.fn();
+      const opts = { ...createTestOpts(), ensureOwnerMainGroup };
+      const channel = makeChannel(opts);
+      await channel.connect();
+
+      await postActivity({
+        type: 'message',
+        id: 'act-group',
+        text: 'hey atlas',
+        from: { id: 'u', name: 'CEO', aadObjectId: 'owner-aad-1' },
+        conversation: { id: '19:abc@thread.v2', conversationType: 'groupChat' },
+      });
+
+      expect(ensureOwnerMainGroup).not.toHaveBeenCalled();
+    });
+
+    it('does NOT call ensureOwnerMainGroup when the owner gate refuses a non-owner', async () => {
+      const ensureOwnerMainGroup = vi.fn();
+      const opts = { ...createTestOpts(), ensureOwnerMainGroup };
+      const channel = makeChannel(opts);
+      await channel.connect();
+
+      await postActivity({
+        type: 'message',
+        id: 'act-attacker-dm',
+        text: 'hello',
+        from: { id: 'u', name: 'Mallory', aadObjectId: 'attacker-aad' },
+        // Personal DM from non-owner: gate fires before ensureOwnerMainGroup
+        conversation: { id: 'personal:conv-1' },
+      });
+
+      expect(ensureOwnerMainGroup).not.toHaveBeenCalled();
+      expect(opts.onMessage).not.toHaveBeenCalled();
+    });
+  });
+
   describe('teamsJid helper', () => {
     it('prefixes a conversation id', () => {
       expect(teamsJid('19:abc@thread.v2')).toBe('msteams:19:abc@thread.v2');

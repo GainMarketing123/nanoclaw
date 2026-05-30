@@ -226,9 +226,17 @@ export class TeamsChannel implements Channel {
         botReq as never,
         toBotResponse(res) as never,
         (context) => this.onTurn(context),
-      ).catch((err) => {
-        logger.error({ err }, 'Teams: adapter.process failed');
-      });
+      )
+        .catch((err) => {
+          logger.error({ err }, 'Teams: adapter.process failed');
+        })
+        .finally(() => {
+          // Always close the socket. A well-formed Teams activity is answered by
+          // adapter.process itself; but a malformed-but-valid-JSON POST (one the
+          // adapter neither answers nor rejects on) would otherwise leave the
+          // request hanging until the client times out. End it if nothing did.
+          if (!res.writableEnded) res.end();
+        });
     });
   }
 
@@ -269,6 +277,17 @@ export class TeamsChannel implements Channel {
     if (this.references.size > TEAMS_MAX_REFERENCES) {
       const oldest = this.references.keys().next().value;
       if (oldest !== undefined) this.references.delete(oldest);
+    }
+
+    // The owner gate above guarantees this message is from the verified owner.
+    // For the owner's 1:1 (personal) chat, ensure it is registered as the main
+    // control group BEFORE the message is stored, so the orchestrator's message
+    // loop — which only acts on registered JIDs — actually picks it up and
+    // replies. Group/channel conversations are deliberately NOT auto-registered:
+    // they would all collide on the single `atlas_teams` folder, and the
+    // private all-access surface is the DM, not a shared group.
+    if (!isGroup) {
+      this.opts.ensureOwnerMainGroup?.(chatJid);
     }
 
     this.opts.onChatMetadata(

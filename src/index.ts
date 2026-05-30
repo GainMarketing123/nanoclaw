@@ -729,6 +729,28 @@ async function main(): Promise<void> {
       }
       storeMessage(msg);
     },
+    // Auto-register the owner's 1:1 chat as the main control group the first
+    // time they message from an owner-gated channel (Teams). The channel has
+    // already verified the sender is the owner (fail-closed gate), so this is
+    // the sanctioned entry point — no second owner check is needed here. Without
+    // it, owner messages are stored but never processed, because the message
+    // loop only acts on JIDs present in registeredGroups. Idempotent: a chat
+    // that is already registered is left untouched.
+    ensureOwnerMainGroup: (chatJid: string) => {
+      if (registeredGroups[chatJid]) return;
+      registerGroup(chatJid, {
+        name: 'Atlas',
+        folder: 'atlas_teams',
+        trigger: `@${ASSISTANT_NAME}`,
+        added_at: new Date().toISOString(),
+        requiresTrigger: false,
+        isMain: true,
+      });
+      logger.info(
+        { chatJid },
+        'Owner chat auto-registered as main control group',
+      );
+    },
     onChatMetadata: (
       chatJid: string,
       timestamp: string,
