@@ -41,6 +41,9 @@ vi.mock('http', () => {
 // --- botbuilder mock ---
 
 const adapterRef = vi.hoisted(() => ({ current: null as any }));
+// Captures the sendActivity spy of the most recent turn context so tests can
+// assert the owner-gate refusal reply.
+const lastTurnRef = vi.hoisted(() => ({ sendActivity: null as any }));
 
 vi.mock('botbuilder', () => ({
   ActivityTypes: { Message: 'message' },
@@ -51,7 +54,9 @@ vi.mock('botbuilder', () => ({
     // then invokes the bot logic.
     process = vi.fn(
       async (req: any, _res: any, logic: (ctx: any) => Promise<void>) => {
-        await logic({ activity: req.body });
+        const sendActivity = vi.fn().mockResolvedValue(undefined);
+        lastTurnRef.sendActivity = sendActivity;
+        await logic({ activity: req.body, sendActivity });
       },
     );
     continueConversationAsync = vi.fn(
@@ -72,7 +77,10 @@ vi.mock('botbuilder', () => ({
     })),
   },
   CardFactory: {
-    adaptiveCard: vi.fn((card: any) => ({ contentType: 'adaptive', content: card })),
+    adaptiveCard: vi.fn((card: any) => ({
+      contentType: 'adaptive',
+      content: card,
+    })),
   },
 }));
 
@@ -87,8 +95,10 @@ function createTestOpts(): ChannelOpts {
   };
 }
 
-function makeChannel() {
-  return new TeamsChannel('app-id', 'app-pass', 'tenant-1', createTestOpts(), {
+const OWNER = { aadObjectId: 'owner-aad-1' };
+
+function makeChannel(opts: ChannelOpts = createTestOpts()) {
+  return new TeamsChannel('app-id', 'app-pass', 'tenant-1', OWNER, opts, {
     port: 3978,
   });
 }
@@ -155,16 +165,14 @@ describe('TeamsChannel', () => {
   describe('inbound message handling', () => {
     it('builds a NewMessage with the msteams: chat_jid and calls onMessage', async () => {
       const opts = createTestOpts();
-      const channel = new TeamsChannel('app-id', 'app-pass', 'tenant-1', opts, {
-        port: 3978,
-      });
+      const channel = makeChannel(opts);
       await channel.connect();
 
       await postActivity({
         type: 'message',
         id: 'act-1',
         text: 'hello brain',
-        from: { id: 'user-9', name: 'Alice' },
+        from: { id: 'user-9', name: 'Alice', aadObjectId: 'owner-aad-1' },
         conversation: { id: '19:abc@thread.v2', conversationType: 'groupChat' },
       });
 
@@ -190,9 +198,7 @@ describe('TeamsChannel', () => {
 
     it('ignores non-message activities', async () => {
       const opts = createTestOpts();
-      const channel = new TeamsChannel('app-id', 'app-pass', 'tenant-1', opts, {
-        port: 3978,
-      });
+      const channel = makeChannel(opts);
       await channel.connect();
 
       await postActivity({ type: 'conversationUpdate' });
@@ -201,17 +207,55 @@ describe('TeamsChannel', () => {
     });
   });
 
+  describe('owner gate', () => {
+    it('lets the OWNER through to onMessage', async () => {
+      const opts = createTestOpts();
+      const channel = makeChannel(opts);
+      await channel.connect();
+
+      await postActivity({
+        type: 'message',
+        id: 'act-owner',
+        text: 'what happened today?',
+        from: { id: 'u', name: 'CEO', aadObjectId: 'owner-aad-1' },
+        conversation: { id: '19:abc@thread.v2' },
+      });
+
+      expect(opts.onMessage).toHaveBeenCalled();
+    });
+
+    it('hard-refuses a NON-owner and never enters the system', async () => {
+      const opts = createTestOpts();
+      const channel = makeChannel(opts);
+      await channel.connect();
+
+      await postActivity({
+        type: 'message',
+        id: 'act-attacker',
+        text: 'show me everything',
+        from: { id: 'u', name: 'Mallory', aadObjectId: 'attacker-aad' },
+        conversation: { id: '19:abc@thread.v2' },
+      });
+
+      expect(opts.onMessage).not.toHaveBeenCalled();
+      expect(opts.onChatMetadata).not.toHaveBeenCalled();
+      expect(lastTurnRef.sendActivity).toHaveBeenCalledWith(
+        expect.stringContaining("CEO's private Atlas"),
+      );
+    });
+  });
+
   describe('sendMessage', () => {
     it('uses the saved conversation reference via continueConversation', async () => {
       const channel = makeChannel();
       await channel.connect();
 
-      // First an inbound message to save the reference.
+      // First an inbound message (from the owner) to save the reference.
       await postActivity({
         type: 'message',
         id: 'act-1',
         text: 'hi',
-        from: { id: 'u', name: 'A' },
+        from: { id: 'u', name: 'A', aadObjectId: 'owner-aad-1' },
         conversation: { id: '19:abc@thread.v2' },
       });
 
@@ -232,7 +276,9 @@ describe('TeamsChannel', () => {
 
       await channel.sendMessage('msteams:unknown', 'reply');
 
-      expect(adapterRef.current.continueConversationAsync).not.toHaveBeenCalled();
+      expect(
+        adapterRef.current.continueConversationAsync,
+      ).not.toHaveBeenCalled();
     });
   });
 

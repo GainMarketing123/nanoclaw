@@ -25,6 +25,12 @@ import { logger } from '../logger.js';
 import { readEnvFile } from '../env.js';
 import { registerChannel, ChannelOpts } from './registry.js';
 import { Channel, NewMessage } from '../types.js';
+import {
+  isOwner,
+  loadOwnerConfigFromEnv,
+  OwnerConfig,
+  SenderIdentity,
+} from '../secondbrain/owner.js';
 
 export const TEAMS_JID_PREFIX = 'msteams:';
 
@@ -118,6 +124,7 @@ export class TeamsChannel implements Channel {
   private readonly appId: string;
   private readonly appPassword: string;
   private readonly tenantId: string;
+  private readonly ownerConfig: OwnerConfig;
   private readonly opts: ChannelOpts;
   private readonly port: number;
 
@@ -134,12 +141,14 @@ export class TeamsChannel implements Channel {
     appId: string,
     appPassword: string,
     tenantId: string,
+    ownerConfig: OwnerConfig,
     opts: ChannelOpts,
     extras: { port: number },
   ) {
     this.appId = appId;
     this.appPassword = appPassword;
     this.tenantId = tenantId;
+    this.ownerConfig = ownerConfig;
     this.opts = opts;
     this.port = extras.port;
   }
@@ -227,6 +236,27 @@ export class TeamsChannel implements Channel {
   private async onTurn(context: TurnContext): Promise<void> {
     const activity = context.activity;
     if (activity.type !== ActivityTypes.Message) return;
+
+    // THE OWNER GATE (fail-closed). This bot is the CEO's private all-access
+    // Atlas; it answers ONLY the owner's identity and HARD-REFUSES everyone
+    // else. A non-owner message never enters the system: we do not save the
+    // reference, do not record chat metadata, and do not call onMessage.
+    const sender: SenderIdentity = {
+      aadObjectId: activity.from?.aadObjectId,
+      upn: (activity.from as { userPrincipalName?: string } | undefined)
+        ?.userPrincipalName,
+      name: activity.from?.name,
+    };
+    if (!isOwner(sender, this.ownerConfig)) {
+      logger.warn(
+        { sender: sender.aadObjectId ?? sender.name },
+        'Teams: refusing non-owner',
+      );
+      await context.sendActivity(
+        "This is the CEO's private Atlas. It isn't available to other accounts.",
+      );
+      return;
+    }
 
     const { chatJid, message, chatName, isGroup } =
       buildInboundMessage(activity);
@@ -351,6 +381,8 @@ registerChannel('teams', (opts: ChannelOpts) => {
     'MICROSOFT_APP_PASSWORD',
     'TEAMS_BOT_TENANT_ID',
     'TEAMS_ADAPTER_PORT',
+    'ATLAS_OWNER_AAD_OBJECT_ID',
+    'ATLAS_OWNER_UPN',
   ]);
   const appId = process.env.MICROSOFT_APP_ID || env.MICROSOFT_APP_ID || '';
   const appPassword =
@@ -366,5 +398,23 @@ registerChannel('teams', (opts: ChannelOpts) => {
     );
     return null;
   }
-  return new TeamsChannel(appId, appPassword, tenantId, opts, { port });
+
+  // THE OWNER GATE config. This bot is the CEO's private Atlas; it answers
+  // only this identity. If neither field is set the gate fails closed at
+  // runtime (refuses ALL users), so we still construct the channel — a bot
+  // that refuses everyone is correct, a bot that silently never starts is not.
+  const ownerConfig = loadOwnerConfigFromEnv({
+    ATLAS_OWNER_AAD_OBJECT_ID:
+      process.env.ATLAS_OWNER_AAD_OBJECT_ID || env.ATLAS_OWNER_AAD_OBJECT_ID,
+    ATLAS_OWNER_UPN: process.env.ATLAS_OWNER_UPN || env.ATLAS_OWNER_UPN,
+  });
+  if (!ownerConfig.aadObjectId && !ownerConfig.upn) {
+    logger.warn(
+      'Teams: no ATLAS_OWNER identity configured — the bot will refuse ALL users until set',
+    );
+  }
+
+  return new TeamsChannel(appId, appPassword, tenantId, ownerConfig, opts, {
+    port,
+  });
 });

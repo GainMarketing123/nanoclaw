@@ -13,6 +13,16 @@ channel-connect-teams, updated 2025-12-16).
 > businesses live in one M365 tenant. The code declares
 > `MicrosoftAppType: 'SingleTenant'`; the registration must match.
 
+> **Access model — the CEO's private all-access Atlas.** This bot is NOT a
+> shared, per-business tool. It serves the OWNER (the CEO) and ONLY the owner:
+> it answers a single Microsoft identity and HARD-REFUSES everyone else
+> (fail-closed — if no owner is configured it refuses all users). For the owner
+> it spans everything: all three businesses plus a personal space, merged into
+> one answer. Cross-entity isolation still lives in the brain's data layer; this
+> bot is the sanctioned superuser above it. Two layers of lock protect it: the
+> single-tenant registration (only your org can reach the bot) and the owner-id
+> gate (only YOU, by Object ID / UPN, get answers). Step 5 sets that owner id.
+
 ## 1. Create the Azure Bot resource (this also creates the app identity)
 
 1. Azure Portal → **Create a resource** → search `bot` → select the
@@ -57,14 +67,19 @@ channel-connect-teams, updated 2025-12-16).
    - `MICROSOFT_APP_ID`
    - `MICROSOFT_APP_PASSWORD`
    - `TEAMS_BOT_TENANT_ID`
-   - `TEAMS_ENTITY_MAP` — a JSON object mapping each business's Team /
-     conversation id to its entity slug, e.g.
-     `{"19:abc@thread.v2":"gpg","19:def@thread.v2":"wisestream"}`.
+   - `ATLAS_OWNER_AAD_OBJECT_ID` — YOUR Microsoft identity (the owner gate).
+     Find it in **Azure Portal → Microsoft Entra ID → Users → (your user) →
+     Object ID**. This is the stable, tenant-scoped id and is the preferred
+     match.
+   - `ATLAS_OWNER_UPN` (optional convenience fallback) — your user principal
+     name / sign-in email, e.g. `tle@gainmanagement.com`.
 
-   **Why per-conversation:** all businesses share ONE M365 tenant, so the
-   tenant ID can't tell businesses apart. The conversation map is the real
-   guardrail — any unmapped conversation is refused so one business can never
-   read another's memory.
+   **Why an owner id, not a conversation map:** this bot is YOUR private
+   all-access Atlas, not a per-business tool. It answers only the owner identity
+   and refuses everyone else; for the owner it spans all businesses + personal.
+   Set at least one of the two fields (Object ID preferred). **Fail-closed:** if
+   NEITHER is set, the bot refuses ALL users — so a missing owner id locks
+   everyone out rather than letting anyone in.
 
 ## 6. Build and upload the Teams app package
 

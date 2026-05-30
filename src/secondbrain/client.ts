@@ -28,6 +28,12 @@ export interface AskResult {
   degraded: boolean;
 }
 
+export interface EntityInfo {
+  id: string;
+  slug: string;
+  display_name: string | null;
+}
+
 export interface IngestStats {
   unprocessed_count: number;
   running_count: number;
@@ -55,7 +61,10 @@ export class SecondBrainClient {
   private readonly timeoutMs: number;
   private readonly apiKey?: string;
 
-  constructor(baseUrl: string, opts: { timeoutMs?: number; apiKey?: string } = {}) {
+  constructor(
+    baseUrl: string,
+    opts: { timeoutMs?: number; apiKey?: string } = {},
+  ) {
     // Normalize: strip a trailing slash so path concatenation is predictable.
     this.baseUrl = baseUrl.replace(/\/+$/, '');
     this.timeoutMs = opts.timeoutMs ?? 5000;
@@ -73,15 +82,42 @@ export class SecondBrainClient {
       entity_id: entityId,
       question,
     });
-    if (outcome.degraded || !outcome.envelope || outcome.envelope.degraded || !outcome.envelope.data) {
+    if (
+      outcome.degraded ||
+      !outcome.envelope ||
+      outcome.envelope.degraded ||
+      !outcome.envelope.data
+    ) {
       return { answer: '', provenance: [], degraded: true };
     }
-    const data = outcome.envelope.data as { answer?: string; provenance?: AskProvenance[] };
+    const data = outcome.envelope.data as {
+      answer?: string;
+      provenance?: AskProvenance[];
+    };
     return {
       answer: typeof data.answer === 'string' ? data.answer : '',
       provenance: Array.isArray(data.provenance) ? data.provenance : [],
       degraded: false,
     };
+  }
+
+  /**
+   * List all entities the brain knows about (the businesses + personal space).
+   * Used by the owner all-entity fan-out. Never throws: any failure or
+   * degraded envelope yields `[]` so the chat path keeps moving.
+   */
+  async listEntities(): Promise<EntityInfo[]> {
+    const outcome = await this._request('GET', '/v1/entities');
+    if (
+      outcome.degraded ||
+      !outcome.envelope ||
+      outcome.envelope.degraded ||
+      !outcome.envelope.data
+    ) {
+      return [];
+    }
+    const data = outcome.envelope.data;
+    return Array.isArray(data) ? (data as EntityInfo[]) : [];
   }
 
   /** Health probe. ok=false on any failure; degraded mirrors the envelope. */
@@ -90,7 +126,10 @@ export class SecondBrainClient {
     if (outcome.degraded || !outcome.envelope) {
       return { ok: false, degraded: true };
     }
-    return { ok: !outcome.envelope.degraded && outcome.envelope.data != null, degraded: outcome.envelope.degraded };
+    return {
+      ok: !outcome.envelope.degraded && outcome.envelope.data != null,
+      degraded: outcome.envelope.degraded,
+    };
   }
 
   /** Ingest observability counters; null on any failure. */
@@ -109,7 +148,11 @@ export class SecondBrainClient {
    * Single bounded request. Resolves to a degraded sentinel on timeout,
    * socket error, or unparseable body — never rejects, so callers cannot hang.
    */
-  private _request(method: string, path: string, body?: unknown): Promise<RequestOutcome> {
+  private _request(
+    method: string,
+    path: string,
+    body?: unknown,
+  ): Promise<RequestOutcome> {
     return new Promise<RequestOutcome>((resolve) => {
       let settled = false;
       let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
@@ -168,7 +211,10 @@ export class SecondBrainClient {
               const envelope = JSON.parse(raw) as Envelope<unknown>;
               done({ envelope, degraded: Boolean(envelope.degraded) });
             } catch (err) {
-              logger.warn({ err, path, status: res.statusCode }, 'second-brain: unparseable response');
+              logger.warn(
+                { err, path, status: res.statusCode },
+                'second-brain: unparseable response',
+              );
               done(DEGRADED_OUTCOME);
             }
           });
@@ -183,7 +229,10 @@ export class SecondBrainClient {
       });
       req.on('timeout', () => {
         timedOut = true;
-        logger.warn({ path, timeoutMs: this.timeoutMs }, 'second-brain: request timed out; degrading');
+        logger.warn(
+          { path, timeoutMs: this.timeoutMs },
+          'second-brain: request timed out; degrading',
+        );
         req.destroy(new Error('second-brain request timeout'));
         done(DEGRADED_OUTCOME);
       });
@@ -192,7 +241,10 @@ export class SecondBrainClient {
       // active (slow trickle) so the chat path always resolves within budget.
       deadlineTimer = setTimeout(() => {
         timedOut = true;
-        logger.warn({ path, timeoutMs: this.timeoutMs }, 'second-brain: overall deadline exceeded; degrading');
+        logger.warn(
+          { path, timeoutMs: this.timeoutMs },
+          'second-brain: overall deadline exceeded; degrading',
+        );
         req.destroy(new Error('second-brain overall deadline'));
         done(DEGRADED_OUTCOME);
       }, this.timeoutMs);

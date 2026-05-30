@@ -4,106 +4,131 @@ vi.mock('../logger.js', () => ({
   logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
-import { handleAsk } from './askCommand.js';
-import type { SecondBrainClient, AskResult } from './client.js';
-import { EntityMap, TeamsContext } from './entityMap.js';
+import { handleOwnerAsk } from './askCommand.js';
+import type { SecondBrainClient, AskResult, EntityInfo } from './client.js';
+import type { OwnerConfig, SenderIdentity } from './owner.js';
 
-const MAP: EntityMap = { '19:abc@thread.v2': 'gpg' };
-const slugToId = (slug: string) => (slug === 'gpg' ? 'entity-gpg' : null);
+const OWNER: OwnerConfig = { aadObjectId: 'owner-aad-1' };
+const OWNER_SENDER: SenderIdentity = { aadObjectId: 'owner-aad-1' };
+const NON_OWNER: SenderIdentity = { aadObjectId: 'attacker-aad' };
 
-function fakeClient(askImpl: () => Promise<AskResult>) {
-  const ask = vi.fn(askImpl);
-  return { client: { ask } as unknown as SecondBrainClient, ask };
+const ENTITIES: EntityInfo[] = [
+  { id: 'e-gpg', slug: 'gpg', display_name: 'GPG' },
+  { id: 'e-ws', slug: 'wisestream', display_name: 'WiseStream' },
+  { id: 'e-personal', slug: 'personal', display_name: null },
+];
+
+function answered(answer: string): AskResult {
+  return {
+    answer,
+    provenance: [
+      {
+        raw_event_id: 'abcdef1234567890',
+        source: 'email',
+        memory_item_ids: ['m1'],
+        score: 0.9,
+        cached: false,
+      },
+    ],
+    degraded: false,
+  };
 }
 
-describe('handleAsk', () => {
-  it('refuses an unmapped conversation and never calls the brain', async () => {
-    const { client, ask } = fakeClient(async () => ({
-      answer: '',
-      provenance: [],
-      degraded: false,
-    }));
-    const ctx: TeamsContext = { conversationId: '19:unknown@thread.v2' };
+const EMPTY: AskResult = { answer: '', provenance: [], degraded: false };
+const DEGRADED: AskResult = { answer: '', provenance: [], degraded: true };
 
-    const out = await handleAsk(client, slugToId, ctx, MAP, undefined, 'hi');
+function fakeClient(opts: {
+  entities?: EntityInfo[];
+  ask?: (entityId: string) => AskResult;
+}) {
+  const listEntities = vi.fn(async () => opts.entities ?? ENTITIES);
+  const ask = vi.fn(async (entityId: string) =>
+    opts.ask ? opts.ask(entityId) : EMPTY,
+  );
+  return {
+    client: { listEntities, ask } as unknown as SecondBrainClient,
+    listEntities,
+    ask,
+  };
+}
 
-    expect(out.text).toContain("can't tell which business");
+describe('handleOwnerAsk', () => {
+  it('hard-refuses a non-owner and never touches the brain', async () => {
+    const { client, listEntities, ask } = fakeClient({});
+    const out = await handleOwnerAsk(client, NON_OWNER, OWNER, 'secrets?');
+
+    expect(out.text).toContain("CEO's private Atlas");
+    expect(listEntities).not.toHaveBeenCalled();
     expect(ask).not.toHaveBeenCalled();
   });
 
-  it('refuses on a wrong tenant and never calls the brain', async () => {
-    const { client, ask } = fakeClient(async () => ({
-      answer: '',
-      provenance: [],
-      degraded: false,
-    }));
-    const ctx: TeamsContext = {
-      conversationId: '19:abc@thread.v2',
-      tenantId: 'evil-tenant',
-    };
+  it('fails closed (refuses) when no owner is configured', async () => {
+    const { client, listEntities } = fakeClient({});
+    const out = await handleOwnerAsk(client, OWNER_SENDER, {}, 'hi');
 
-    const out = await handleAsk(client, slugToId, ctx, MAP, 'good-tenant', 'hi');
-
-    expect(out.text).toContain('approved tenant');
-    expect(ask).not.toHaveBeenCalled();
+    expect(out.text).toContain("CEO's private Atlas");
+    expect(listEntities).not.toHaveBeenCalled();
   });
 
-  it('refuses when the slug has no entity id', async () => {
-    const { client, ask } = fakeClient(async () => ({
-      answer: '',
-      provenance: [],
-      degraded: false,
-    }));
-    const ctx: TeamsContext = { conversationId: '19:abc@thread.v2' };
-    const noId = () => null;
-
-    const out = await handleAsk(client, noId, ctx, MAP, undefined, 'hi');
-
-    expect(out.text).toContain("can't tell which business");
-    expect(ask).not.toHaveBeenCalled();
-  });
-
-  it('renders the degraded fallback when the brain is degraded', async () => {
-    const { client, ask } = fakeClient(async () => ({
-      answer: '',
-      provenance: [],
-      degraded: true,
-    }));
-    const ctx: TeamsContext = { conversationId: '19:abc@thread.v2' };
-
-    const out = await handleAsk(client, slugToId, ctx, MAP, undefined, 'hi');
+  it('returns degraded when every entity is degraded', async () => {
+    const { client } = fakeClient({ ask: () => DEGRADED });
+    const out = await handleOwnerAsk(client, OWNER_SENDER, OWNER, 'hi');
 
     expect(out.text).toContain('catching up');
-    expect(ask).toHaveBeenCalledWith('entity-gpg', 'hi');
   });
 
-  it('renders the answer with its source on success', async () => {
-    const { client, ask } = fakeClient(async () => ({
-      answer: 'The deal closed Tuesday.',
-      provenance: [
-        {
-          raw_event_id: 'abcdef1234',
-          source: 'email',
-          memory_item_ids: ['m1'],
-          score: 0.9,
-          cached: false,
-        },
-      ],
-      degraded: false,
-    }));
-    const ctx: TeamsContext = { conversationId: '19:abc@thread.v2' };
+  it('returns degraded when there are no entities', async () => {
+    const { client, ask } = fakeClient({ entities: [] });
+    const out = await handleOwnerAsk(client, OWNER_SENDER, OWNER, 'hi');
 
-    const out = await handleAsk(
-      client,
-      slugToId,
-      ctx,
-      MAP,
-      undefined,
-      'when did it close?',
-    );
+    expect(out.text).toContain('catching up');
+    expect(ask).not.toHaveBeenCalled();
+  });
 
+  it('builds a section only for the entity that answered (mixed)', async () => {
+    const { client, ask } = fakeClient({
+      ask: (id) => (id === 'e-gpg' ? answered('The deal closed Tuesday.') : EMPTY),
+    });
+    const out = await handleOwnerAsk(client, OWNER_SENDER, OWNER, 'when?');
+
+    expect(ask).toHaveBeenCalledTimes(3);
+    expect(out.text).toContain('GPG');
     expect(out.text).toContain('The deal closed Tuesday.');
-    expect(out.text).toContain('email');
-    expect(ask).toHaveBeenCalledWith('entity-gpg', 'when did it close?');
+    // The non-answering entities are NOT labelled in the merged output.
+    expect(out.text).not.toContain('WiseStream');
+    expect(out.text).not.toContain('personal');
+    expect(JSON.stringify(out.card)).toContain('The deal closed Tuesday.');
+  });
+
+  it('skips the "No memory matched." sentinel as empty', async () => {
+    const { client } = fakeClient({ ask: () => answered('No memory matched.') });
+    const out = await handleOwnerAsk(client, OWNER_SENDER, OWNER, 'hi');
+
+    expect(out.text).toBe('No memory matched across your spaces.');
+  });
+
+  it('returns the no-memory copy when all entities answer empty', async () => {
+    const { client } = fakeClient({ ask: () => EMPTY });
+    const out = await handleOwnerAsk(client, OWNER_SENDER, OWNER, 'hi');
+
+    expect(out.text).toBe('No memory matched across your spaces.');
+  });
+
+  it('merges multiple answering entities, each labelled', async () => {
+    const { client } = fakeClient({
+      ask: (id) =>
+        id === 'e-gpg'
+          ? answered('GPG answer.')
+          : id === 'e-personal'
+            ? answered('Personal answer.')
+            : EMPTY,
+    });
+    const out = await handleOwnerAsk(client, OWNER_SENDER, OWNER, 'hi');
+
+    expect(out.text).toContain('GPG');
+    expect(out.text).toContain('GPG answer.');
+    // display_name null ⇒ falls back to the slug label.
+    expect(out.text).toContain('personal');
+    expect(out.text).toContain('Personal answer.');
   });
 });

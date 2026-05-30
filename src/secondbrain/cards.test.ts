@@ -1,46 +1,63 @@
 import { describe, it, expect } from 'vitest';
 import {
-  renderAnswerText,
-  renderAnswerCard,
+  OwnerAnswerSection,
+  renderOwnerAnswerText,
+  renderOwnerAnswerCard,
   renderDegradedText,
   renderDegradedCard,
 } from './cards.js';
-import { AskProvenance } from './client.js';
 
-const provenance: AskProvenance[] = [
+const sections: OwnerAnswerSection[] = [
   {
-    raw_event_id: 'abcdef1234567890',
-    source: 'email',
-    memory_item_ids: ['m1'],
-    score: 0.9,
-    cached: true,
+    entitySlug: 'gpg',
+    entityName: 'GPG',
+    answer: 'The deal closed Tuesday.',
+    provenance: [
+      {
+        raw_event_id: 'abcdef1234567890',
+        source: 'email',
+        memory_item_ids: ['m1'],
+        score: 0.9,
+        cached: true,
+      },
+    ],
+  },
+  {
+    entitySlug: 'personal',
+    entityName: 'Personal',
+    answer: 'Dentist on Friday.',
+    provenance: [],
   },
 ];
 
-describe('renderAnswerText', () => {
-  it('includes the answer and a provenance source', () => {
-    const text = renderAnswerText('The deal closed Tuesday.', provenance);
+describe('renderOwnerAnswerText', () => {
+  it('includes each entity name, its answer, and the sources', () => {
+    const text = renderOwnerAnswerText(sections);
+    expect(text).toContain('=== GPG ===');
     expect(text).toContain('The deal closed Tuesday.');
     expect(text).toContain('Sources:');
     expect(text).toContain('email');
     expect(text).toContain('abcdef12'); // short raw_event_id
     expect(text).toContain('(cached)');
-  });
-
-  it('returns just the answer when there is no provenance', () => {
-    expect(renderAnswerText('No sources.', [])).toBe('No sources.');
+    expect(text).toContain('=== Personal ===');
+    expect(text).toContain('Dentist on Friday.');
   });
 });
 
-describe('renderAnswerCard', () => {
-  it('is an Adaptive Card v1.4 with the answer and a source fact', () => {
-    const card = renderAnswerCard('The deal closed Tuesday.', provenance) as any;
+describe('renderOwnerAnswerCard', () => {
+  it('is an Adaptive Card v1.4 with a Container per section', () => {
+    const card = renderOwnerAnswerCard(sections) as any;
     expect(card.type).toBe('AdaptiveCard');
     expect(card.version).toBe('1.4');
+    expect(card.body).toHaveLength(2);
+    expect(card.body[0].type).toBe('Container');
     const serialized = JSON.stringify(card);
+    expect(serialized).toContain('GPG');
     expect(serialized).toContain('The deal closed Tuesday.');
     expect(serialized).toContain('email');
     expect(serialized).toContain('abcdef12');
+    expect(serialized).toContain('Personal');
+    expect(serialized).toContain('Dentist on Friday.');
   });
 });
 

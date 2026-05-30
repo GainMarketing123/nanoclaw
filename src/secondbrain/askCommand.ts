@@ -1,81 +1,107 @@
 /**
- * Transport-agnostic "ask the brain" handler.
+ * Transport-agnostic "ask the brain" handler for the OWNER all-access model.
  *
- * Encapsulates the cross-entity guardrail so any channel (Teams today,
- * others later) gets identical safe-refusal behaviour. The order of checks
- * is load-bearing: we NEVER call the brain until we've positively resolved
- * which business this conversation belongs to.
+ * This bot is the CEO's private Atlas. The owner gate (isOwner) is the ONLY
+ * thing protecting every business's data from a non-owner, so it is checked
+ * FIRST and fails closed: a non-owner is hard-refused and the brain is never
+ * touched. For the owner, we fan out across EVERY entity (the businesses + a
+ * personal space) and merge the non-empty answers into one labelled response.
  */
-import { SecondBrainClient } from './client.js';
+import { SecondBrainClient, AskProvenance, EntityInfo } from './client.js';
+import { isOwner, OwnerConfig, SenderIdentity } from './owner.js';
 import {
-  TeamsContext,
-  EntityMap,
-  resolveEntitySlug,
-  isAllowedTenant,
-} from './entityMap.js';
-import {
-  renderAnswerText,
-  renderAnswerCard,
+  OwnerAnswerSection,
+  renderOwnerAnswerText,
+  renderOwnerAnswerCard,
   renderDegradedText,
   renderDegradedCard,
 } from './cards.js';
 
-/** Refusal shown when we can't tell which business owns this conversation. */
-const UNMAPPED_REFUSAL =
-  "I can't tell which business this chat belongs to — ask your admin to map this conversation.";
+// Re-export so callers can import the section shape from here too if they wish.
+export type { OwnerAnswerSection };
+export type { AskProvenance, EntityInfo };
 
-/** Refusal shown when the activity fails the tenant guard. */
-const TENANT_REFUSAL =
-  "I can't answer here — this chat isn't on an approved tenant.";
+/** Hard refusal shown to anyone who is not the configured owner. */
+const NON_OWNER_REFUSAL =
+  "This is the CEO's private Atlas. It isn't available to other accounts.";
 
-function refusal(text: string): { text: string; card: object } {
+/** Shown when the owner asks but no entity had anything to say. */
+const NO_MEMORY_COPY = 'No memory matched across your spaces.';
+
+/** The brain's "no hit" answer sentinel — skipped when building sections. */
+const NO_MEMORY_ANSWER = 'No memory matched.';
+
+function simpleCard(text: string): object {
   return {
-    text,
-    card: {
-      type: 'AdaptiveCard',
-      version: '1.4',
-      body: [{ type: 'TextBlock', text, wrap: true }],
-    },
+    type: 'AdaptiveCard',
+    version: '1.4',
+    body: [{ type: 'TextBlock', text, wrap: true }],
   };
 }
 
 /**
- * Resolve + guard + ask. Returns rendered text and an Adaptive Card.
+ * Owner gate + all-entity fan-out. Returns rendered text and an Adaptive Card.
  *
- * Refuses (without ever touching the brain) when:
- *   - the tenant guard fails, or
- *   - the conversation isn't mapped to a business, or
- *   - the resolved slug has no entity id.
+ * Order is load-bearing:
+ *   1. Non-owner ⇒ hard refusal, brain NEVER touched.
+ *   2. No entities ⇒ degraded.
+ *   3. Fan out across all entities.
+ *   4. Every result degraded ⇒ degraded.
+ *   5. Build sections from non-empty answers.
+ *   6. No non-empty sections ⇒ "no memory" copy.
+ *   7. Otherwise merge into one labelled answer.
  */
-export async function handleAsk(
+export async function handleOwnerAsk(
   client: SecondBrainClient,
-  entitySlugToId: (slug: string) => string | null,
-  ctx: TeamsContext,
-  entityMap: EntityMap,
-  allowedTenantId: string | undefined,
+  sender: SenderIdentity,
+  owner: OwnerConfig,
   question: string,
 ): Promise<{ text: string; card: object }> {
-  if (!isAllowedTenant(ctx, allowedTenantId)) {
-    return refusal(TENANT_REFUSAL);
+  // 1. Owner gate — fail-closed, brain never touched for a non-owner.
+  if (!isOwner(sender, owner)) {
+    return { text: NON_OWNER_REFUSAL, card: simpleCard(NON_OWNER_REFUSAL) };
   }
 
-  const slug = resolveEntitySlug(ctx, entityMap);
-  if (slug === null) {
-    return refusal(UNMAPPED_REFUSAL);
-  }
-
-  const entityId = entitySlugToId(slug);
-  if (entityId === null) {
-    return refusal(UNMAPPED_REFUSAL);
-  }
-
-  const result = await client.ask(entityId, question);
-  if (result.degraded) {
+  // 2. Resolve every entity the owner spans.
+  const entities = await client.listEntities();
+  if (entities.length === 0) {
     return { text: renderDegradedText(), card: renderDegradedCard() };
   }
 
+  // 3. Fan out across all entities in parallel.
+  const results = await Promise.all(
+    entities.map(async (e: EntityInfo) => ({
+      entity: e,
+      result: await client.ask(e.id, question),
+    })),
+  );
+
+  // 4. If EVERY entity degraded, the brain is catching up.
+  if (results.every((r) => r.result.degraded)) {
+    return { text: renderDegradedText(), card: renderDegradedCard() };
+  }
+
+  // 5. Build sections from entities with a real answer (skip empty / no-hit).
+  const sections: OwnerAnswerSection[] = results
+    .filter((r) => {
+      const a = r.result.answer.trim();
+      return a.length > 0 && a !== NO_MEMORY_ANSWER;
+    })
+    .map((r) => ({
+      entitySlug: r.entity.slug,
+      entityName: r.entity.display_name ?? r.entity.slug,
+      answer: r.result.answer,
+      provenance: r.result.provenance,
+    }));
+
+  // 6. Nothing matched anywhere.
+  if (sections.length === 0) {
+    return { text: NO_MEMORY_COPY, card: simpleCard(NO_MEMORY_COPY) };
+  }
+
+  // 7. Merge into one labelled answer.
   return {
-    text: renderAnswerText(result.answer, result.provenance),
-    card: renderAnswerCard(result.answer, result.provenance),
+    text: renderOwnerAnswerText(sections),
+    card: renderOwnerAnswerCard(sections),
   };
 }
