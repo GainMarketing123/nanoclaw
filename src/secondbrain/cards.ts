@@ -62,9 +62,7 @@ export function renderOwnerAnswerText(sections: OwnerAnswerSection[]): string {
  * Render the merged owner answer as a single Adaptive Card v1.4 with one
  * Container per entity section (bold entity name, the answer, the sources).
  */
-export function renderOwnerAnswerCard(
-  sections: OwnerAnswerSection[],
-): object {
+export function renderOwnerAnswerCard(sections: OwnerAnswerSection[]): object {
   const body = sections.map((section) => {
     const items: object[] = [
       {

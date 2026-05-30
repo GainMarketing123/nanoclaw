@@ -87,7 +87,8 @@ describe('handleOwnerAsk', () => {
 
   it('builds a section only for the entity that answered (mixed)', async () => {
     const { client, ask } = fakeClient({
-      ask: (id) => (id === 'e-gpg' ? answered('The deal closed Tuesday.') : EMPTY),
+      ask: (id) =>
+        id === 'e-gpg' ? answered('The deal closed Tuesday.') : EMPTY,
     });
     const out = await handleOwnerAsk(client, OWNER_SENDER, OWNER, 'when?');
 
@@ -101,7 +102,9 @@ describe('handleOwnerAsk', () => {
   });
 
   it('skips the "No memory matched." sentinel as empty', async () => {
-    const { client } = fakeClient({ ask: () => answered('No memory matched.') });
+    const { client } = fakeClient({
+      ask: () => answered('No memory matched.'),
+    });
     const out = await handleOwnerAsk(client, OWNER_SENDER, OWNER, 'hi');
 
     expect(out.text).toBe('No memory matched across your spaces.');
