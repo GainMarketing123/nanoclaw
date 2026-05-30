@@ -1,0 +1,35 @@
+{
+  "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/v1.16/MicrosoftTeams.schema.json",
+  "manifestVersion": "1.16",
+  "version": "1.0.0",
+  "id": "${BOT_APP_ID}",
+  "developer": {
+    "name": "Atlas",
+    "websiteUrl": "https://example.com",
+    "privacyUrl": "https://example.com/privacy",
+    "termsOfUseUrl": "https://example.com/terms"
+  },
+  "name": {
+    "short": "Atlas",
+    "full": "Atlas — Executive Memory"
+  },
+  "description": {
+    "short": "Ask your executive memory anything.",
+    "full": "Atlas is your executive second brain — ask it questions in Teams and it answers from your business's own memory, scoped to this conversation."
+  },
+  "icons": {
+    "color": "color.png",
+    "outline": "outline.png"
+  },
+  "accentColor": "#2A2A2A",
+  "bots": [
+    {
+      "botId": "${BOT_APP_ID}",
+      "scopes": ["personal", "team"],
+      "supportsFiles": false,
+      "isNotificationOnly": false
+    }
+  ],
+  "permissions": ["identity", "messageTeamMembers"],
+  "validDomains": []
+}
