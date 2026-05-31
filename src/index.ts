@@ -64,6 +64,10 @@ import {
 import { startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
+import {
+  SecondBrainClient,
+  parseLoomQuestion,
+} from './secondbrain/client.js';
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
@@ -76,6 +80,15 @@ let messageLoopRunning = false;
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
+
+// Loom (learning-brain) Q&A over Teams: a "loom ..." message is answered from
+// the course brain instead of spawning the agent. Long timeout because a course
+// answer runs Claude server-side (~20-40s); the 5s default would always trip.
+const LOOM_BRAIN = new SecondBrainClient(
+  process.env.BRAIN_BASE_URL || 'http://127.0.0.1:8000',
+  { timeoutMs: parseInt(process.env.LOOM_BRAIN_TIMEOUT_MS || '45000', 10) },
+);
+const LOOM_ENTITY_SLUG = process.env.LOOM_ENTITY_SLUG || 'learning';
 
 /**
  * Extract a human-readable entity label from a group folder name.
@@ -697,6 +710,39 @@ async function main(): Promise<void> {
           }
           return;
         }
+      }
+
+      // Loom (learning-brain) course Q&A — "loom <question>" answers from the
+      // course brain instead of the agent. Intercept before storage.
+      const loomQuestion = parseLoomQuestion(trimmed);
+      if (loomQuestion !== null) {
+        const channel = findChannel(channels, chatJid);
+        if (!loomQuestion) {
+          channel
+            ?.sendMessage(
+              chatJid,
+              'Ask your courses something, e.g. "loom how do I write a hook?"',
+            )
+            .catch((err) =>
+              logger.error({ err, chatJid }, 'Loom usage hint send error'),
+            );
+          return;
+        }
+        (async () => {
+          await channel?.sendMessage(chatJid, '🎓 Searching your courses…');
+          const result = await LOOM_BRAIN.askBySlug(
+            LOOM_ENTITY_SLUG,
+            loomQuestion,
+          );
+          const reply =
+            !result.degraded && result.answer.trim()
+              ? result.answer
+              : 'Your course brain is catching up and could not answer that just now — try again in a moment.';
+          await channel?.sendMessage(chatJid, reply);
+        })().catch((err) =>
+          logger.error({ err, chatJid }, 'Loom course Q&A error'),
+        );
+        return;
       }
 
       // 3d-2: Failure ack — denied sender gets a specific reason, not silence

@@ -56,6 +56,18 @@ interface RequestOutcome {
 
 const DEGRADED_OUTCOME: RequestOutcome = { envelope: null, degraded: true };
 
+/**
+ * Parse a "loom" course-Q&A command. Pure (no network) so the regex lives in
+ * one place and is unit-testable. Returns the question when the text is a loom
+ * command, `''` when it is exactly "loom" with no question, and `null` when the
+ * text is NOT a loom command (e.g. "I loom over the code").
+ */
+export function parseLoomQuestion(text: string): string | null {
+  const trimmed = text.trim();
+  if (!/^loom\b/i.test(trimmed)) return null;
+  return trimmed.replace(/^loom\b[:,]?\s*/i, '').trim();
+}
+
 export class SecondBrainClient {
   private readonly baseUrl: string;
   private readonly timeoutMs: number;
@@ -80,6 +92,36 @@ export class SecondBrainClient {
   async ask(entityId: string, question: string): Promise<AskResult> {
     const outcome = await this._request('POST', '/v1/ask', {
       entity_id: entityId,
+      question,
+    });
+    if (
+      outcome.degraded ||
+      !outcome.envelope ||
+      outcome.envelope.degraded ||
+      !outcome.envelope.data
+    ) {
+      return { answer: '', provenance: [], degraded: true };
+    }
+    const data = outcome.envelope.data as {
+      answer?: string;
+      provenance?: AskProvenance[];
+    };
+    return {
+      answer: typeof data.answer === 'string' ? data.answer : '',
+      provenance: Array.isArray(data.provenance) ? data.provenance : [],
+      degraded: false,
+    };
+  }
+
+  /**
+   * Ask the brain a question scoped to ONE entity by slug (e.g. "learning"),
+   * so callers need not resolve the UUID. Same never-throw contract as ask():
+   * any failure/timeout/degraded envelope yields
+   * `{ answer: '', provenance: [], degraded: true }`.
+   */
+  async askBySlug(slug: string, question: string): Promise<AskResult> {
+    const outcome = await this._request('POST', '/v1/ask', {
+      entity_slug: slug,
       question,
     });
     if (
