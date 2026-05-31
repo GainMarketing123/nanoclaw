@@ -56,6 +56,7 @@ export function buildInboundMessage(activity: Partial<Activity>): {
   message: NewMessage;
   chatName: string;
   isGroup: boolean;
+  isPersonal: boolean;
 } {
   const conversationId = activity.conversation?.id ?? '';
   const chatJid = teamsJid(conversationId);
@@ -67,6 +68,11 @@ export function buildInboundMessage(activity: Partial<Activity>): {
   )?.conversationType;
   const isGroup =
     conversationType === 'groupChat' || conversationType === 'channel';
+  // Auto-registration of the main control surface keys off this STRICT,
+  // fail-closed predicate — NOT "!isGroup". An unrecognized or missing
+  // conversationType must NOT be treated as the owner's private DM, or a
+  // misclassified chat could be bound as the all-access control group.
+  const isPersonal = conversationType === 'personal';
   const chatName = activity.conversation?.name ?? senderName;
 
   const message: NewMessage = {
@@ -79,7 +85,7 @@ export function buildInboundMessage(activity: Partial<Activity>): {
     is_from_me: false,
   };
 
-  return { chatJid, message, chatName, isGroup };
+  return { chatJid, message, chatName, isGroup, isPersonal };
 }
 
 /** Minimal botbuilder-compatible Request built from a parsed http body. */
@@ -266,7 +272,7 @@ export class TeamsChannel implements Channel {
       return;
     }
 
-    const { chatJid, message, chatName, isGroup } =
+    const { chatJid, message, chatName, isGroup, isPersonal } =
       buildInboundMessage(activity);
 
     // Save the conversation reference so we can send proactively later.
@@ -280,13 +286,14 @@ export class TeamsChannel implements Channel {
     }
 
     // The owner gate above guarantees this message is from the verified owner.
-    // For the owner's 1:1 (personal) chat, ensure it is registered as the main
-    // control group BEFORE the message is stored, so the orchestrator's message
-    // loop — which only acts on registered JIDs — actually picks it up and
-    // replies. Group/channel conversations are deliberately NOT auto-registered:
-    // they would all collide on the single `atlas_teams` folder, and the
-    // private all-access surface is the DM, not a shared group.
-    if (!isGroup) {
+    // For the owner's 1:1 (personal) chat ONLY, ensure it is registered as the
+    // main control group BEFORE the message is stored, so the orchestrator's
+    // message loop — which only acts on registered JIDs — actually picks it up
+    // and replies. Gated on the STRICT `isPersonal` predicate (fail-closed): a
+    // group/channel OR an unrecognized/missing conversationType is never
+    // auto-bound as the all-access control surface. (isGroup stays for chat
+    // metadata; isPersonal is the registration gate.)
+    if (isPersonal) {
       this.opts.ensureOwnerMainGroup?.(chatJid);
     }
 

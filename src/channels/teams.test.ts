@@ -294,13 +294,34 @@ describe('TeamsChannel', () => {
         id: 'act-dm',
         text: 'hey atlas',
         from: { id: 'u', name: 'CEO', aadObjectId: 'owner-aad-1' },
-        // No conversationType → isGroup=false → personal DM
-        conversation: { id: 'personal:conv-1' },
+        // Explicit personal (1:1) conversation → registers as main control group
+        conversation: { id: 'personal:conv-1', conversationType: 'personal' },
       });
 
       expect(ensureOwnerMainGroup).toHaveBeenCalledWith(
         'msteams:personal:conv-1',
       );
+    });
+
+    it('does NOT call ensureOwnerMainGroup for an unrecognized/missing conversationType (fail-closed)', async () => {
+      const ensureOwnerMainGroup = vi.fn();
+      const opts = { ...createTestOpts(), ensureOwnerMainGroup };
+      const channel = makeChannel(opts);
+      await channel.connect();
+
+      // Owner message, but conversationType is absent (not 'personal'). Must NOT
+      // auto-register — a misclassified chat must never become the all-access
+      // control surface. The message is still stored/answered normally.
+      await postActivity({
+        type: 'message',
+        id: 'act-unknown-type',
+        text: 'hey atlas',
+        from: { id: 'u', name: 'CEO', aadObjectId: 'owner-aad-1' },
+        conversation: { id: 'mystery:conv-x' },
+      });
+
+      expect(ensureOwnerMainGroup).not.toHaveBeenCalled();
+      expect(opts.onMessage).toHaveBeenCalled();
     });
 
     it('does NOT call ensureOwnerMainGroup for group/channel conversations', async () => {
@@ -332,7 +353,7 @@ describe('TeamsChannel', () => {
         text: 'hello',
         from: { id: 'u', name: 'Mallory', aadObjectId: 'attacker-aad' },
         // Personal DM from non-owner: gate fires before ensureOwnerMainGroup
-        conversation: { id: 'personal:conv-1' },
+        conversation: { id: 'personal:conv-1', conversationType: 'personal' },
       });
 
       expect(ensureOwnerMainGroup).not.toHaveBeenCalled();
