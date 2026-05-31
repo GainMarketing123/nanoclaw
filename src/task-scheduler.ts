@@ -137,6 +137,17 @@ async function runTask(
       result: null,
       error: `Group not found: ${task.group_folder}`,
     });
+    // Advance next_run before returning. Otherwise next_run stays in the past
+    // and the scheduler re-fires this task EVERY poll tick (a 60s tight loop)
+    // for as long as the group is missing from registeredGroups — which is
+    // usually transient (group not yet loaded / a startup race). Advancing lets
+    // it retry at the next scheduled time instead of hammering. (computeNextRun
+    // returns null for 'once' tasks, which correctly stops further runs.)
+    updateTaskAfterRun(
+      task.id,
+      computeNextRun(task),
+      `Error: Group not found: ${task.group_folder}`,
+    );
     return;
   }
 
