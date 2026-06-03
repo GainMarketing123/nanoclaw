@@ -664,7 +664,9 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
   // this one, atomically, so at most one main can exist.
   const apply = db.transaction(() => {
     if (group.isMain) {
-      db.prepare('UPDATE registered_groups SET is_main = 0 WHERE jid != ?').run(jid);
+      db.prepare('UPDATE registered_groups SET is_main = 0 WHERE jid != ?').run(
+        jid,
+      );
     }
     upsert.run(
       jid,

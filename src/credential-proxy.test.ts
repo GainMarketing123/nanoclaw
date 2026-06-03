@@ -4,7 +4,7 @@ import type { AddressInfo } from 'net';
 
 // vi.mock factories are hoisted before const declarations — use vi.hoisted so
 // mockEnv is available in the factory without a TDZ ReferenceError.
-const mockEnv = vi.hoisted(() => ({} as Record<string, string>));
+const mockEnv = vi.hoisted(() => ({}) as Record<string, string>);
 vi.mock('./env.js', () => ({
   readEnvFile: vi.fn(() => ({ ...mockEnv })),
 }));
@@ -20,7 +20,8 @@ vi.mock('fs', async (importOriginal) => {
   const patched = {
     ...actual,
     existsSync: (p: Parameters<(typeof actual)['existsSync']>[0]) => {
-      if (typeof p === 'string' && p.endsWith('.credentials.json')) return false;
+      if (typeof p === 'string' && p.endsWith('.credentials.json'))
+        return false;
       return actual.existsSync(p);
     },
   };
