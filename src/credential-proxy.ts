@@ -95,6 +95,13 @@ interface OAuthCredentials {
   rateLimitTier?: string;
 }
 
+// Tracks which credentials file reads actually succeeded from, so token-refresh
+// writes (saveCredentials) persist to the SAME file rather than always the
+// configured primary. Without this, an EACCES-on-primary deployment reads via
+// the fallback but writes still throw on the inaccessible primary, so refreshed
+// tokens never persist durably. Defaults to the primary until a read proves otherwise.
+let activeCredentialsPath = CREDENTIALS_PATH;
+
 /**
  * Read the raw OAuthCredentials record from disk, trying CREDENTIALS_PATH
  * first and CREDENTIALS_PATH_FALLBACK on EACCES.
@@ -111,7 +118,10 @@ function readRawOauthRecord(): OAuthCredentials | null {
       if (!fs.existsSync(credPath)) continue;
       const data = JSON.parse(fs.readFileSync(credPath, 'utf-8'));
       const oauth: OAuthCredentials = data.claudeAiOauth;
-      if (oauth?.accessToken) return oauth;
+      if (oauth?.accessToken) {
+        activeCredentialsPath = credPath;
+        return oauth;
+      }
     } catch (err: unknown) {
       const code = (err as NodeJS.ErrnoException)?.code;
       if (code === 'EACCES' && credPath === CREDENTIALS_PATH) {
@@ -164,9 +174,13 @@ function saveCredentials(
   expiresIn: number,
 ): void {
   try {
+    // Persist to the path reads actually succeeded from (mirrors
+    // readRawOauthRecord's primary-then-fallback), so an EACCES-on-primary
+    // deployment refreshes tokens durably instead of throwing on every write.
+    const credPath = activeCredentialsPath;
     let data: Record<string, unknown> = {};
-    if (fs.existsSync(CREDENTIALS_PATH)) {
-      data = JSON.parse(fs.readFileSync(CREDENTIALS_PATH, 'utf-8'));
+    if (fs.existsSync(credPath)) {
+      data = JSON.parse(fs.readFileSync(credPath, 'utf-8'));
     }
 
     const existing = (data.claudeAiOauth || {}) as Record<string, unknown>;
@@ -177,7 +191,7 @@ function saveCredentials(
       expiresAt: Date.now() + expiresIn * 1000,
     };
 
-    const dir = path.dirname(CREDENTIALS_PATH);
+    const dir = path.dirname(credPath);
     fs.mkdirSync(dir, { recursive: true });
 
     // Codex cfc93bb F1 BLOCKING fix: atomic write via temp-file-in-directory
@@ -196,11 +210,11 @@ function saveCredentials(
     // explicit chown the new file inherits the proxy process's uid — the
     // next claude auth status under nanoclaw-he gets EPERM. Read existing
     // owner first, then chown temp to match before rename.
-    const tmpPath = `${CREDENTIALS_PATH}.new.${process.pid}.${Date.now()}`;
+    const tmpPath = `${credPath}.new.${process.pid}.${Date.now()}`;
     let targetUid: number | null = null;
     let targetGid: number | null = null;
     try {
-      const existingStat = fs.statSync(CREDENTIALS_PATH);
+      const existingStat = fs.statSync(credPath);
       targetUid = existingStat.uid;
       targetGid = existingStat.gid;
     } catch {
@@ -224,7 +238,7 @@ function saveCredentials(
           );
         }
       }
-      fs.renameSync(tmpPath, CREDENTIALS_PATH);
+      fs.renameSync(tmpPath, credPath);
     } catch (writeErr) {
       // Clean up the temp file if rename failed.
       try {

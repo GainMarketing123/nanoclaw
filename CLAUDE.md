@@ -2,15 +2,16 @@
 
 ## Identity
 
-Personal Claude assistant (v2.0.0). The Atlas runtime that sits on the VPS — a single Node.js orchestrator that routes messages from chat channels (Telegram, WhatsApp, Slack, Discord, Gmail) into containerized Claude Agent SDK sessions. Each "group" is an isolated filesystem + memory boundary. Three-layer execution: orchestrator → host-executor (`claude -p` on the VPS host) → containers (Tier 2+ uses `--worktree` isolation for parallel work).
+Personal Claude assistant (v2.0.0). The Atlas runtime that sits on the VPS — a single Node.js orchestrator that routes messages from chat channels (Teams, WhatsApp, Slack, Discord, Gmail) into containerized Claude Agent SDK sessions. Each "group" is an isolated filesystem + memory boundary. Three-layer execution: orchestrator → host-executor (`claude -p` on the VPS host) → containers (Tier 2+ uses `--worktree` isolation for parallel work).
 
 The README + `docs/REQUIREMENTS.md` are the deeper architecture references.
 
 ## Current State
 
 - **Version:** v2.0.0 (Mission Control redesign — bridge-first, SQLite-backed mission lifecycle).
-- **Mission lifecycle:** `create → pending_approval → approved → executing → synthesis → complete`. Missions flow through the Atlas Bridge (HTTP) for Paperclip integration, constraint enforcement, security evaluation. CEO approves/rejects via Telegram inline keyboards.
-- **Auth gating:** CEO-only commands gated by `TELEGRAM_CEO_USER_ID`.
+- **2026-06-03 comms cleanup (live on VPS):** Telegram channel REMOVED (grammy dropped); Teams is the primary channel. Fixed a loom-before-allowlist auth-bypass (allowlist now runs first), a NaN-timeout guard, an EACCES credential-read fallback plus matching write-path fallback, and enforced a single-`is_main` registered-group invariant at the DB layer.
+- **Mission lifecycle:** `create → pending_approval → approved → executing → synthesis → complete`. Missions flow through the Atlas Bridge (HTTP) for Paperclip integration, constraint enforcement, security evaluation. CEO approves/rejects via Teams.
+- **Auth gating:** CEO-only commands gated by the Teams `isOwner()` owner-gate (the legacy `TELEGRAM_CEO_USER_ID` sender-match was removed 2026-06-03 with the Telegram channel).
 - **Atlas paths quartet (post-2026-05-08):** nanoclaw carries a byte-identical copy of `lib/atlas_paths.py` matching atlas-engineering / atlas-operations / atlas-shared. `host/host-executor.py` uses the shared `env_or_home(strict=...)` helper.
 - **Phase 3.0 (1.A.6) landed 2026-05-04:** host-executor paths block fail-closes when `ATLAS_HOST_MODE=production`. Module-level `_ATLAS_LIB_PATH` prefers root-owned `/usr/local/lib/atlas` when complete, else falls back to `ATLAS_DIR/lib`. SSRF `ImportError` handler fail-closes (rejects task) instead of logging-and-continuing. `git-sync.sh` mirrors `~/.atlas/lib` into `/usr/local/lib/atlas` after every atlas-core pull (sudoers grant at `infra/sudoers.d/atlas-rsync`).
 - **Phase 3.1 (1.A.6) landed 2026-05-05:** `ANTHROPIC_API_KEY` migrated from `EnvironmentFile=` to systemd `LoadCredential=` (root-owned source `/etc/atlas/anthropic-api-key.secret`, mode 0400). `_load_anthropic_api_key()` order: `$CREDENTIALS_DIRECTORY/anthropic-api-key` → env var → `.env`. Verified end-to-end via synthetic `/quality-check` probe (Haiku grading, 6.2s).
