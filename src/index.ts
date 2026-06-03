@@ -81,9 +81,10 @@ const queue = new GroupQueue();
 // Loom (learning-brain) Q&A over Teams: a "loom ..." message is answered from
 // the course brain instead of spawning the agent. Long timeout because a course
 // answer runs Claude server-side (~20-40s); the 5s default would always trip.
+const _loomTimeoutRaw = Number(process.env.LOOM_BRAIN_TIMEOUT_MS);
 const LOOM_BRAIN = new SecondBrainClient(
   process.env.BRAIN_BASE_URL || 'http://127.0.0.1:8000',
-  { timeoutMs: parseInt(process.env.LOOM_BRAIN_TIMEOUT_MS || '45000', 10) },
+  { timeoutMs: Number.isFinite(_loomTimeoutRaw) ? _loomTimeoutRaw : 45000 },
 );
 const LOOM_ENTITY_SLUG = process.env.LOOM_ENTITY_SLUG || 'learning';
 
@@ -697,6 +698,37 @@ async function main(): Promise<void> {
         }
       }
 
+      // 3d-2: Failure ack — denied sender gets a specific reason, not silence.
+      // MUST run before loom dispatch: a denied sender must not reach the
+      // course-brain Q&A path (auth-bypass fix for F1 from d72146a cross-review).
+      if (!msg.is_from_me && !msg.is_bot_message && registeredGroups[chatJid]) {
+        const cfg = loadSenderAllowlist();
+        if (
+          shouldDropMessage(chatJid, cfg) &&
+          !isSenderAllowed(chatJid, msg.sender, cfg)
+        ) {
+          if (cfg.logDenied) {
+            logger.debug(
+              { chatJid, sender: msg.sender },
+              'sender-allowlist: dropping message (drop mode)',
+            );
+          }
+          // Send denial ack to the group
+          const channel = findChannel(channels, chatJid);
+          if (channel) {
+            channel
+              .sendMessage(
+                chatJid,
+                `Message from ${msg.sender_name || 'unknown sender'} — not on the approved sender list for this group.`,
+              )
+              .catch((err) =>
+                logger.warn({ chatJid, err }, 'Failed to send denial ack'),
+              );
+          }
+          return;
+        }
+      }
+
       // Loom (learning-brain) course Q&A — "loom <question>" answers from the
       // course brain instead of the agent. Intercept before storage.
       const loomQuestion = parseLoomQuestion(trimmed);
@@ -730,34 +762,6 @@ async function main(): Promise<void> {
         return;
       }
 
-      // 3d-2: Failure ack — denied sender gets a specific reason, not silence
-      if (!msg.is_from_me && !msg.is_bot_message && registeredGroups[chatJid]) {
-        const cfg = loadSenderAllowlist();
-        if (
-          shouldDropMessage(chatJid, cfg) &&
-          !isSenderAllowed(chatJid, msg.sender, cfg)
-        ) {
-          if (cfg.logDenied) {
-            logger.debug(
-              { chatJid, sender: msg.sender },
-              'sender-allowlist: dropping message (drop mode)',
-            );
-          }
-          // Send denial ack to the group
-          const channel = findChannel(channels, chatJid);
-          if (channel) {
-            channel
-              .sendMessage(
-                chatJid,
-                `Message from ${msg.sender_name || 'unknown sender'} — not on the approved sender list for this group.`,
-              )
-              .catch((err) =>
-                logger.warn({ chatJid, err }, 'Failed to send denial ack'),
-              );
-          }
-          return;
-        }
-      }
       storeMessage(msg);
     },
     // Auto-register the owner's 1:1 chat as the main control group the first
