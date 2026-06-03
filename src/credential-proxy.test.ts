@@ -2,7 +2,9 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import http from 'http';
 import type { AddressInfo } from 'net';
 
-const mockEnv: Record<string, string> = {};
+// vi.mock factories are hoisted before const declarations — use vi.hoisted so
+// mockEnv is available in the factory without a TDZ ReferenceError.
+const mockEnv = vi.hoisted(() => ({} as Record<string, string>));
 vi.mock('./env.js', () => ({
   readEnvFile: vi.fn(() => ({ ...mockEnv })),
 }));
@@ -10,6 +12,20 @@ vi.mock('./env.js', () => ({
 vi.mock('./logger.js', () => ({
   logger: { info: vi.fn(), error: vi.fn(), debug: vi.fn(), warn: vi.fn() },
 }));
+
+// Prevent loadCredentials() from reading the real ~/.claude/.credentials.json
+// on the dev machine. The test controls tokens exclusively via mockEnv.
+vi.mock('fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('fs')>();
+  const patched = {
+    ...actual,
+    existsSync: (p: Parameters<(typeof actual)['existsSync']>[0]) => {
+      if (typeof p === 'string' && p.endsWith('.credentials.json')) return false;
+      return actual.existsSync(p);
+    },
+  };
+  return { ...patched, default: patched };
+});
 
 import { startCredentialProxy } from './credential-proxy.js';
 

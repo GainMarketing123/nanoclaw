@@ -115,7 +115,3 @@ export const BRIDGE_CALLBACK_PORT = parseInt(
   process.env.BRIDGE_CALLBACK_PORT || '3002',
   10,
 );
-
-// CEO Telegram user ID — gates dangerous commands (approve, pause, reset-mode)
-// This is ctx.from.id (user ID), NOT ctx.chat.id (chat ID)
-export const TELEGRAM_CEO_USER_ID = process.env.TELEGRAM_CEO_USER_ID || '';

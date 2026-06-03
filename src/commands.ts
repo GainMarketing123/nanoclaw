@@ -16,7 +16,6 @@ import {
   ATLAS_STATE_DIR,
   ATLAS_OPS_DIR,
   BRIDGE_CALLBACK_PORT,
-  TELEGRAM_CEO_USER_ID,
 } from './config.js';
 import { CONTAINER_RUNTIME_BIN, stopContainer } from './container-runtime.js';
 import {
@@ -75,16 +74,6 @@ const APPROVAL_REJECTED_DIR = path.join(
   'rejected',
 );
 
-// Dangerous commands that require CEO sender verification
-const CEO_ONLY_COMMANDS = new Set([
-  '/approve',
-  '/reject',
-  '/pause',
-  '/resume',
-  '/reset-mode',
-  '/mission',
-]);
-
 // Model weights for quota display (mirrors governance/quota.ts)
 const MODEL_WEIGHTS: Record<string, number> = {
   haiku: 0.1,
@@ -102,7 +91,7 @@ interface CommandResult {
  * Returns { handled: true, response } if it was a command, { handled: false } otherwise.
  * Only processes commands from main group.
  *
- * @param sender - Telegram user ID (ctx.from.id) for CEO-only command gating
+ * @param sender - Sender identity (used for logging; channel-level owner gate handles auth)
  */
 export function handleCommand(text: string, sender?: string): CommandResult {
   const trimmed = text.trim();
@@ -111,31 +100,6 @@ export function handleCommand(text: string, sender?: string): CommandResult {
   const parts = trimmed.split(/\s+/);
   const cmd = parts[0].toLowerCase();
   const args = parts.slice(1);
-
-  // CEO-only gate: dangerous commands require verified sender.
-  // Fail-closed: if TELEGRAM_CEO_USER_ID is unset, ALL users are blocked (not all pass).
-  if (CEO_ONLY_COMMANDS.has(cmd)) {
-    if (!TELEGRAM_CEO_USER_ID) {
-      logger.warn(
-        { cmd },
-        'CEO-only command blocked: TELEGRAM_CEO_USER_ID not configured',
-      );
-      return {
-        handled: true,
-        response: `${cmd} blocked — CEO user ID not configured on this server.`,
-      };
-    }
-    if (!sender || sender !== TELEGRAM_CEO_USER_ID) {
-      logger.warn(
-        { cmd, sender, expected: TELEGRAM_CEO_USER_ID },
-        'CEO-only command rejected: sender mismatch',
-      );
-      return {
-        handled: true,
-        response: `Command ${cmd} requires CEO authorization.`,
-      };
-    }
-  }
 
   switch (cmd) {
     case '/pause':

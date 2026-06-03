@@ -610,18 +610,6 @@ async function main(): Promise<void> {
   invalidateStaleClaudeMdSessions();
   restoreRemoteControl();
 
-  // Startup validation: warn loudly if CEO user ID is not configured.
-  // All CEO-only commands (approve, reject, pause, resume, reset-mode, mission)
-  // will be blocked at runtime — this makes misconfiguration a boot-time signal
-  // rather than a silent runtime surprise.
-  if (!process.env.TELEGRAM_CEO_USER_ID) {
-    const msg =
-      '⚠️  TELEGRAM_CEO_USER_ID not set — all CEO-only commands will be blocked. ' +
-      'Set this env var to enable /approve, /reject, /mission, /pause, /resume, /reset-mode.';
-    logger.warn(msg);
-    console.warn(`\n  ${msg}\n`);
-  }
-
   // Start credential proxy (containers route API calls through this)
   const proxyServer = await startCredentialProxy(
     CREDENTIAL_PROXY_PORT,
