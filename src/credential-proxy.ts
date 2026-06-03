@@ -52,9 +52,23 @@ export interface ProxyConfig {
   authMode: AuthMode;
 }
 
-// Credentials file path (where Claude Code stores OAuth tokens)
-// Uses HOST_CLAUDE_DIR so services running as non-atlas users still find the right file.
+// Credentials file path (where Claude Code stores OAuth tokens).
+// Uses HOST_CLAUDE_DIR (= CLAUDE_CONFIG_DIR env or ~/home/.claude) so services
+// running as non-atlas users still find the right file.
+// NOTE: when CLAUDE_CONFIG_DIR is set in the shared /etc/atlas/atlas.env for the
+// Phase 3.2 nanoclaw-he migration, ALL services that source that file inherit the
+// value — including the nanoclaw orchestrator which may run as a different user.
+// loadCredentials() handles the resulting EACCES by trying the process-effective
+// home .credentials.json as a fallback before giving up.
 const CREDENTIALS_PATH = path.join(HOST_CLAUDE_DIR, '.credentials.json');
+// Process-effective home fallback: used by loadCredentials() when CREDENTIALS_PATH
+// is not readable due to EACCES (shared-env CLAUDE_CONFIG_DIR pointing at another
+// user's .claude directory). Computed once so both load and save use the same path.
+const CREDENTIALS_PATH_FALLBACK = path.join(
+  os.homedir(),
+  '.claude',
+  '.credentials.json',
+);
 
 // Anthropic OAuth endpoints
 const OAUTH_BASE = 'https://claude.ai';
@@ -82,31 +96,58 @@ interface OAuthCredentials {
 }
 
 /**
+ * Read the raw OAuthCredentials record from disk, trying CREDENTIALS_PATH
+ * first and CREDENTIALS_PATH_FALLBACK on EACCES.
+ * Returns null when neither path has a usable record.
+ */
+function readRawOauthRecord(): OAuthCredentials | null {
+  const pathsToTry =
+    CREDENTIALS_PATH_FALLBACK !== CREDENTIALS_PATH
+      ? [CREDENTIALS_PATH, CREDENTIALS_PATH_FALLBACK]
+      : [CREDENTIALS_PATH];
+
+  for (const credPath of pathsToTry) {
+    try {
+      if (!fs.existsSync(credPath)) continue;
+      const data = JSON.parse(fs.readFileSync(credPath, 'utf-8'));
+      const oauth: OAuthCredentials = data.claudeAiOauth;
+      if (oauth?.accessToken) return oauth;
+    } catch (err: unknown) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code === 'EACCES' && credPath === CREDENTIALS_PATH) {
+        logger.warn(
+          { configured: credPath, fallback: CREDENTIALS_PATH_FALLBACK },
+          'EACCES reading credentials.json — trying process-home fallback',
+        );
+        continue;
+      }
+      // Other read/parse errors: skip silently (non-fatal caller handles it)
+    }
+  }
+  return null;
+}
+
+/**
  * Read OAuth credentials from ~/.claude/.credentials.json.
  * Falls back to .env CLAUDE_CODE_OAUTH_TOKEN if file doesn't exist.
+ *
+ * EACCES handling: if CLAUDE_CONFIG_DIR in the shared atlas.env points at
+ * nanoclaw-he's .claude dir but this process runs as a different user, the
+ * primary path throws EACCES. readRawOauthRecord() falls through to the
+ * process-effective home path before giving up. Root fix: scope
+ * CLAUDE_CONFIG_DIR to the host-executor service unit only.
  */
 function loadCredentials(envFallback?: string): {
   accessToken: string;
   refreshToken: string | null;
 } {
-  try {
-    if (fs.existsSync(CREDENTIALS_PATH)) {
-      const data = JSON.parse(fs.readFileSync(CREDENTIALS_PATH, 'utf-8'));
-      const oauth: OAuthCredentials = data.claudeAiOauth;
-      if (oauth?.accessToken) {
-        return {
-          accessToken: oauth.accessToken,
-          refreshToken: oauth.refreshToken || null,
-        };
-      }
-    }
-  } catch (err) {
-    logger.warn(
-      { err },
-      'Failed to read credentials.json, falling back to .env',
-    );
+  const oauth = readRawOauthRecord();
+  if (oauth) {
+    return {
+      accessToken: oauth.accessToken,
+      refreshToken: oauth.refreshToken || null,
+    };
   }
-
   // Fallback to .env token (no refresh capability)
   return {
     accessToken: envFallback || '',
@@ -512,9 +553,9 @@ export function startCredentialProxy(
   if (authMode === 'oauth') {
     setInterval(() => {
       try {
-        if (!fs.existsSync(CREDENTIALS_PATH)) return;
-        const data = JSON.parse(fs.readFileSync(CREDENTIALS_PATH, 'utf-8'));
-        const oauth: OAuthCredentials = data.claudeAiOauth;
+        // Use readRawOauthRecord() so EACCES on CREDENTIALS_PATH falls back
+        // to the process-home path instead of silently skipping the refresh.
+        const oauth = readRawOauthRecord();
         if (!oauth?.expiresAt || !oauth?.refreshToken) return;
 
         const timeToExpiry = oauth.expiresAt - Date.now();
