@@ -25,6 +25,13 @@ let loopIterations = 0;
 let loopStarted = false;
 
 /**
+ * Wall-clock ms when this module loaded (≈ process start). Used to bound the
+ * "still booting" window so a startup wedge before the first heartbeat does not
+ * report healthy forever (see getHealthSnapshot's startup-grace branch).
+ */
+let processStartedAt = Date.now();
+
+/**
  * Called once per message-loop iteration. Cheap and allocation-free so it can
  * sit on the hot path without measurable cost.
  */
@@ -48,6 +55,8 @@ export interface HealthSnapshot {
   loopIterations: number;
   /** The stall threshold the verdict was computed against. */
   stallThresholdMs: number;
+  /** ms elapsed since process start. */
+  uptimeMs: number;
   /** Human-readable reason when unhealthy; undefined when healthy. */
   reason?: string;
 }
@@ -56,32 +65,47 @@ export interface HealthSnapshot {
  * Compute the current liveness verdict.
  *
  * Healthy when:
- *   - the loop has not started yet (process is still booting — `pgrep` plus
- *     systemd's own startup timeout own that window), OR
+ *   - the loop has not started yet AND the process is still inside the startup
+ *     grace window (a normal cold start: channel auth + DB open), OR
  *   - the loop has beaten within `stallThresholdMs`.
  *
- * Unhealthy when the loop started and the last heartbeat is older than the
- * threshold — i.e. the work loop is wedged.
+ * Unhealthy when:
+ *   - the loop never started AND the startup grace window has elapsed — i.e. a
+ *     startup wedge (e.g. a hung `channel.connect()`); the process is up so
+ *     `pgrep` passes, but it never reached the work loop. Without this bound
+ *     /health would report healthy forever, defeating the watchdog for the
+ *     exact internal-stall class it exists to catch. OR
+ *   - the loop started and the last heartbeat is older than the threshold —
+ *     i.e. the work loop is wedged.
  *
  * @param stallThresholdMs how stale the heartbeat may get before we call it
  *   wedged. Should be comfortably larger than POLL_INTERVAL plus the longest
  *   expected in-loop await, so a normal busy iteration never trips it.
+ * @param startupGraceMs how long the process may sit pre-first-heartbeat before
+ *   a never-started loop is reported unhealthy. Should cover a normal cold start.
  */
 export function getHealthSnapshot(
   stallThresholdMs: number,
+  startupGraceMs: number,
   now: number = Date.now(),
 ): HealthSnapshot {
   const sinceLastBeatMs = lastLoopBeat === 0 ? 0 : now - lastLoopBeat;
+  const uptimeMs = now - processStartedAt;
 
-  // Booting: loop hasn't run yet. Healthy — startup is owned elsewhere.
+  // Booting: loop hasn't run yet.
   if (!loopStarted) {
+    const startupWedged = uptimeMs > startupGraceMs;
     return {
-      healthy: true,
+      healthy: !startupWedged,
       loopStarted: false,
       lastLoopBeat,
       sinceLastBeatMs,
       loopIterations,
       stallThresholdMs,
+      uptimeMs,
+      reason: startupWedged
+        ? `startup wedged: message loop has not started ${uptimeMs}ms after process start (grace ${startupGraceMs}ms)`
+        : undefined,
     };
   }
 
@@ -93,15 +117,22 @@ export function getHealthSnapshot(
     sinceLastBeatMs,
     loopIterations,
     stallThresholdMs,
+    uptimeMs,
     reason: stalled
       ? `message loop stalled: no heartbeat for ${sinceLastBeatMs}ms (threshold ${stallThresholdMs}ms)`
       : undefined,
   };
 }
 
-/** Reset module state. Test-only. */
-export function _resetHealthState(): void {
+/**
+ * Reset module state. Test-only.
+ *
+ * @param startedAt optional override for the process-start baseline so tests can
+ *   exercise the startup-grace branch deterministically (defaults to now).
+ */
+export function _resetHealthState(startedAt: number = Date.now()): void {
   lastLoopBeat = 0;
   loopIterations = 0;
   loopStarted = false;
+  processStartedAt = startedAt;
 }

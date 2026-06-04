@@ -8,12 +8,14 @@ import {
   GROUPS_DIR,
   HEALTH_PORT,
   HEALTH_STALL_THRESHOLD_MS,
+  HEALTH_STARTUP_GRACE_MS,
   IDLE_TIMEOUT,
   POLL_INTERVAL,
   TIMEZONE,
   TRIGGER_PATTERN,
 } from './config.js';
 import { startCredentialProxy } from './credential-proxy.js';
+import { readEnvFile } from './env.js';
 import { recordLoopBeat } from './health.js';
 import { startHealthServer } from './health-server.js';
 import './channels/index.js';
@@ -86,9 +88,34 @@ const queue = new GroupQueue();
 // the course brain instead of spawning the agent. Long timeout because a course
 // answer runs Claude server-side (~20-40s); the 5s default would always trip.
 const _loomTimeoutRaw = Number(process.env.LOOM_BRAIN_TIMEOUT_MS);
+// Loom brain config follows this repo's .env contract (the same SECOND_BRAIN_*
+// keys .env.example documents): read from the project-root .env FILE via
+// readEnvFile, NOT process.env. SECOND_BRAIN_API_KEY is a SECRET, and env.ts's
+// explicit contract is to keep secrets in the file and out of process.env so
+// they don't leak to child processes (same as ANTHROPIC_API_KEY / Teams creds).
+// process.env still wins as an override for systemd EnvironmentFile= deploys;
+// BRAIN_BASE_URL is a legacy fallback for installs that set it before the
+// SECOND_BRAIN_BASE_URL rename. The API key MUST be passed through — the
+// SecondBrainClient only sends the auth header when apiKey is set, so omitting
+// it makes loom Q&A fail (or silently degrade) against a protected remote brain.
+const _loomEnv = readEnvFile([
+  'SECOND_BRAIN_BASE_URL',
+  'SECOND_BRAIN_API_KEY',
+  'BRAIN_BASE_URL',
+]);
 const LOOM_BRAIN = new SecondBrainClient(
-  process.env.BRAIN_BASE_URL || 'http://127.0.0.1:8000',
-  { timeoutMs: Number.isFinite(_loomTimeoutRaw) ? _loomTimeoutRaw : 45000 },
+  process.env.SECOND_BRAIN_BASE_URL ||
+    _loomEnv.SECOND_BRAIN_BASE_URL ||
+    process.env.BRAIN_BASE_URL ||
+    _loomEnv.BRAIN_BASE_URL ||
+    'http://127.0.0.1:8000',
+  {
+    timeoutMs: Number.isFinite(_loomTimeoutRaw) ? _loomTimeoutRaw : 45000,
+    apiKey:
+      process.env.SECOND_BRAIN_API_KEY ||
+      _loomEnv.SECOND_BRAIN_API_KEY ||
+      undefined,
+  },
 );
 const LOOM_ENTITY_SLUG = process.env.LOOM_ENTITY_SLUG || 'learning';
 
@@ -125,6 +152,25 @@ function loadState(): void {
   }
   sessions = getAllSessions();
   registeredGroups = getAllRegisteredGroups();
+  // Defensive single-main normalization. setRegisteredGroup enforces a single
+  // is_main=1 row on WRITE, but legacy data predating that invariant (e.g. a
+  // Telegram main left behind after the Teams migration) could still carry two
+  // is_main=1 rows. Without this, loadState would revive BOTH as isMain in
+  // memory on every restart, re-creating the two-privileged-chats bug the
+  // write-path guard fixes. Keep the first main, demote the rest in memory.
+  let mainSeen = false;
+  for (const [jid, group] of Object.entries(registeredGroups)) {
+    if (!group.isMain) continue;
+    if (mainSeen) {
+      logger.warn(
+        { jid, name: group.name },
+        'Demoting duplicate is_main group on load (single-main invariant)',
+      );
+      registeredGroups[jid] = { ...group, isMain: undefined };
+    } else {
+      mainSeen = true;
+    }
+  }
   logger.info(
     { groupCount: Object.keys(registeredGroups).length },
     'State loaded',
@@ -203,8 +249,26 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
     return;
   }
 
-  registeredGroups[jid] = group;
+  // Persist to the DB FIRST (atomic single-main transaction in
+  // setRegisteredGroup), then mirror the result in memory only on success. If
+  // the DB write throws, process memory is left untouched and stays consistent
+  // with the database rather than being mutated ahead of a failed persist.
   setRegisteredGroup(jid, group);
+
+  // Mirror the DB-layer single-main invariant in the in-memory map. The router
+  // and command path trust `registeredGroups[chatJid]?.isMain`, not the DB, so
+  // promoting a new main must demote every other in-memory entry too —
+  // otherwise the old main keeps its privileges until process restart, leaving
+  // two simultaneously-privileged chats in memory (out of sync with the DB,
+  // which `setRegisteredGroup` keeps single-main).
+  if (group.isMain) {
+    for (const [otherJid, otherGroup] of Object.entries(registeredGroups)) {
+      if (otherJid !== jid && otherGroup.isMain) {
+        registeredGroups[otherJid] = { ...otherGroup, isMain: undefined };
+      }
+    }
+  }
+  registeredGroups[jid] = group;
 
   // Create group folder
   fs.mkdirSync(path.join(groupDir, 'logs'), { recursive: true });
@@ -637,6 +701,7 @@ async function main(): Promise<void> {
     healthServer = await startHealthServer(
       HEALTH_PORT,
       HEALTH_STALL_THRESHOLD_MS,
+      HEALTH_STARTUP_GRACE_MS,
     );
   } catch (err) {
     logger.error({ err, port: HEALTH_PORT }, 'Failed to start health server');

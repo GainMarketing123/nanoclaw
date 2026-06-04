@@ -27,6 +27,7 @@ import { logger } from './logger.js';
 export function startHealthServer(
   port: number,
   stallThresholdMs: number,
+  startupGraceMs: number,
   host = '127.0.0.1',
 ): Promise<Server> {
   return new Promise((resolve, reject) => {
@@ -39,7 +40,7 @@ export function startHealthServer(
         return;
       }
 
-      const snapshot = getHealthSnapshot(stallThresholdMs);
+      const snapshot = getHealthSnapshot(stallThresholdMs, startupGraceMs);
       const statusCode = snapshot.healthy ? 200 : 503;
       const payload = {
         status: snapshot.healthy ? 'ok' : 'unhealthy',

@@ -9,22 +9,35 @@ import {
 } from './health.js';
 import { startHealthServer } from './health-server.js';
 
+const GRACE_MS = 120_000;
+
 describe('health snapshot', () => {
   beforeEach(() => {
     _resetHealthState();
   });
 
-  it('reports healthy while the loop has not started yet (booting)', () => {
-    const snap = getHealthSnapshot(60_000);
+  it('reports healthy while the loop has not started yet (within startup grace)', () => {
+    // Anchor the process-start baseline so the injected `now` stays inside grace.
+    _resetHealthState(0);
+    const snap = getHealthSnapshot(60_000, GRACE_MS, 5_000);
     expect(snap.healthy).toBe(true);
     expect(snap.loopStarted).toBe(false);
     expect(snap.reason).toBeUndefined();
   });
 
+  it('reports UNHEALTHY when the loop never starts past the startup grace (startup wedge)', () => {
+    // Process started at t=0; loop never beat; now is past the grace window.
+    _resetHealthState(0);
+    const snap = getHealthSnapshot(60_000, GRACE_MS, GRACE_MS + 1);
+    expect(snap.healthy).toBe(false);
+    expect(snap.loopStarted).toBe(false);
+    expect(snap.reason).toMatch(/startup wedged/);
+  });
+
   it('reports healthy when the loop beat within the stall threshold', () => {
     const now = 1_000_000;
     recordLoopBeat(now);
-    const snap = getHealthSnapshot(60_000, now + 5_000);
+    const snap = getHealthSnapshot(60_000, GRACE_MS, now + 5_000);
     expect(snap.healthy).toBe(true);
     expect(snap.loopStarted).toBe(true);
     expect(snap.sinceLastBeatMs).toBe(5_000);
@@ -34,7 +47,7 @@ describe('health snapshot', () => {
   it('reports unhealthy when the heartbeat is older than the threshold', () => {
     const now = 1_000_000;
     recordLoopBeat(now);
-    const snap = getHealthSnapshot(60_000, now + 60_001);
+    const snap = getHealthSnapshot(60_000, GRACE_MS, now + 60_001);
     expect(snap.healthy).toBe(false);
     expect(snap.reason).toMatch(/stalled/);
     expect(snap.sinceLastBeatMs).toBe(60_001);
@@ -43,16 +56,20 @@ describe('health snapshot', () => {
   it('recovers to healthy once a fresh beat lands after a stall', () => {
     const start = 2_000_000;
     recordLoopBeat(start);
-    expect(getHealthSnapshot(60_000, start + 120_000).healthy).toBe(false);
+    expect(getHealthSnapshot(60_000, GRACE_MS, start + 120_000).healthy).toBe(
+      false,
+    );
     recordLoopBeat(start + 120_000);
-    expect(getHealthSnapshot(60_000, start + 121_000).healthy).toBe(true);
+    expect(getHealthSnapshot(60_000, GRACE_MS, start + 121_000).healthy).toBe(
+      true,
+    );
   });
 
   it('counts iterations', () => {
     recordLoopBeat(1);
     recordLoopBeat(2);
     recordLoopBeat(3);
-    expect(getHealthSnapshot(60_000, 3).loopIterations).toBe(3);
+    expect(getHealthSnapshot(60_000, GRACE_MS, 3).loopIterations).toBe(3);
   });
 });
 
@@ -60,11 +77,14 @@ describe('health HTTP endpoint', () => {
   let server: Awaited<ReturnType<typeof startHealthServer>>;
   let baseUrl: string;
   const STALL_MS = 60_000;
+  // Large grace so the live-HTTP "booting" case stays healthy under real wall
+  // clock (these tests don't inject `now` into the server handler).
+  const STARTUP_GRACE_MS = 10 * 60_000;
 
   beforeEach(async () => {
     _resetHealthState();
     // port 0 => ephemeral free port, avoids clashing with a running orchestrator
-    server = await startHealthServer(0, STALL_MS);
+    server = await startHealthServer(0, STALL_MS, STARTUP_GRACE_MS);
     const port = (server.address() as AddressInfo).port;
     baseUrl = `http://127.0.0.1:${port}`;
   });

@@ -81,6 +81,18 @@ function escapeRegex(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+/**
+ * Parse a positive-integer env value, falling back to `fallback` when the value
+ * is unset, non-numeric, or not a positive integer. Plain parseInt would let a
+ * typo'd env value flow through as NaN; for the health thresholds that turns the
+ * liveness comparisons (sinceLastBeatMs > stallThresholdMs) into `> NaN`, which
+ * is always false, so /health would never report a stall. Guard at the source.
+ */
+function parsePositiveInt(raw: string | undefined, fallback: number): number {
+  const n = parseInt(raw ?? '', 10);
+  return Number.isInteger(n) && n > 0 ? n : fallback;
+}
+
 export const TRIGGER_PATTERN = new RegExp(
   `^@${escapeRegex(ASSISTANT_NAME)}\\b`,
   'i',
@@ -120,13 +132,25 @@ export const BRIDGE_CALLBACK_PORT = parseInt(
 // atlas-watchdog can detect an internally-wedged process (the message loop
 // stalled) that a bare `pgrep` still sees as "alive". Loopback-only; 3001 is
 // the credential proxy, 3002 the bridge callback.
-export const HEALTH_PORT = parseInt(process.env.HEALTH_PORT || '3003', 10);
+export const HEALTH_PORT = parsePositiveInt(process.env.HEALTH_PORT, 3003);
 
 // How stale the message-loop heartbeat may get before /health reports 503.
 // Must sit comfortably above POLL_INTERVAL (2s) plus any in-loop await so a
 // normal busy iteration never trips it; 60s flags a genuine wedge fast enough
 // for the watchdog without false positives under load.
-export const HEALTH_STALL_THRESHOLD_MS = parseInt(
-  process.env.HEALTH_STALL_THRESHOLD_MS || '60000',
-  10,
+export const HEALTH_STALL_THRESHOLD_MS = parsePositiveInt(
+  process.env.HEALTH_STALL_THRESHOLD_MS,
+  60000,
+);
+
+// How long the process may sit pre-first-heartbeat (still booting) before
+// /health reports unhealthy. The health server starts BEFORE channel.connect()
+// and startMessageLoop(), so without a bound a startup wedge (e.g. a hung
+// channel connect) would keep /health returning 200 forever — defeating the
+// watchdog for the exact internal-stall class it exists to catch. Generous
+// enough to cover a normal cold start (channel auth + DB open) without
+// false-tripping; once exceeded, /health returns 503 until the loop beats.
+export const HEALTH_STARTUP_GRACE_MS = parsePositiveInt(
+  process.env.HEALTH_STARTUP_GRACE_MS,
+  120000,
 );
