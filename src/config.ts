@@ -115,3 +115,18 @@ export const BRIDGE_CALLBACK_PORT = parseInt(
   process.env.BRIDGE_CALLBACK_PORT || '3002',
   10,
 );
+
+// Health endpoint port — the orchestrator serves GET /health here so the
+// atlas-watchdog can detect an internally-wedged process (the message loop
+// stalled) that a bare `pgrep` still sees as "alive". Loopback-only; 3001 is
+// the credential proxy, 3002 the bridge callback.
+export const HEALTH_PORT = parseInt(process.env.HEALTH_PORT || '3003', 10);
+
+// How stale the message-loop heartbeat may get before /health reports 503.
+// Must sit comfortably above POLL_INTERVAL (2s) plus any in-loop await so a
+// normal busy iteration never trips it; 60s flags a genuine wedge fast enough
+// for the watchdog without false positives under load.
+export const HEALTH_STALL_THRESHOLD_MS = parseInt(
+  process.env.HEALTH_STALL_THRESHOLD_MS || '60000',
+  10,
+);

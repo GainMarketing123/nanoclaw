@@ -6,12 +6,16 @@ import {
   ASSISTANT_NAME,
   CREDENTIAL_PROXY_PORT,
   GROUPS_DIR,
+  HEALTH_PORT,
+  HEALTH_STALL_THRESHOLD_MS,
   IDLE_TIMEOUT,
   POLL_INTERVAL,
   TIMEZONE,
   TRIGGER_PATTERN,
 } from './config.js';
 import { startCredentialProxy } from './credential-proxy.js';
+import { recordLoopBeat } from './health.js';
+import { startHealthServer } from './health-server.js';
 import './channels/index.js';
 import {
   getChannelFactory,
@@ -489,6 +493,12 @@ async function startMessageLoop(): Promise<void> {
   logger.info(`NanoClaw running (trigger: @${ASSISTANT_NAME})`);
 
   while (true) {
+    // Heartbeat: stamp each iteration so /health can tell a wedged loop apart
+    // from a live one. Recorded at the top of the body so reaching the next
+    // pass proves the loop is iterating (and that the prior iteration's awaits
+    // resolved). A wedge mid-iteration leaves this stale, which /health reports
+    // as 503.
+    recordLoopBeat();
     try {
       const jids = Object.keys(registeredGroups);
       const { messages, newTimestamp } = getNewMessages(
@@ -617,10 +627,26 @@ async function main(): Promise<void> {
     PROXY_BIND_HOST,
   );
 
+  // Start health endpoint (loopback) so the atlas-watchdog can detect an
+  // internally-wedged process — the message loop stalling while the process
+  // is still up — instead of only pgrep-ing for liveness. Best-effort: a
+  // failure to bind the health port must not stop the orchestrator from
+  // serving messages, so log and continue rather than crash.
+  let healthServer: import('http').Server | null = null;
+  try {
+    healthServer = await startHealthServer(
+      HEALTH_PORT,
+      HEALTH_STALL_THRESHOLD_MS,
+    );
+  } catch (err) {
+    logger.error({ err, port: HEALTH_PORT }, 'Failed to start health server');
+  }
+
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
     proxyServer.close();
+    healthServer?.close();
     await queue.shutdown(10000);
     for (const ch of channels) await ch.disconnect();
     process.exit(0);
