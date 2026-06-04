@@ -1,0 +1,29 @@
+#!/usr/bin/env sh
+
+# Chain into the canonical Atlas pre-push cert gate.
+#
+# Husky v9 sets a repo-local core.hooksPath=.husky/_, which shadows the
+# global core.hooksPath=~/.atlas/hooks Atlas gate and would otherwise let
+# pushes land with no cross-review certificate. This tracked hook is the
+# user-hook husky discovers; it forwards straight into the SAME canonical
+# Atlas pre-push shim that every other Atlas-managed repo uses, so nanoclaw
+# is byte-for-byte consistent with the ecosystem gate (single source of
+# truth — no re-implemented resolution logic that could drift or weaken).
+#
+# Resolution precedence intentionally MIRRORS the canonical Atlas shim
+# (install-git-hooks.sh / ~/.atlas/hooks/pre-push): ${ATLAS_DIR:-$HOME/.atlas}.
+# ATLAS_DIR is REQUIRED for the VPS service-user case (Phase 3.2 nanoclaw-he,
+# whose $HOME has no .atlas/); honoring it here does not widen the attack
+# surface beyond what the canonical shim already permits ecosystem-wide.
+# Intentionally fail-closed: a missing/non-executable gate BLOCKS the push.
+
+ATLAS_GATE="${ATLAS_DIR:-$HOME/.atlas}/hooks/pre-push"
+
+if [ ! -x "$ATLAS_GATE" ]; then
+  echo "BLOCK: Atlas pre-push cert gate not found at '$ATLAS_GATE'. Push blocked fail-closed (security: never fail open)." >&2
+  exit 1
+fi
+
+# exec preserves the git-supplied argv (remote name + url) and stdin
+# (the ref-update spec the gate reads to know what is being pushed).
+exec "$ATLAS_GATE" "$@"
