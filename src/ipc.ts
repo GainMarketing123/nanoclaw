@@ -254,7 +254,7 @@ export async function processTaskIpc(
         data.schedule_value &&
         data.targetJid
       ) {
-        // Resolve the target group from JID — supports both real Telegram JIDs
+        // Resolve the target group from JID — supports both real channel JIDs
         // and logical dispatch: JIDs from the bridge (e.g. "dispatch:atlas_gpg")
         let targetJid = data.targetJid as string;
         let targetGroupEntry = registeredGroups[targetJid];

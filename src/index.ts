@@ -866,7 +866,16 @@ async function main(): Promise<void> {
       if (registeredGroups[chatJid]) return;
       registerGroup(chatJid, {
         name: 'Atlas',
-        folder: 'atlas_teams',
+        // MUST be 'atlas_main': the host-side IPC writers (host/host-executor.py
+        // IPC_DIR and src/credential-proxy.ts) emit alert/result messages from a
+        // hard-coded `data/ipc/atlas_main/messages` source, and startIpcWatcher
+        // authorizes by SOURCE folder (folder===is_main folder). A divergent
+        // folder here would make the main group's folder !== 'atlas_main', so
+        // those CEO alerts (auth-expiry, outage, escalation, task results) would
+        // be rejected as "Unauthorized IPC message attempt blocked" even though
+        // the target JID resolves. 'atlas_main' also matches the name→folder
+        // convention ("Atlas" ↔ atlas_main).
+        folder: 'atlas_main',
         trigger: `@${ASSISTANT_NAME}`,
         added_at: new Date().toISOString(),
         requiresTrigger: false,

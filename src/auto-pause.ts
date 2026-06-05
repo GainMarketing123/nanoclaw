@@ -2,7 +2,7 @@
  * Auto-Pause — Safety system for autonomous task execution.
  *
  * Tracks consecutive failures per group, detects scope expansion,
- * and triggers automatic pause with CEO escalation via Telegram.
+ * and triggers automatic pause with CEO escalation via Teams.
  *
  * Session 3c items: 3c-4 (scope expansion detection), 3c-5 (re-evaluation),
  * 3c-6 (auto-pause on uncertainty).

@@ -84,7 +84,12 @@ vi.mock('botbuilder', () => ({
   },
 }));
 
-import { TeamsChannel, teamsJid } from './teams.js';
+import {
+  TeamsChannel,
+  teamsJid,
+  buildInboundMessage,
+  callbackDataToCommand,
+} from './teams.js';
 import type { ChannelOpts } from './registry.js';
 
 function createTestOpts(): ChannelOpts {
@@ -358,6 +363,126 @@ describe('TeamsChannel', () => {
 
       expect(ensureOwnerMainGroup).not.toHaveBeenCalled();
       expect(opts.onMessage).not.toHaveBeenCalled();
+    });
+  });
+
+  // Adaptive Card Action.Submit click-back (Teams migration spec §2.4). A
+  // button tap arrives as a Message activity whose payload is in
+  // `activity.value` (not `activity.text`); it must be translated into the
+  // equivalent `/mission <verb> <id>` command and routed through the SAME
+  // handleCommand path the typed commands use.
+  describe('callbackDataToCommand (card → command translation)', () => {
+    it('translates the producer shape mission:<verb>:<id> → /mission <verb> <id>', () => {
+      expect(callbackDataToCommand('mission:approve:m-123')).toBe(
+        '/mission approve m-123',
+      );
+      expect(callbackDataToCommand('mission:reject:m-123')).toBe(
+        '/mission reject m-123',
+      );
+      expect(callbackDataToCommand('mission:status:m-123')).toBe(
+        '/mission status m-123',
+      );
+      expect(callbackDataToCommand('mission:stop:m-123')).toBe(
+        '/mission stop m-123',
+      );
+    });
+
+    it('fail-closed: returns null for unknown verb, wrong namespace, or malformed payload', () => {
+      expect(callbackDataToCommand('mission:delete:m-123')).toBeNull();
+      expect(callbackDataToCommand('other:approve:m-123')).toBeNull();
+      expect(callbackDataToCommand('mission:approve')).toBeNull();
+      expect(callbackDataToCommand('mission:approve:')).toBeNull();
+      expect(callbackDataToCommand('')).toBeNull();
+      expect(callbackDataToCommand(undefined)).toBeNull();
+      expect(callbackDataToCommand({ callback_data: 'x' })).toBeNull();
+    });
+  });
+
+  describe('buildInboundMessage (Action.Submit payload)', () => {
+    it('synthesizes the command from activity.value.callback_data (text empty)', () => {
+      const { message } = buildInboundMessage({
+        id: 'act-tap',
+        from: { id: 'u', name: 'CEO', aadObjectId: 'owner-aad-1' },
+        conversation: { id: 'personal:c1', conversationType: 'personal' },
+        text: '',
+        value: { callback_data: 'mission:approve:m-777' },
+      } as never);
+      expect(message.content).toBe('/mission approve m-777');
+    });
+
+    it('falls through to raw text when value carries no callback_data (ordinary message)', () => {
+      const result = buildInboundMessage({
+        id: 'act-text',
+        from: { id: 'u', name: 'CEO', aadObjectId: 'owner-aad-1' },
+        conversation: { id: 'personal:c1', conversationType: 'personal' },
+        text: 'hello',
+        value: { something_else: 'noise' },
+      } as never);
+      expect(result.message.content).toBe('hello');
+      // No callback_data present → this is not a card action at all.
+      expect(result.unrecognizedCardAction).toBe(false);
+    });
+
+    it('flags unrecognizedCardAction when callback_data is present but unknown', () => {
+      const result = buildInboundMessage({
+        id: 'act-bad-card',
+        from: { id: 'u', name: 'CEO', aadObjectId: 'owner-aad-1' },
+        conversation: { id: 'personal:c1', conversationType: 'personal' },
+        text: '',
+        value: { callback_data: 'mission:delete:m-9' },
+      } as never);
+      expect(result.unrecognizedCardAction).toBe(true);
+    });
+  });
+
+  describe('Action.Submit round-trip through onTurn → onMessage', () => {
+    it('a button tap reaches onMessage as the synthesized /mission command (same path as typed commands)', async () => {
+      const opts = createTestOpts();
+      const channel = makeChannel(opts);
+      await channel.connect();
+
+      // Simulate the CEO tapping "Approve" on an Adaptive Card: Teams POSTs a
+      // Message activity whose payload is in `value`, text empty.
+      await postActivity({
+        type: 'message',
+        id: 'act-approve-tap',
+        text: '',
+        from: { id: 'u', name: 'CEO', aadObjectId: 'owner-aad-1' },
+        conversation: { id: 'personal:conv-1', conversationType: 'personal' },
+        value: { callback_data: 'mission:approve:m-555' },
+      });
+
+      // The owner gate passed, the chat auto-registered as main, and the tap
+      // was delivered to onMessage AS THE COMMAND STRING — which index.ts then
+      // feeds to handleCommand (proven end-to-end in the next test).
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'msteams:personal:conv-1',
+        expect.objectContaining({
+          content: '/mission approve m-555',
+          is_from_me: false,
+        }),
+      );
+    });
+
+    it('fail-closed: drops an unrecognized card action (no onMessage, no metadata)', async () => {
+      const opts = createTestOpts();
+      const channel = makeChannel(opts);
+      await channel.connect();
+
+      // Owner taps a card whose callback_data is NOT a known verb. It passed
+      // the owner gate, but must NOT be downgraded into a normal (empty-text)
+      // chat message — the turn is dropped before entering the system.
+      await postActivity({
+        type: 'message',
+        id: 'act-bad-tap',
+        text: '',
+        from: { id: 'u', name: 'CEO', aadObjectId: 'owner-aad-1' },
+        conversation: { id: 'personal:conv-1', conversationType: 'personal' },
+        value: { callback_data: 'mission:delete:m-9' },
+      });
+
+      expect(opts.onMessage).not.toHaveBeenCalled();
+      expect(opts.onChatMetadata).not.toHaveBeenCalled();
     });
   });
 

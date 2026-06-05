@@ -612,7 +612,7 @@ ALERT_SOFT_WINDOW_S = 300     # 5 min rolling window
 def _unavailable(reason: str, retryable: bool, detail: str) -> dict:
     """Build the canonical unavailable response dict. Detail is truncated to
     keep the wire body bounded; container side does not need full upstream
-    error text (already in host stderr / Telegram alert)."""
+    error text (already in host stderr / Teams alert)."""
     return {
         "status": "unavailable",
         "reason": reason,
@@ -649,7 +649,7 @@ def _save_alert_dedup_state(state: dict) -> None:
 
 def _maybe_send_operator_alert(reason: str, detail: str) -> None:
     """Decide whether to alert based on persistent dedup state, then send.
-    Lock is released BEFORE send_telegram_alert so file IPC + sqlite read
+    Lock is released BEFORE send_alert so file IPC + sqlite read
     don't block other quality-check threads racing to update dedup."""
     if reason not in ALERT_HARD_REASONS and reason not in ALERT_SOFT_REASONS:
         return  # busy / parse / api_error / prompt_missing — loud-log only
@@ -682,7 +682,7 @@ def _maybe_send_operator_alert(reason: str, detail: str) -> None:
                 _save_alert_dedup_state(state)
     if should_send:
         try:
-            send_telegram_alert(
+            send_alert(
                 f"[OPS] quality-check {reason}: {detail[:200]} (sha={QUALITY_CHECK_PROMPT_SHA})"
             )
         except Exception as e:
@@ -960,21 +960,26 @@ def log(msg: str) -> None:
     print(f"[{ts}] {msg}", flush=True)
 
 
-def send_telegram_alert(message: str) -> None:
-    """Send an alert to CEO via NanoClaw's IPC system (atlas_main group)."""
+def send_alert(message: str) -> None:
+    """Send an alert to CEO via NanoClaw's IPC system (atlas_main group).
+
+    Channel-agnostic: writes an IPC message addressed to the registered main
+    group JID; the NanoClaw channel layer delivers it by JID prefix (now a
+    Teams `msteams:` JID post-2026-06-03 comms cutover).
+    """
     try:
         IPC_DIR.mkdir(parents=True, exist_ok=True)
         # Read main group JID from NanoClaw DB
         import sqlite3
         db_path = NANOCLAW_DIR / "store" / "messages.db"
         if not db_path.exists():
-            log(f"Cannot send Telegram alert — DB not found at {db_path}")
+            log(f"Cannot send alert — DB not found at {db_path}")
             return
         conn = sqlite3.connect(str(db_path))
         row = conn.execute("SELECT jid FROM registered_groups WHERE is_main = 1 LIMIT 1").fetchone()
         conn.close()
         if not row:
-            log("Cannot send Telegram alert — no main group registered")
+            log("Cannot send alert — no main group registered")
             return
         main_jid = row[0]
 
@@ -984,15 +989,15 @@ def send_telegram_alert(message: str) -> None:
             "chatJid": main_jid,
             "text": message,
         }))
-        log(f"Telegram alert sent via IPC: {message[:100]}...")
+        log(f"Alert sent via IPC: {message[:100]}...")
     except Exception as e:
-        log(f"Failed to send Telegram alert: {e}")
+        log(f"Failed to send alert: {e}")
 
 
-def send_telegram_result(callback_group: str, content: str, task_id: str, entity: str) -> None:
-    """Deliver task result text to the originating Telegram group via IPC.
+def send_result(callback_group: str, content: str, task_id: str, entity: str) -> None:
+    """Deliver task result text to the originating Teams group via IPC.
 
-    Mirrors send_telegram_alert above but routes to a specific callback_group
+    Mirrors send_alert above but routes to a specific callback_group
     (a JID/chat identifier the originating task included in its request) rather
     than the registered main group. Used by the mission-task and atlas-route
     branches of process_task() so the conversational thread that asked for the
@@ -1008,11 +1013,11 @@ def send_telegram_result(callback_group: str, content: str, task_id: str, entity
     try:
         IPC_DIR.mkdir(parents=True, exist_ok=True)
         if not callback_group:
-            log(f"Telegram result skipped — empty callback_group for task {task_id}")
+            log(f"Result skipped — empty callback_group for task {task_id}")
             return
-        # Truncate large payloads to keep the IPC message size bounded —
-        # Telegram itself caps at 4096 chars; we leave headroom for the
-        # entity / task_id prefix and any wrapper the channel adds.
+        # Truncate large payloads to keep the IPC message size bounded — chat
+        # channels cap message length; we leave headroom for the entity /
+        # task_id prefix and any wrapper the channel adds.
         max_chars = 3500
         body = content if len(content) <= max_chars else (
             content[:max_chars] + f"\n... (truncated, full output in ~/.atlas/host-tasks/outputs/{task_id}.txt)"
@@ -1024,9 +1029,9 @@ def send_telegram_result(callback_group: str, content: str, task_id: str, entity
             "chatJid": callback_group,
             "text": prefix + body,
         }))
-        log(f"Telegram result sent via IPC to {callback_group} for task {task_id} ({len(body)} chars)")
+        log(f"Result sent via IPC to {callback_group} for task {task_id} ({len(body)} chars)")
     except Exception as e:
-        log(f"Failed to send Telegram result for task {task_id}: {e}")
+        log(f"Failed to send result for task {task_id}: {e}")
 
 
 def is_auth_error(stdout: str, stderr: str) -> bool:
@@ -1071,7 +1076,7 @@ def enter_outage_mode() -> None:
 
     if not outage_alert_sent:
         outage_alert_sent = True
-        send_telegram_alert(
+        send_alert(
             "*Host-Executor: API Outage Detected*\n\n"
             "Claude API is unreachable. Pending tasks will be held and "
             "retried automatically when the outage ends.\n\n"
@@ -1087,7 +1092,7 @@ def exit_outage_mode() -> None:
     outage_alert_sent = False
     health_check_attempt = 0
     log(f"Exiting outage mode — API recovered after ~{downtime_min} minutes")
-    send_telegram_alert(
+    send_alert(
         f"*Host-Executor: API Recovered*\n\n"
         f"Auto-recovered after ~{downtime_min} minute(s). "
         f"Resuming task processing."
@@ -1381,7 +1386,7 @@ def process_task(task_path: Path) -> None:
                                  [], False)
                     task_path.unlink()
                     if callback_group and route_result.content:
-                        send_telegram_result(callback_group, route_result.content, task_id, entity)
+                        send_result(callback_group, route_result.content, task_id, entity)
                     return
                 else:
                     log(f"  atlas.route() failed ({route_result.error}), falling back to claude -p")
@@ -1484,9 +1489,9 @@ def process_task(task_path: Path) -> None:
                 "Or pipe credentials over SSH (the script rejects non-pipe stdin):\n"
                 "`ssh root@5.78.190.56 '/home/atlas/scripts/refresh-claude-auth.sh' < ~/.claude/.credentials.json`"
             )
-            send_telegram_alert(auth_msg)
+            send_alert(auth_msg)
             write_result(task_id, entity, "error", exit_code,
-                         "Authentication expired. CEO alerted on Telegram.",
+                         "Authentication expired. CEO alerted on Teams.",
                          [], False)
             task_path.unlink()
             log(f"Task {task_id} failed: auth expired. CEO alerted.")
@@ -1641,7 +1646,7 @@ def process_task(task_path: Path) -> None:
                         f"degraded for this nonce until it expires — check "
                         f"nonce-cache disk space and permissions.")
                     try:
-                        send_telegram_alert(
+                        send_alert(
                             f"*Host-Executor SEC-1*\n\nNonce burn FAILED for task "
                             f"{task_id}: {_burn_err}. Replay defense degraded for "
                             f"this task until it expires. Check the nonce-cache "
@@ -1758,7 +1763,7 @@ def check_escalations() -> None:
                     f"{summary}{'...' if len(content) > 200 else ''}\n\n"
                     f"File: `shared/{dept}/escalations/{esc_file.name}`"
                 )
-                send_telegram_alert(alert_msg)
+                send_alert(alert_msg)
                 log(f"Escalation alert sent: {dept}/{esc_file.name}")
 
             except Exception as e:
@@ -1799,7 +1804,7 @@ def main() -> None:
     # prompt — do NOT abort the whole service (codex F2 fix on c839228:
     # main() must keep the poll loop alive for task processing, escalations,
     # and auto-pushes; quality-check is one auxiliary feature). Operator
-    # alert via send_telegram_alert + the /quality-check endpoint reports
+    # alert via send_alert + the /quality-check endpoint reports
     # status=unavailable+reason=prompt_missing on every request until fixed.
     try:
         prompt_text = QUALITY_CHECK_PROMPT_PATH.read_text()
@@ -1851,7 +1856,7 @@ def main() -> None:
             "tasks will be REJECTED until /etc/atlas/host-task-hmac.secret is provisioned "
             "and the unit has LoadCredential=host-task-hmac.")
         try:
-            send_telegram_alert(
+            send_alert(
                 "*Host-Executor SEC-1*\n\nHost-task signing key missing — ALL host tasks "
                 "are being REJECTED fail-closed. Provision /etc/atlas/host-task-hmac.secret "
                 "+ LoadCredential on the unit, then restart."
@@ -1871,7 +1876,7 @@ def main() -> None:
             log(f"  WARNING: nonce-cache dir {_nc_dir} is group/other-writable or not "
                 f"owned by uid {os.getuid()} — replay-defense integrity degraded.")
             try:
-                send_telegram_alert(
+                send_alert(
                     f"*Host-Executor SEC-1*\n\nNonce-cache dir {_nc_dir} is writable by a "
                     f"non-owner — replay defense degraded. Check permissions."
                 )

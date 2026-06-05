@@ -107,7 +107,11 @@ export async function run(_args: string[]): Promise<void> {
   // running services actually read; nothing else is a valid
   // verification source.
   let credentials = 'missing';
-  const credKeys = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY'];
+  const credKeys = [
+    'CLAUDE_CODE_OAUTH_TOKEN',
+    'ANTHROPIC_AUTH_TOKEN',
+    'ANTHROPIC_API_KEY',
+  ];
 
   // 3a. systemd LoadCredential — root-installed unit on VPS.
   const credentialsDir = process.env.CREDENTIALS_DIRECTORY;
@@ -154,7 +158,11 @@ export async function run(_args: string[]): Promise<void> {
 
   // 4. Check channel auth (detect configured channels by credentials)
   const envVars = readEnvFile([
-    'TELEGRAM_BOT_TOKEN',
+    'MICROSOFT_APP_ID',
+    'MICROSOFT_APP_PASSWORD',
+    'TEAMS_BOT_TENANT_ID',
+    'ATLAS_OWNER_AAD_OBJECT_ID',
+    'ATLAS_OWNER_UPN',
     'SLACK_BOT_TOKEN',
     'SLACK_APP_TOKEN',
     'DISCORD_BOT_TOKEN',
@@ -169,8 +177,35 @@ export async function run(_args: string[]): Promise<void> {
   }
 
   // Token-based channels: check .env
-  if (process.env.TELEGRAM_BOT_TOKEN || envVars.TELEGRAM_BOT_TOKEN) {
-    channelAuth.telegram = 'configured';
+  // Teams is the primary CEO command channel. The single-tenant bot needs all
+  // three of app id / password / tenant id (registerChannel returns null if any
+  // is missing — see src/channels/teams.ts). It ALSO needs at least one owner
+  // identifier (aadObjectId or UPN): without one the owner gate fails closed and
+  // refuses EVERY sender (src/secondbrain/owner.ts), so the CEO could not use
+  // typed commands or card taps even with valid bot creds. Require both halves
+  // before reporting Teams as configured — otherwise verify would green-light a
+  // bot that answers no one.
+  // Trim every candidate the same way the runtime owner gate does
+  // (loadOwnerConfigFromEnv in src/secondbrain/owner.ts drops whitespace-only
+  // values), so a value like "   " is not counted as configured here while the
+  // runtime refuses every sender.
+  const firstNonBlank = (...vals: Array<string | undefined>): string =>
+    vals.map((v) => (v ?? '').trim()).find((v) => v !== '') ?? '';
+  const teamsBotCreds =
+    firstNonBlank(process.env.MICROSOFT_APP_ID, envVars.MICROSOFT_APP_ID) &&
+    firstNonBlank(
+      process.env.MICROSOFT_APP_PASSWORD,
+      envVars.MICROSOFT_APP_PASSWORD,
+    ) &&
+    firstNonBlank(process.env.TEAMS_BOT_TENANT_ID, envVars.TEAMS_BOT_TENANT_ID);
+  const teamsOwnerIdentity = firstNonBlank(
+    process.env.ATLAS_OWNER_AAD_OBJECT_ID,
+    envVars.ATLAS_OWNER_AAD_OBJECT_ID,
+    process.env.ATLAS_OWNER_UPN,
+    envVars.ATLAS_OWNER_UPN,
+  );
+  if (teamsBotCreds && teamsOwnerIdentity) {
+    channelAuth.teams = 'configured';
   }
   if (
     (process.env.SLACK_BOT_TOKEN || envVars.SLACK_BOT_TOKEN) &&

@@ -1,9 +1,8 @@
 /**
- * Microsoft Teams channel (Lane B).
+ * Microsoft Teams channel — the primary CEO command channel.
  *
- * DORMANT until `src/channels/index.ts` imports this module — the barrel does
- * NOT import it yet, so registering this channel has zero effect on the live
- * Telegram bot. See teams/PROVISIONING.md step 7 ("THE ON-SWITCH").
+ * LIVE: `src/channels/index.ts` imports this module (the on-switch was flipped
+ * 2026-06-03 when the Telegram channel was removed). See teams/PROVISIONING.md.
  *
  * Uses the Bot Framework `CloudAdapter` (the supported successor to the
  * deprecated BotFrameworkAdapter) plus a minimal node `http` server — no
@@ -34,13 +33,69 @@ import {
 
 export const TEAMS_JID_PREFIX = 'msteams:';
 
+/**
+ * Whitelisted mission verbs an Adaptive Card button may invoke. The card
+ * producer (`src/ipc.ts`) emits approve / reject / status; stop is included
+ * because the `/mission` command supports it and a future card may surface it.
+ * Anything outside this set is NOT synthesized into a command (fail-closed) —
+ * an unexpected `callback_data` must never be coerced into a privileged verb.
+ */
+const TEAMS_CARD_MISSION_VERBS = new Set([
+  'approve',
+  'reject',
+  'stop',
+  'status',
+]);
+
+/**
+ * Translate an Adaptive Card `Action.Submit` payload's `callback_data` into the
+ * equivalent text command string, or return null if it is not a recognized
+ * card action.
+ *
+ * The card producer emits `callback_data: "mission:<verb>:<missionId>"` (see
+ * `src/ipc.ts`). We translate that to `"/mission <verb> <missionId>"` so a
+ * button tap is routed through the SAME `handleCommand` path the typed text
+ * commands use — one authorization gate, one code path. No second approval
+ * surface to secure.
+ *
+ * Fail-closed: only the whitelisted verbs are translated; a malformed or
+ * unknown payload returns null and the tap is treated as an ordinary (empty)
+ * message rather than being coerced into a command.
+ */
+export function callbackDataToCommand(callbackData: unknown): string | null {
+  if (typeof callbackData !== 'string') return null;
+  const parts = callbackData.split(':');
+  // Shape: "mission:<verb>:<missionId>" — missionId may itself contain no ':'.
+  if (parts.length !== 3) return null;
+  const [namespace, verb, missionId] = parts;
+  if (namespace !== 'mission') return null;
+  if (!TEAMS_CARD_MISSION_VERBS.has(verb)) return null;
+  if (!missionId) return null;
+  return `/mission ${verb} ${missionId}`;
+}
+
+/**
+ * Extract the `callback_data` field from an Adaptive Card submit activity's
+ * `value`. An `Action.Submit` tap arrives as a Message activity whose `value`
+ * carries the button's `data` object (`{ callback_data: "..." }`); `text` is
+ * usually empty.
+ */
+function readCallbackData(value: unknown): string | undefined {
+  if (value && typeof value === 'object' && 'callback_data' in value) {
+    const cb = (value as { callback_data?: unknown }).callback_data;
+    return typeof cb === 'string' ? cb : undefined;
+  }
+  return undefined;
+}
+
 // Bound the proactive-send reference cache so a long-running process with high
 // conversation churn cannot grow it without limit. Oldest entries evict first.
 const TEAMS_MAX_REFERENCES = 1000;
 
 /**
  * Build the canonical chat JID for a Teams conversation id.
- * Mirrors the `tg:` convention from telegram.ts.
+ * Follows the same per-channel JID-prefix convention used across channels
+ * (e.g. WhatsApp `…@s.whatsapp.net`, Discord `dc:`, the retired `tg:`).
  */
 export function teamsJid(conversationId: string): string {
   return `${TEAMS_JID_PREFIX}${conversationId}`;
@@ -57,11 +112,32 @@ export function buildInboundMessage(activity: Partial<Activity>): {
   chatName: string;
   isGroup: boolean;
   isPersonal: boolean;
+  unrecognizedCardAction: boolean;
 } {
   const conversationId = activity.conversation?.id ?? '';
   const chatJid = teamsJid(conversationId);
   const timestamp = new Date().toISOString();
   const senderName = activity.from?.name ?? activity.from?.id ?? 'Unknown';
+
+  // Adaptive Card Action.Submit tap: the button payload lives in
+  // `activity.value` (`{ callback_data: "mission:<verb>:<id>" }`), and
+  // `activity.text` is usually empty. Translate a recognized card action into
+  // the equivalent text command so it rides the SAME handleCommand path the
+  // typed commands use (§2.4 of the Teams migration spec).
+  //
+  // Fail-closed (§2.4): if the tap carries a `callback_data` we do NOT
+  // recognize, we must NOT silently downgrade it into an ordinary (usually
+  // empty-text) chat message that flows on to onMessage / the conversation
+  // pipeline. `unrecognizedCardAction` flags that case so onTurn can drop the
+  // turn before it enters the system. A genuine text message (no
+  // `callback_data`) is unaffected.
+  const callbackData = readCallbackData(activity.value);
+  const synthesizedCommand = callbackData
+    ? callbackDataToCommand(callbackData)
+    : null;
+  const unrecognizedCardAction =
+    callbackData !== undefined && synthesizedCommand === null;
+  const content = synthesizedCommand ?? activity.text ?? '';
   // Teams "personal" conversations are 1:1; "groupChat"/"channel" are groups.
   const conversationType = (
     activity.conversation as { conversationType?: string }
@@ -80,12 +156,19 @@ export function buildInboundMessage(activity: Partial<Activity>): {
     chat_jid: chatJid,
     sender: activity.from?.id ?? '',
     sender_name: senderName,
-    content: activity.text ?? '',
+    content,
     timestamp,
     is_from_me: false,
   };
 
-  return { chatJid, message, chatName, isGroup, isPersonal };
+  return {
+    chatJid,
+    message,
+    chatName,
+    isGroup,
+    isPersonal,
+    unrecognizedCardAction,
+  };
 }
 
 /** Minimal botbuilder-compatible Request built from a parsed http body. */
@@ -272,8 +355,28 @@ export class TeamsChannel implements Channel {
       return;
     }
 
-    const { chatJid, message, chatName, isGroup, isPersonal } =
-      buildInboundMessage(activity);
+    const {
+      chatJid,
+      message,
+      chatName,
+      isGroup,
+      isPersonal,
+      unrecognizedCardAction,
+    } = buildInboundMessage(activity);
+
+    // Fail-closed on unrecognized Adaptive Card actions (§2.4). The tap passed
+    // the owner gate, but its `callback_data` did not map to a known command.
+    // Do NOT let it through as an (empty-text) chat message: drop the turn
+    // before saving the reference, registering the chat, or calling onMessage,
+    // so an unexpected card payload can never be coerced into the normal
+    // conversation pipeline on the all-access main chat.
+    if (unrecognizedCardAction) {
+      logger.warn(
+        { chatJid, value: activity.value },
+        'Teams: dropping unrecognized Adaptive Card action',
+      );
+      return;
+    }
 
     // Save the conversation reference so we can send proactively later.
     this.references.set(

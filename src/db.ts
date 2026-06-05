@@ -190,6 +190,9 @@ function createSchema(database: Database.Database): void {
     database.exec(
       `UPDATE chats SET channel = 'discord', is_group = 1 WHERE jid LIKE 'dc:%'`,
     );
+    // Historical data migration: relabels legacy `tg:%` rows that predate the
+    // channel column. The Telegram channel itself was retired 2026-06-03 (Teams
+    // is now primary); this backfill is kept only so old rows stay queryable.
     database.exec(
       `UPDATE chats SET channel = 'telegram', is_group = 1 WHERE jid LIKE 'tg:%'`,
     );
