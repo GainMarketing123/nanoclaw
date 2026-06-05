@@ -1,7 +1,7 @@
 /**
  * Step: register — Write channel registration config, create group folders.
  *
- * Accepts --channel to specify the messaging platform (whatsapp, telegram, slack, discord).
+ * Accepts --channel to specify the messaging platform (teams, whatsapp, slack, discord).
  * Uses parameterized SQL queries to prevent injection.
  */
 import fs from 'fs';

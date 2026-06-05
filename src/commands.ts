@@ -1,5 +1,5 @@
 /**
- * Atlas Telegram command handler.
+ * Atlas Teams command handler.
  * Intercepts /command messages from the main group and handles them
  * mechanically (no LLM, no container) for instant responses.
  *
@@ -368,7 +368,7 @@ function handleResetMode(): string {
         {
           mode: 'active',
           previous_mode: previousMode,
-          reset_by: 'telegram_command',
+          reset_by: 'teams_command',
           reset_at: new Date().toISOString(),
         },
         null,
@@ -661,7 +661,7 @@ function missionApprove(id?: string): string {
       mission.id,
       'approved',
       undefined,
-      'CEO approved via Telegram',
+      'CEO approved via Teams',
     );
 
     logger.info(
@@ -755,7 +755,7 @@ function missionReject(id?: string): string {
       mission.id,
       'rejected',
       undefined,
-      'CEO rejected via Telegram',
+      'CEO rejected via Teams',
     );
 
     logger.info(
@@ -811,12 +811,7 @@ function missionStop(id?: string): string {
       status: 'stopped' as any,
       completed_at: new Date().toISOString(),
     });
-    logMissionEvent(
-      mission.id,
-      'stopped',
-      undefined,
-      'CEO stopped via Telegram',
-    );
+    logMissionEvent(mission.id, 'stopped', undefined, 'CEO stopped via Teams');
 
     // Mark any running roles as cancelled
     const roles = getMissionRoles(mission.id);
@@ -1192,7 +1187,7 @@ function moveApprovalItem(
     const data = JSON.parse(fs.readFileSync(srcPath, 'utf-8'));
     data.disposition = destination;
     data.disposition_at = new Date().toISOString();
-    data.disposition_via = 'telegram_command';
+    data.disposition_via = 'teams_command';
 
     fs.writeFileSync(destPath, JSON.stringify(data, null, 2));
     fs.unlinkSync(srcPath);

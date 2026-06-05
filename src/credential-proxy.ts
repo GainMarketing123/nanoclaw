@@ -367,7 +367,7 @@ function startOutageRecovery(creds: {
   // Alert CEO once, not every 30 seconds
   if (!outageAlertSent) {
     outageAlertSent = true;
-    sendTelegramAlert(
+    sendAlert(
       '*Anthropic API Outage Detected*\n\n' +
         'Atlas credential proxy cannot reach the API. ' +
         'Auto-recovery is active — will restore service automatically when the outage ends.\n\n' +
@@ -434,7 +434,7 @@ function startOutageRecovery(creds: {
         { downtimeMinutes: downtimeMin },
         'Outage resolved — auto-recovered',
       );
-      sendTelegramAlert(
+      sendAlert(
         '*API Recovered*\n\n' +
           `Atlas auto-recovered after ~${downtimeMin} minute(s). ` +
           'Tokens refreshed, service fully restored.',
@@ -463,9 +463,10 @@ function startOutageRecovery(creds: {
 }
 
 /**
- * Send a Telegram alert via NanoClaw IPC (best effort).
+ * Send an alert to the CEO via NanoClaw IPC (best effort). Channel-agnostic:
+ * delivers to the registered main group JID, now a Teams chat.
  */
-function sendTelegramAlert(message: string): void {
+function sendAlert(message: string): void {
   try {
     const ipcDir = path.join(
       process.cwd(),
@@ -620,7 +621,7 @@ export function startCredentialProxy(
                   clearTimeout(healthCheckTimer);
                   healthCheckTimer = null;
                 }
-                sendTelegramAlert(
+                sendAlert(
                   '*API Recovered*\n\n' +
                     `Atlas auto-recovered after ~${downtimeMin} minute(s). ` +
                     'Tokens refreshed via proactive check.',
@@ -786,7 +787,7 @@ export function startCredentialProxy(
               logger.error(
                 'OAuth refresh token is invalid — manual intervention required',
               );
-              sendTelegramAlert(
+              sendAlert(
                 '*OAuth Refresh Token Failed*\n\n' +
                   'The refresh token is invalid or expired. This is NOT an outage — the token needs replacing.\n\n' +
                   'From your laptop, run:\n' +

@@ -630,7 +630,7 @@ function buildVolumeMounts(
   // work via the request_host_task MCP tool, which writes to the group's OWN
   // /workspace/ipc/tasks/; the orchestrator validates against a host-only
   // policy, assigns entity, clamps tier/model, HMAC-signs, and writes pending/.
-  // Results are delivered to the group's chat (send_telegram_result), not read
+  // Results are delivered to the group's chat (send_result), not read
   // from a shared folder. See plan §5 + §14.
 
   // Per-group Claude sessions directory (isolated from other groups)

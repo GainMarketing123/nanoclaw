@@ -30,7 +30,7 @@ The README + `docs/REQUIREMENTS.md` are the deeper architecture references.
 | Runtime | Node.js (orchestrator) + Python 3 (host-executor) |
 | Language | TypeScript (orchestrator) + Python (hooks/host) |
 | State store | SQLite (`src/db.ts`) for missions, tasks, audit |
-| Channels | Telegram (Grammy), WhatsApp, Slack, Discord, Gmail — self-register at startup |
+| Channels | Teams (Bot Framework / botbuilder — primary CEO command channel), WhatsApp, Slack, Discord, Gmail — self-register at startup |
 | Agent runtime | Claude Agent SDK inside Linux VMs (containers) |
 | Container isolation | `--worktree` isolation for Tier 2+ tasks |
 | Credentials | systemd `LoadCredential=` for `ANTHROPIC_API_KEY`; per-user SSH/OAuth |
@@ -67,9 +67,13 @@ The README + `docs/REQUIREMENTS.md` are the deeper architecture references.
 1. **`atlas_paths.py` quartet drift.** Four byte-identical copies live across atlas-engineering / atlas-operations / atlas-shared / nanoclaw. A one-off edit to any of them silently breaks the production fail-close contract (Phase 3.0) in only one of the four runtimes — and the cross-review hook only catches it on the repo where the edit landed. We have no automated cross-repo SHA check.
 2. **Mission lifecycle stuck in `executing` or `synthesis` after a container crash.** If a container OOMs mid-mission and the cleanup path doesn't fire (which has happened during worktree-cleanup races), the SQLite row stays in `executing` forever. The CEO sees a stale "approved, running" mission with no actual process behind it. Manual SQL pokes are the only recovery path today.
 
-## Telegram Commands
+## CEO Commands (Teams)
 
 Handled mechanically in `src/commands.ts` — no LLM, no container, instant response.
+Typed by the CEO in the Teams main chat, or invoked by tapping an Adaptive Card
+button (a card `Action.Submit` tap is translated to the equivalent `/mission …`
+command and routed through the same handler — see `src/channels/teams.ts`
+`callbackDataToCommand`).
 
 | Command | Purpose |
 |---------|---------|
@@ -88,7 +92,7 @@ Injected into every container session. Components:
 
 - **Tier Gate** (`tier-gate.ts`): Maps graduation tier to available tools.
 - **Quota** (`quota.ts`): Self-calibrating usage tracking. Model weights: haiku=0.1, sonnet=1.0, opus=5.0. Starts at 1000 weighted units/day estimate, adjusts from 429 responses.
-- **Response Interceptor** (`response-interceptor.ts`): Haiku-based quality check on CEO-facing Telegram messages before delivery.
+- **Response Interceptor** (`response-interceptor.ts`): Haiku-based quality check on CEO-facing Teams messages before delivery.
 - **Canary** (`canary.ts`): Constitution validation at session start.
 - **Audit** (`audit.ts`): Logs tool calls, governance events, post-task analysis.
 - **Learning** (`learning.ts`): Post-task analysis for graduation credit.
@@ -99,11 +103,11 @@ Runs on VPS host (not containerized). Watches `~/.atlas/host-tasks/pending/` for
 
 ## Safety Features
 
-- **Auto-pause** (`src/auto-pause.ts`): Tracks consecutive failures per group. After threshold, pauses group and sends CEO Telegram alert. `/resume` clears.
+- **Auto-pause** (`src/auto-pause.ts`): Tracks consecutive failures per group. After threshold, pauses group and sends CEO Teams alert. `/resume` clears.
 - **Worktree isolation**: Tier 2+ tasks get isolated git worktrees. Branches merged back after completion.
 - **Passive monitoring**: Staff group conversations evaluated after each exchange — surfaces approval needs, blockers, risks, wins for CEO.
-- **Mechanical acks**: Valid Telegram messages get instant receive confirmation before container spawn. Denied senders get rejection messages.
-- **Escalation alerts**: Staff containers write escalation files + IPC to atlas_main. CEO gets Telegram alert. File watcher as backup path.
+- **Mechanical acks**: Valid Teams messages get instant receive confirmation before container spawn. Denied senders get rejection messages.
+- **Escalation alerts**: Staff containers write escalation files + IPC to atlas_main. CEO gets Teams alert. File watcher as backup path.
 - **SSRF protection**: Mission URLs validated against allowlist; private/loopback IPs blocked. Exact agent ID matching prevents tier-bypass via prefix collision. Atomic approve/reject with status pre-check.
 
 ## Group Architecture
