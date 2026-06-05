@@ -35,6 +35,7 @@ import {
   PROXY_BIND_HOST,
 } from './container-runtime.js';
 import {
+  clearGroupIsMain,
   deleteSession,
   getAllChats,
   getAllRegisteredGroups,
@@ -157,18 +158,38 @@ function loadState(): void {
   // Telegram main left behind after the Teams migration) could still carry two
   // is_main=1 rows. Without this, loadState would revive BOTH as isMain in
   // memory on every restart, re-creating the two-privileged-chats bug the
-  // write-path guard fixes. Keep the first main, demote the rest in memory.
-  let mainSeen = false;
-  for (const [jid, group] of Object.entries(registeredGroups)) {
-    if (!group.isMain) continue;
-    if (mainSeen) {
+  // write-path guard fixes.
+  //
+  // Critically, the demotion must be PERSISTED, not just applied in memory: the
+  // alert router (credential-proxy.ts) reads the DB directly with
+  // `SELECT jid FROM registered_groups WHERE is_main = 1 LIMIT 1`. With two
+  // is_main=1 rows still on disk, that query's LIMIT 1 can pick the dead
+  // (e.g. Telegram) main, so after a restart auth alerts route to a target that
+  // no longer exists. An in-memory-only demotion never reaches that query.
+  //
+  // Which main survives must also be deterministic across restarts (SELECT
+  // order is not stable across a SQLite vacuum/rewrite). We keep the canonical
+  // `folder === 'main'` group when present — that is the row the schema
+  // migration promotes (`UPDATE ... SET is_main = 1 WHERE folder = 'main'`) —
+  // and otherwise fall back to the first main encountered. Every other main is
+  // demoted in memory AND on disk.
+  const mainJids = Object.entries(registeredGroups)
+    .filter(([, group]) => group.isMain)
+    .map(([jid]) => jid);
+  if (mainJids.length > 1) {
+    const keepJid =
+      mainJids.find((jid) => registeredGroups[jid].folder === 'main') ??
+      mainJids[0];
+    for (const jid of mainJids) {
+      if (jid === keepJid) continue;
+      const group = registeredGroups[jid];
       logger.warn(
-        { jid, name: group.name },
-        'Demoting duplicate is_main group on load (single-main invariant)',
+        { jid, name: group.name, keepJid },
+        'Demoting duplicate is_main group on load (single-main invariant) — persisting to DB',
       );
       registeredGroups[jid] = { ...group, isMain: undefined };
-    } else {
-      mainSeen = true;
+      // Persist the demotion so the DB-backed alert router cannot revive it.
+      clearGroupIsMain(jid);
     }
   }
   logger.info(

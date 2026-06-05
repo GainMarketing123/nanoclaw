@@ -685,6 +685,20 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
   apply();
 }
 
+/**
+ * Durably clear the is_main flag for a single group, without touching any other
+ * row. Used by the load-path single-main normalization (see loadState in
+ * index.ts): when two legacy is_main=1 rows survive (e.g. a Telegram main left
+ * behind after the Teams migration), the demotion must be persisted — otherwise
+ * the DB keeps both main rows and the alert router's
+ * `SELECT jid ... WHERE is_main = 1 LIMIT 1` can route alerts to a dead target
+ * after every restart. Unlike setRegisteredGroup, this does NOT promote any row
+ * or demote others; it only clears the named jid.
+ */
+export function clearGroupIsMain(jid: string): void {
+  db.prepare('UPDATE registered_groups SET is_main = 0 WHERE jid = ?').run(jid);
+}
+
 export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
   const rows = db.prepare('SELECT * FROM registered_groups').all() as Array<{
     jid: string;
