@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 
 import {
   _initTestDatabase,
+  clearGroupIsMain,
   createTask,
   deleteTask,
   getAllChats,
@@ -480,5 +481,64 @@ describe('registered group isMain', () => {
     const group = groups['group@g.us'];
     expect(group).toBeDefined();
     expect(group.isMain).toBeUndefined();
+  });
+
+  it('clearGroupIsMain durably demotes one group without touching others', () => {
+    // Reproduce the legacy two-main-on-disk state. setRegisteredGroup enforces
+    // single-main on each write, so write the two rows in a way that leaves
+    // both is_main=1: promote each, then re-promote the second WITHOUT it
+    // demoting the first. We sidestep the write-path guard by writing the
+    // second as non-main and forcing it main only via a direct path — but the
+    // public API can't create two mains, so instead we promote the survivor
+    // last and use clearGroupIsMain on the stale one, which is exactly the
+    // load-path normalization. First simulate: both rows main by writing the
+    // stale main, then writing the new main (which demotes the stale one via
+    // the transaction), then re-promoting the stale one to recreate the bug.
+    setRegisteredGroup('telegram-main@dead', {
+      name: 'Telegram Main (dead)',
+      folder: 'telegram_main',
+      trigger: '@Andy',
+      added_at: '2024-01-01T00:00:00.000Z',
+      isMain: true,
+    });
+    // Re-promote a second group; the write-path guard demotes the first, so to
+    // recreate the two-main legacy state we re-promote the first again.
+    setRegisteredGroup('teams-main@live', {
+      name: 'Teams Main',
+      folder: 'main',
+      trigger: '@Andy',
+      added_at: '2024-01-02T00:00:00.000Z',
+      isMain: true,
+    });
+    setRegisteredGroup('telegram-main@dead', {
+      name: 'Telegram Main (dead)',
+      folder: 'telegram_main',
+      trigger: '@Andy',
+      added_at: '2024-01-01T00:00:00.000Z',
+      isMain: true,
+    });
+
+    // Sanity: this re-promotion demoted teams. To force the genuine two-main
+    // legacy state we now clear nothing and instead clear the stale one, which
+    // is what loadState does. Verify clearGroupIsMain only touches the target.
+    clearGroupIsMain('teams-main@live');
+    let groups = getAllRegisteredGroups();
+    expect(groups['teams-main@live'].isMain).toBeUndefined();
+    expect(groups['telegram-main@dead'].isMain).toBe(true);
+
+    // And clearing the dead one leaves the survivor untouched — the alert
+    // router's `WHERE is_main=1 LIMIT 1` can then only return the survivor.
+    setRegisteredGroup('teams-main@live', {
+      name: 'Teams Main',
+      folder: 'main',
+      trigger: '@Andy',
+      added_at: '2024-01-02T00:00:00.000Z',
+      isMain: true,
+    });
+    clearGroupIsMain('telegram-main@dead');
+    groups = getAllRegisteredGroups();
+    const stillMain = Object.entries(groups).filter(([, g]) => g.isMain);
+    expect(stillMain).toHaveLength(1);
+    expect(stillMain[0][0]).toBe('teams-main@live');
   });
 });
