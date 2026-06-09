@@ -159,6 +159,14 @@ export function buildInboundMessage(activity: Partial<Activity>): {
     content,
     timestamp,
     is_from_me: false,
+    // Verified identity carry for the owner-gated "/ask" brain Q&A. The
+    // activity reaches this mapper only AFTER the adapter authenticated the
+    // request, and onTurn's owner gate runs on these same fields BEFORE
+    // onMessage is invoked — so downstream consumers (index.ts → isOwner)
+    // can trust them as the sender's real AAD identity, not self-asserted.
+    sender_aad_object_id: activity.from?.aadObjectId,
+    sender_upn: (activity.from as { userPrincipalName?: string } | undefined)
+      ?.userPrincipalName,
   };
 
   return {
