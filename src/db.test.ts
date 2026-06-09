@@ -13,6 +13,7 @@ import {
   setRegisteredGroup,
   storeChatMetadata,
   storeMessage,
+  storeMessageDirect,
   updateTask,
 } from './db.js';
 
@@ -138,6 +139,74 @@ describe('storeMessage', () => {
     );
     expect(messages).toHaveLength(1);
     expect(messages[0].content).toBe('updated');
+  });
+});
+
+// --- verified sender identity persistence (owner-gated /ask depends on it) ---
+
+describe('verified sender identity round-trip', () => {
+  beforeEach(() => {
+    storeChatMetadata('group@g.us', '2026-06-09T00:00:00.000Z');
+  });
+
+  it('storeMessage persists sender_aad_object_id + sender_upn and both read paths return them', () => {
+    storeMessage({
+      id: 'id1',
+      chat_jid: 'group@g.us',
+      sender: '29:user',
+      sender_name: 'CEO',
+      content: '/ask what closed?',
+      timestamp: '2026-06-09T10:00:00.000Z',
+      is_from_me: false,
+      sender_aad_object_id: 'owner-aad-1',
+      sender_upn: 'ceo@example.com',
+    });
+
+    const since = getMessagesSince('group@g.us', '', 'Andy');
+    expect(since).toHaveLength(1);
+    expect(since[0].sender_aad_object_id).toBe('owner-aad-1');
+    expect(since[0].sender_upn).toBe('ceo@example.com');
+
+    const { messages } = getNewMessages(['group@g.us'], '', 'Andy');
+    expect(messages).toHaveLength(1);
+    expect(messages[0].sender_aad_object_id).toBe('owner-aad-1');
+    expect(messages[0].sender_upn).toBe('ceo@example.com');
+  });
+
+  it('storeMessageDirect persists the identity fields too', () => {
+    storeMessageDirect({
+      id: 'id2',
+      chat_jid: 'group@g.us',
+      sender: '29:user',
+      sender_name: 'CEO',
+      content: 'direct store',
+      timestamp: '2026-06-09T10:01:00.000Z',
+      is_from_me: false,
+      sender_aad_object_id: 'owner-aad-1',
+      sender_upn: 'ceo@example.com',
+    });
+
+    const messages = getMessagesSince('group@g.us', '', 'Andy');
+    expect(messages).toHaveLength(1);
+    expect(messages[0].sender_aad_object_id).toBe('owner-aad-1');
+    expect(messages[0].sender_upn).toBe('ceo@example.com');
+  });
+
+  it('messages without verified identity come back undefined (fail-closed for isOwner)', () => {
+    storeMessage({
+      id: 'id3',
+      chat_jid: 'group@g.us',
+      sender: '29:other',
+      sender_name: 'Someone',
+      content: 'no identity here',
+      timestamp: '2026-06-09T10:02:00.000Z',
+      is_from_me: false,
+    });
+
+    const messages = getMessagesSince('group@g.us', '', 'Andy');
+    expect(messages).toHaveLength(1);
+    expect(messages[0].sender_aad_object_id).toBeUndefined();
+    expect(messages[0].sender_upn).toBeUndefined();
   });
 });
 

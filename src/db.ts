@@ -32,6 +32,8 @@ function createSchema(database: Database.Database): void {
       timestamp TEXT,
       is_from_me INTEGER,
       is_bot_message INTEGER DEFAULT 0,
+      sender_aad_object_id TEXT,
+      sender_upn TEXT,
       PRIMARY KEY (id, chat_jid),
       FOREIGN KEY (chat_jid) REFERENCES chats(jid)
     );
@@ -159,6 +161,21 @@ function createSchema(database: Database.Database): void {
     database
       .prepare(`UPDATE messages SET is_bot_message = 1 WHERE content LIKE ?`)
       .run(`${ASSISTANT_NAME}:%`);
+  } catch {
+    /* column already exists */
+  }
+
+  // Add verified-sender identity columns if they don't exist (migration for
+  // existing DBs). Nullable on purpose: only channels that authenticate the
+  // sender (Teams) populate them; old rows and identity-less transports stay
+  // NULL, which keeps the owner gate fail-closed for replayed messages.
+  try {
+    database.exec(`ALTER TABLE messages ADD COLUMN sender_aad_object_id TEXT`);
+  } catch {
+    /* column already exists */
+  }
+  try {
+    database.exec(`ALTER TABLE messages ADD COLUMN sender_upn TEXT`);
   } catch {
     /* column already exists */
   }
@@ -322,7 +339,7 @@ export function setLastGroupSync(): void {
  */
 export function storeMessage(msg: NewMessage): void {
   db.prepare(
-    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message, sender_aad_object_id, sender_upn) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     msg.id,
     msg.chat_jid,
@@ -332,6 +349,8 @@ export function storeMessage(msg: NewMessage): void {
     msg.timestamp,
     msg.is_from_me ? 1 : 0,
     msg.is_bot_message ? 1 : 0,
+    msg.sender_aad_object_id ?? null,
+    msg.sender_upn ?? null,
   );
 }
 
@@ -347,9 +366,11 @@ export function storeMessageDirect(msg: {
   timestamp: string;
   is_from_me: boolean;
   is_bot_message?: boolean;
+  sender_aad_object_id?: string;
+  sender_upn?: string;
 }): void {
   db.prepare(
-    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message, sender_aad_object_id, sender_upn) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     msg.id,
     msg.chat_jid,
@@ -359,7 +380,30 @@ export function storeMessageDirect(msg: {
     msg.timestamp,
     msg.is_from_me ? 1 : 0,
     msg.is_bot_message ? 1 : 0,
+    msg.sender_aad_object_id ?? null,
+    msg.sender_upn ?? null,
   );
+}
+
+/**
+ * Map raw message rows to NewMessage. SQLite returns NULL for the nullable
+ * verified-identity columns; NewMessage declares them as optional strings, so
+ * normalize NULL → undefined (isOwner treats both as "unverified" — the gate
+ * stays fail-closed either way, this just keeps the type contract honest).
+ */
+function normalizeMessageRows(rows: unknown[]): NewMessage[] {
+  return (
+    rows as Array<
+      NewMessage & {
+        sender_aad_object_id: string | null;
+        sender_upn: string | null;
+      }
+    >
+  ).map((row) => ({
+    ...row,
+    sender_aad_object_id: row.sender_aad_object_id ?? undefined,
+    sender_upn: row.sender_upn ?? undefined,
+  }));
 }
 
 export function getNewMessages(
@@ -376,7 +420,8 @@ export function getNewMessages(
   // Subquery takes the N most recent, outer query re-sorts chronologically.
   const sql = `
     SELECT * FROM (
-      SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me
+      SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me,
+             sender_aad_object_id, sender_upn
       FROM messages
       WHERE timestamp > ? AND chat_jid IN (${placeholders})
         AND is_bot_message = 0 AND content NOT LIKE ?
@@ -386,9 +431,9 @@ export function getNewMessages(
     ) ORDER BY timestamp
   `;
 
-  const rows = db
-    .prepare(sql)
-    .all(lastTimestamp, ...jids, `${botPrefix}:%`, limit) as NewMessage[];
+  const rows = normalizeMessageRows(
+    db.prepare(sql).all(lastTimestamp, ...jids, `${botPrefix}:%`, limit),
+  );
 
   let newTimestamp = lastTimestamp;
   for (const row of rows) {
@@ -409,7 +454,8 @@ export function getMessagesSince(
   // Subquery takes the N most recent, outer query re-sorts chronologically.
   const sql = `
     SELECT * FROM (
-      SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me
+      SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me,
+             sender_aad_object_id, sender_upn
       FROM messages
       WHERE chat_jid = ? AND timestamp > ?
         AND is_bot_message = 0 AND content NOT LIKE ?
@@ -418,9 +464,9 @@ export function getMessagesSince(
       LIMIT ?
     ) ORDER BY timestamp
   `;
-  return db
-    .prepare(sql)
-    .all(chatJid, sinceTimestamp, `${botPrefix}:%`, limit) as NewMessage[];
+  return normalizeMessageRows(
+    db.prepare(sql).all(chatJid, sinceTimestamp, `${botPrefix}:%`, limit),
+  );
 }
 
 export function createTask(

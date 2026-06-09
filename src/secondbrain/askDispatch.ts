@@ -85,7 +85,12 @@ export async function maybeHandleAskMessage(
   const question = parseAskQuestion(opts.text);
   if (question === null) return false;
 
-  if (!question) {
+  // Owner gate comes BEFORE the usage hint: a bare "/ask" must not leak the
+  // hint (or a differentiable response) to a non-owner. Only a verified owner
+  // gets the usage copy; a non-owner falls through to the normal path, where
+  // handleOwnerAsk's own gate (checked FIRST, fail-closed) sends the same
+  // refusal as a real "/ask <question>" — one refusal surface, no oracle.
+  if (!question && isOwner(opts.sender, opts.owner)) {
     await opts.send(ASK_USAGE_HINT);
     return true;
   }

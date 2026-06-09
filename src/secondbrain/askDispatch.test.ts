@@ -30,10 +30,7 @@ const ANSWERED: AskResult = {
 };
 const DEGRADED: AskResult = { answer: '', provenance: [], degraded: true };
 
-function fakeClient(opts: {
-  entities?: EntityInfo[];
-  ask?: () => AskResult;
-}) {
+function fakeClient(opts: { entities?: EntityInfo[]; ask?: () => AskResult }) {
   const listEntities = vi.fn(async () => opts.entities ?? ENTITIES);
   const ask = vi.fn(async () => (opts.ask ? opts.ask() : ANSWERED));
   return {
@@ -125,7 +122,7 @@ describe('maybeHandleAskMessage', () => {
     expect(listEntities).not.toHaveBeenCalled();
   });
 
-  it('sends the usage hint for a bare "/ask" without touching the brain', async () => {
+  it('sends the usage hint for a bare "/ask" from the OWNER without touching the brain', async () => {
     const { client, listEntities } = fakeClient({});
     const { sent, send } = sendCollector();
 
@@ -139,6 +136,44 @@ describe('maybeHandleAskMessage', () => {
 
     expect(handled).toBe(true);
     expect(sent).toEqual([ASK_USAGE_HINT]);
+    expect(listEntities).not.toHaveBeenCalled();
+  });
+
+  it('non-owner bare "/ask" → same refusal as a real ask (no hint, no ping, brain never touched)', async () => {
+    const { client, listEntities, ask } = fakeClient({});
+    const { sent, send } = sendCollector();
+
+    const handled = await maybeHandleAskMessage({
+      text: '/ask',
+      sender: NON_OWNER,
+      owner: OWNER,
+      client,
+      send,
+    });
+
+    expect(handled).toBe(true);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toContain("CEO's private Atlas");
+    expect(sent[0]).not.toBe(ASK_USAGE_HINT);
+    expect(listEntities).not.toHaveBeenCalled();
+    expect(ask).not.toHaveBeenCalled();
+  });
+
+  it('unverified-identity bare "/ask" fails closed (refusal, never the hint)', async () => {
+    const { client, listEntities } = fakeClient({});
+    const { sent, send } = sendCollector();
+
+    const handled = await maybeHandleAskMessage({
+      text: '  /ask  ',
+      sender: { name: 'CEO' }, // what an identity-less transport yields
+      owner: OWNER,
+      client,
+      send,
+    });
+
+    expect(handled).toBe(true);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toContain("CEO's private Atlas");
     expect(listEntities).not.toHaveBeenCalled();
   });
 

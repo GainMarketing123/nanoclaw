@@ -361,8 +361,7 @@ describe('TeamsChannel', () => {
     });
 
     it('non-owner asks → refused at the channel gate, brain and dispatch never touched', async () => {
-      const { sent, listEntities, ask, opts } =
-        await makeAskHarness(ANSWERED);
+      const { sent, listEntities, ask, opts } = await makeAskHarness(ANSWERED);
 
       await postActivity({
         type: 'message',
