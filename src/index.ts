@@ -72,6 +72,12 @@ import { startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
 import { SecondBrainClient, parseLoomQuestion } from './secondbrain/client.js';
+import {
+  maybeHandleAskMessage,
+  parseAskQuestion,
+  senderIdentityFromMessage,
+} from './secondbrain/askDispatch.js';
+import { loadOwnerConfigFromEnv } from './secondbrain/owner.js';
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
@@ -88,6 +94,8 @@ const queue = new GroupQueue();
 // Loom (learning-brain) Q&A over Teams: a "loom ..." message is answered from
 // the course brain instead of spawning the agent. Long timeout because a course
 // answer runs Claude server-side (~20-40s); the 5s default would always trip.
+// The SAME client also serves the owner-gated "/ask" all-entity Q&A below —
+// one brain, one base URL, one secret, one timeout contract.
 const _loomTimeoutRaw = Number(process.env.LOOM_BRAIN_TIMEOUT_MS);
 // Loom brain config follows this repo's .env contract (the same SECOND_BRAIN_*
 // keys .env.example documents): read from the project-root .env FILE via
@@ -119,6 +127,23 @@ const LOOM_BRAIN = new SecondBrainClient(
   },
 );
 const LOOM_ENTITY_SLUG = process.env.LOOM_ENTITY_SLUG || 'learning';
+
+// Owner identity for the "/ask" all-entity brain Q&A. Same env contract as
+// the Teams channel's owner gate (ATLAS_OWNER_AAD_OBJECT_ID / ATLAS_OWNER_UPN,
+// already documented in .env.example): process.env wins for systemd
+// EnvironmentFile= deploys, the project .env file is the laptop default.
+// If neither is set, loadOwnerConfigFromEnv returns an empty config and the
+// gate inside handleOwnerAsk fails closed — "/ask" refuses EVERYONE.
+const _askOwnerEnv = readEnvFile([
+  'ATLAS_OWNER_AAD_OBJECT_ID',
+  'ATLAS_OWNER_UPN',
+]);
+const ASK_OWNER = loadOwnerConfigFromEnv({
+  ATLAS_OWNER_AAD_OBJECT_ID:
+    process.env.ATLAS_OWNER_AAD_OBJECT_ID ||
+    _askOwnerEnv.ATLAS_OWNER_AAD_OBJECT_ID,
+  ATLAS_OWNER_UPN: process.env.ATLAS_OWNER_UPN || _askOwnerEnv.ATLAS_OWNER_UPN,
+});
 
 /**
  * Extract a human-readable entity label from a group folder name.
@@ -870,6 +895,36 @@ async function main(): Promise<void> {
           await channel?.sendMessage(chatJid, reply);
         })().catch((err) =>
           logger.error({ err, chatJid }, 'Loom course Q&A error'),
+        );
+        return;
+      }
+
+      // Owner-gated all-entity brain Q&A — "/ask <question>". Same async
+      // pattern as the loom dispatch above. Placement is load-bearing:
+      //  - AFTER the main-group handleCommand dispatch: unknown commands
+      //    (like /ask) return { handled: false } there and fall through, so
+      //    /ask is never swallowed by an "unknown command" path.
+      //  - AFTER the sender-allowlist denial: a denied sender must not reach
+      //    the brain (mirrors the loom auth fix above).
+      //  - BEFORE storeMessage: an /ask is answered here, not by the agent.
+      // The owner gate is checked FIRST inside handleOwnerAsk (fail-closed);
+      // the sender identity comes from the channel-verified fields on the
+      // message (Teams populates them post-authentication; channels that
+      // can't verify identity leave them unset and the gate refuses).
+      if (parseAskQuestion(trimmed) !== null) {
+        const channel = findChannel(channels, chatJid);
+        maybeHandleAskMessage({
+          text: trimmed,
+          sender: senderIdentityFromMessage(msg),
+          owner: ASK_OWNER,
+          client: LOOM_BRAIN,
+          send: async (text: string) => {
+            await channel?.sendMessage(chatJid, text);
+          },
+          onError: (err) =>
+            logger.error({ err, chatJid }, '/ask owner Q&A error'),
+        }).catch((err) =>
+          logger.error({ err, chatJid }, '/ask reply send error'),
         );
         return;
       }

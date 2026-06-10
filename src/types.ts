@@ -51,6 +51,13 @@ export interface NewMessage {
   timestamp: string;
   is_from_me?: boolean;
   is_bot_message?: boolean;
+  // Sender's VERIFIED platform identity, used by the owner-gated "/ask" brain
+  // Q&A. Populated only by channels that authenticate the sender (Teams lifts
+  // these from the adapter-authenticated activity's `from` field). Channels
+  // that cannot verify identity leave them unset, which makes the owner gate
+  // fail closed for their messages (isOwner matches on these fields only).
+  sender_aad_object_id?: string;
+  sender_upn?: string;
 }
 
 export interface ScheduledTask {

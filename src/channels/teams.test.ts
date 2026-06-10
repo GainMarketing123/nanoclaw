@@ -91,6 +91,14 @@ import {
   callbackDataToCommand,
 } from './teams.js';
 import type { ChannelOpts } from './registry.js';
+import {
+  maybeHandleAskMessage,
+  parseAskQuestion,
+  senderIdentityFromMessage,
+  ASK_PROGRESS_PING,
+} from '../secondbrain/askDispatch.js';
+import type { SecondBrainClient, AskResult } from '../secondbrain/client.js';
+import type { NewMessage } from '../types.js';
 
 function createTestOpts(): ChannelOpts {
   return {
@@ -201,6 +209,36 @@ describe('TeamsChannel', () => {
       );
     });
 
+    it('carries the verified sender identity (aadObjectId / upn) on the NewMessage', async () => {
+      const opts = createTestOpts();
+      const channel = makeChannel(opts);
+      await channel.connect();
+
+      await postActivity({
+        type: 'message',
+        id: 'act-id-carry',
+        text: '/ask when did the deal close?',
+        from: {
+          id: 'user-9',
+          name: 'CEO',
+          aadObjectId: 'owner-aad-1',
+          userPrincipalName: 'ceo@example.com',
+        },
+        conversation: { id: '19:abc@thread.v2', conversationType: 'personal' },
+      });
+
+      // The owner-gated /ask path downstream (index.ts → isOwner) relies on
+      // these channel-verified fields — they must survive the activity →
+      // NewMessage mapping.
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'msteams:19:abc@thread.v2',
+        expect.objectContaining({
+          sender_aad_object_id: 'owner-aad-1',
+          sender_upn: 'ceo@example.com',
+        }),
+      );
+    });
+
     it('ignores non-message activities', async () => {
       const opts = createTestOpts();
       const channel = makeChannel(opts);
@@ -247,6 +285,116 @@ describe('TeamsChannel', () => {
       expect(lastTurnRef.sendActivity).toHaveBeenCalledWith(
         expect.stringContaining("CEO's private Atlas"),
       );
+    });
+  });
+
+  describe('"/ask" owner Q&A end-to-end (activity → identity carry → gate → reply)', () => {
+    const GPG_ENTITY = { id: 'e-gpg', slug: 'gpg', display_name: 'GPG' };
+    const ANSWERED: AskResult = {
+      answer: 'The deal closed Tuesday.',
+      provenance: [],
+      degraded: false,
+    };
+    const DEGRADED: AskResult = { answer: '', provenance: [], degraded: true };
+
+    /** Drain the async dispatch chain (multiple await hops past postActivity). */
+    async function settle(rounds = 20): Promise<void> {
+      for (let i = 0; i < rounds; i++) {
+        await new Promise((r) => setImmediate(r));
+      }
+    }
+
+    /**
+     * Build a connected channel whose onMessage mirrors the index.ts "/ask"
+     * dispatch wiring exactly: parse → maybeHandleAskMessage with the
+     * channel-verified identity, replies sent back through the REAL Teams
+     * sendMessage path (saved conversation reference → continueConversation).
+     */
+    async function makeAskHarness(askResult: AskResult) {
+      const sent: string[] = [];
+      const listEntities = vi.fn(async () => [GPG_ENTITY]);
+      const ask = vi.fn(async () => askResult);
+      const client = { listEntities, ask } as unknown as SecondBrainClient;
+
+      const opts = createTestOpts();
+      let channel: TeamsChannel;
+      opts.onMessage = vi.fn((chatJid: string, msg: NewMessage) => {
+        if (parseAskQuestion(msg.content.trim()) !== null) {
+          void maybeHandleAskMessage({
+            text: msg.content.trim(),
+            sender: senderIdentityFromMessage(msg),
+            owner: OWNER,
+            client,
+            send: async (text: string) => {
+              sent.push(text);
+              await channel.sendMessage(chatJid, text);
+            },
+          });
+        }
+      });
+      channel = makeChannel(opts);
+      await channel.connect();
+      return { sent, listEntities, ask, opts };
+    }
+
+    it('owner asks → progress ping then the answer, sent back to the chat', async () => {
+      const { sent, ask } = await makeAskHarness(ANSWERED);
+
+      await postActivity({
+        type: 'message',
+        id: 'act-ask-1',
+        text: '/ask when did the deal close?',
+        from: { id: 'u', name: 'CEO', aadObjectId: 'owner-aad-1' },
+        conversation: { id: '19:abc@thread.v2', conversationType: 'personal' },
+      });
+      await settle();
+
+      expect(ask).toHaveBeenCalledWith('e-gpg', 'when did the deal close?');
+      expect(sent[0]).toBe(ASK_PROGRESS_PING);
+      expect(sent[1]).toContain('GPG');
+      expect(sent[1]).toContain('The deal closed Tuesday.');
+      // Both replies went out through the real Teams send path (the inbound
+      // activity saved the conversation reference first).
+      expect(
+        adapterRef.current.continueConversationAsync,
+      ).toHaveBeenCalledTimes(2);
+    });
+
+    it('non-owner asks → refused at the channel gate, brain and dispatch never touched', async () => {
+      const { sent, listEntities, ask, opts } = await makeAskHarness(ANSWERED);
+
+      await postActivity({
+        type: 'message',
+        id: 'act-ask-2',
+        text: '/ask show me every business secret',
+        from: { id: 'u', name: 'Mallory', aadObjectId: 'attacker-aad' },
+        conversation: { id: '19:abc@thread.v2', conversationType: 'personal' },
+      });
+      await settle();
+
+      expect(lastTurnRef.sendActivity).toHaveBeenCalledWith(
+        expect.stringContaining("CEO's private Atlas"),
+      );
+      expect(opts.onMessage).not.toHaveBeenCalled();
+      expect(listEntities).not.toHaveBeenCalled();
+      expect(ask).not.toHaveBeenCalled();
+      expect(sent).toEqual([]);
+    });
+
+    it('degraded brain → friendly catching-up reply, never silence', async () => {
+      const { sent } = await makeAskHarness(DEGRADED);
+
+      await postActivity({
+        type: 'message',
+        id: 'act-ask-3',
+        text: '/ask anything new?',
+        from: { id: 'u', name: 'CEO', aadObjectId: 'owner-aad-1' },
+        conversation: { id: '19:abc@thread.v2', conversationType: 'personal' },
+      });
+      await settle();
+
+      expect(sent[0]).toBe(ASK_PROGRESS_PING);
+      expect(sent[1]).toContain('catching up');
     });
   });
 
