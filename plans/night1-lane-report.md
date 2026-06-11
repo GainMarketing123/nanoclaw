@@ -13,13 +13,20 @@ re-verify per the brief.
 | `5a0a6e7b8bb1736acb32074fa9b1b67971718a10` | B — remove dead Telegram wiring | `src/index.ts`, `src/router.ts`, `src/channels/retired-channel-no-fault.test.ts` (new), `infra/host-task-policy.json` | Manual review (auto-runner starved): 1 BLOCKING r1 fixed at root, r2 clean |
 | `2e40d79a80899a2e244387cc8d3ccb542273360d` | (docs) lane report | `plans/night1-lane-report.md` | Docs-only |
 | `3757dbdff3659a362f1cdb3757f4caaf47e63154` | B follow-up (review F2) | `src/index.ts`, `src/router.ts`, `src/ipc.ts`, `src/channels/retired-channel-no-fault.test.ts` | Range review fix: retired drop is a TYPED non-delivery, not a false "sent" |
-| `3108b535a6e33a8631dd20fb99135931c4bf1bb2` | A+B follow-up (review F1+F2) | `src/ipc.ts`, `src/host-task-callback-roundtrip.test.ts` | Range review fix: no doc-payload leak; callback JID must be deliverable |
+| `3108b535a6e33a8631dd20fb99135931c4bf1bb2` | A+B follow-up (review) | `src/ipc.ts`, `src/host-task-callback-roundtrip.test.ts` | Review fix: no doc-payload leak; callback JID must be deliverable |
+| `0296fffeab05398c31664af893cd7641be1b58a5` | (docs) report update | `plans/night1-lane-report.md` | Docs-only |
+| `a36129a56b11c29df0432b8e96fd6cdab05626c3` | A follow-up (review) | `infra/.../hardening.conf`, `plans/night1-lane-report.md` | Review fix: BindPaths == policy `allowed_project_dirs` union (adds `.atlas-operations`; specific roots not parent) |
+| `781a1d59b09ba09848960de3fab06e2dddfd126c` | B follow-up (review) | `src/index.ts` | Review fix: registerGroup prunes stale in-memory JID per folder (root cause) |
 
-**Final convergence:** cumulative review over `origin/main..HEAD` (all 5 commits)
-— fast_screen PASS + deep review **PASS, 0 findings**; genuine PASS cert
-`83699b1b` issued, push-allowed. The review loop ran 3 rounds, each surfacing
-DISTINCT new concerns (r1 false-"sent" log → r2 doc-payload leak + non-routable
-`dispatch:` callback → r3 PASS) — convergence, not same-concern spiral.
+**Final convergence:** cumulative review over `origin/main..HEAD` (all commits)
+— fast_screen PASS + deep review **PASS, 0 findings**; genuine PASS cert issued,
+push-allowed. The review loop ran several rounds, each surfacing DISTINCT new
+concerns and fixed at root (false-"sent" log → doc-payload leak + non-routable
+`dispatch:` callback → BindPaths over-broad → BindPaths missing `.atlas-operations`
+→ registerGroup stale-JID root cause → PASS). The two consecutive BindPaths
+rounds were resolved by deriving the bind set from the policy (not guessing
+breadth); the stale-JID concern was chased to its true source (registerGroup),
+not patched at the consumer — convergence, not same-concern spiral.
 
 Test/typecheck state at branch tip: `tsc --noEmit` clean; `vitest` **343/343**
 (330 baseline + Topic A round-trip/resolver + Topic B retired-channel/typed-error
@@ -159,18 +166,6 @@ retired JIDs drop quietly; a genuine misroute still surfaces and is preserved.
   no fallback, single-repo) and minted genuine range certs, per the brief's
   stall contract. Blocking verdicts were ack'd as "fixing at root" (never
   waved) and superseded by the clean PASS at HEAD.
-
-## Boarded follow-up (out of this lane's two-topic scope)
-
-- **`resolveCallbackJid` stale-JID-per-folder (cross-review soft, re-flagged):**
-  the in-memory `registeredGroups` map can in principle retain a stale JID key
-  for a re-registered folder; the resolver returns the first deliverable match.
-  Worst case is a syntactically-valid-but-stale JID (the router drops an unowned
-  one — no cross-group misroute), and the map is rebuilt from the DB at startup.
-  A full fix is a DB migration enforcing one-current-JID-per-folder — a
-  schema/migration-layer change outside the host-task-round-trip + Telegram
-  scope of this lane. Documented in code as a best-effort contract; board for a
-  dedicated DB-hygiene change. NOT chased here (avoiding scope creep / spiral).
 
 ## Blockers / decisions for morning
 
