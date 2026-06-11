@@ -674,7 +674,7 @@ describe('single-JID-per-folder invariant (cross-review FAIL_BLOCKING)', () => {
     expect(task!.chat_jid).toBe('new-jid@teams');
   });
 
-  it('a plain same-JID re-register leaves other folders\' tasks untouched', () => {
+  it("a plain same-JID re-register leaves other folders' tasks untouched", () => {
     setRegisteredGroup('jid-a@teams', {
       name: 'A',
       folder: 'folder_a',
