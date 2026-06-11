@@ -71,10 +71,13 @@ gpg request hit the wall.)
   task's path can still legitimately vanish after issue).
 - **Infra (in scope, git-managed root fix):** mirrored the live VPS
   `hardening.conf` into `infra/systemd-dropins/atlas-host-executor.service.d/`
-  and added `/home/atlas/projects` to `BindPaths` (one parent mount covers the
-  three policy-allowed project roots: gpg, crownscape, wisestream). **Live apply
-  is a morning step** (this repo only tracks the source-of-truth; the live file
-  is root-owned VPS state).
+  and added the THREE policy-allowed project roots to `BindPaths`
+  (`/home/atlas/projects/{gpg,crownscape,wisestream}`), NOT the parent
+  `/home/atlas/projects` — binding the parent would make every group's siblings
+  visible in the executor namespace (cross-review: defense-in-depth, mount only
+  what a policy needs; keep this list in sync if a new project root is added).
+  **Live apply is a morning step** (this repo only tracks the source-of-truth;
+  the live file is root-owned VPS state).
 
 **No genuinely-missing dir** — so nothing to create. Project-dir *resolution*
 (realpath + allowlist + escape-path) is unit-tested on the issuer side

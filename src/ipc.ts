@@ -60,6 +60,15 @@ export interface IpcDeps {
  * result delivery. Extracted as a pure function so the issuer round-trip test
  * and production share one resolver implementation (design review: a test that
  * re-implements the loop can preserve a broken impl and still pass).
+ *
+ * Returns the FIRST deliverable (non-dispatch) JID found for the folder. The
+ * map should hold at most one current JID per folder — it is rebuilt from the
+ * DB at startup and the single-`is_main` invariant is enforced at the DB layer
+ * — but it is an in-memory map and is not guaranteed free of a stale key for a
+ * re-registered folder (cross-review F2, soft). Keep `registeredGroups` current
+ * (re-sync on re-registration) rather than relying on a recency tiebreak here;
+ * a worst-case stale-key pick still yields a syntactically valid JID, and the
+ * outbound router drops an unowned one (it does not misroute to another group).
  */
 export function resolveCallbackJid(
   registeredGroups: Record<string, RegisteredGroup>,
