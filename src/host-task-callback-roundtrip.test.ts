@@ -82,6 +82,28 @@ describe('host-task callback_group round-trip (folder -> JID -> signed task)', (
       );
     });
 
+    it('skips a retired-channel JID and returns "" when it is the only JID', () => {
+      // cross-review FAIL_BLOCKING R3: a retired-channel JID (e.g. a leftover
+      // `tg:` row after the Telegram retirement) is guaranteed to raise
+      // RetiredChannelDropError on send, so it must NOT be stamped as
+      // callback_group — that would hand the executor a JID whose only outcome
+      // is a dropped result. Best-effort skip ('') instead.
+      const registeredGroups: Record<string, RegisteredGroup> = {
+        'tg:7322433447': group('atlas_main'),
+      };
+      expect(resolveCallbackJid(registeredGroups, 'atlas_main')).toBe('');
+    });
+
+    it('prefers a live channel JID over a retired one for the same folder', () => {
+      const retiredFirst: Record<string, RegisteredGroup> = {
+        'tg:7322433447': group('atlas_main'),
+        'msteams:a:main': group('atlas_main'),
+      };
+      expect(resolveCallbackJid(retiredFirst, 'atlas_main')).toBe(
+        'msteams:a:main',
+      );
+    });
+
     it('returns empty string when no registered group owns the folder', () => {
       const registeredGroups: Record<string, RegisteredGroup> = {
         'msteams:a:1BURQ': group('atlas_teams'),

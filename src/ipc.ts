@@ -10,7 +10,7 @@ import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
 import { RegisteredGroup } from './types.js';
-import { RetiredChannelDropError } from './router.js';
+import { RetiredChannelDropError, isRetiredChannelJid } from './router.js';
 import { loadHostTaskKey } from './host-task-key.js';
 import { policyForGroup } from './host-task-policy.js';
 import {
@@ -89,8 +89,14 @@ export function resolveCallbackJid(
     if (group.folder !== sourceGroup) {
       continue;
     }
-    // Skip non-deliverable dispatch aliases; keep scanning for a real JID.
-    if (jid.startsWith('dispatch:')) {
+    // Skip non-deliverable JIDs; keep scanning for an actually-deliverable one.
+    // A `dispatch:` alias is owned by no outbound channel; a retired-channel
+    // JID (e.g. `tg:` after the Telegram retirement) is guaranteed to raise
+    // RetiredChannelDropError on send, so stamping it as callback_group would
+    // hand the executor a JID whose only outcome is a dropped result
+    // (cross-review FAIL_BLOCKING R3: filter retired prefixes, not just
+    // dispatch:).
+    if (jid.startsWith('dispatch:') || isRetiredChannelJid(jid)) {
       continue;
     }
     return jid;
@@ -370,7 +376,8 @@ export async function processTaskIpc(
           for (const [jid, group] of Object.entries(registeredGroups)) {
             if (
               group.folder === dispatchFolder &&
-              !jid.startsWith('dispatch:')
+              !jid.startsWith('dispatch:') &&
+              !isRetiredChannelJid(jid)
             ) {
               resolvedJid = jid;
               resolvedGroup = group;
