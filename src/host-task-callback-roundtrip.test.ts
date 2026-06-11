@@ -48,17 +48,37 @@ describe('host-task callback_group round-trip (folder -> JID -> signed task)', (
   });
 
   describe('resolveCallbackJid (pure resolver)', () => {
-    it('resolves a folder to its registered chat JID', () => {
+    it('resolves a folder to its registered, DELIVERABLE chat JID', () => {
       const registeredGroups: Record<string, RegisteredGroup> = {
         'msteams:a:1BURQ': group('atlas_teams'),
         'tg:7322433447': group('atlas_main'),
-        'dispatch:atlas_gpg': group('atlas_gpg'),
       };
       expect(resolveCallbackJid(registeredGroups, 'atlas_teams')).toBe(
         'msteams:a:1BURQ',
       );
-      expect(resolveCallbackJid(registeredGroups, 'atlas_gpg')).toBe(
-        'dispatch:atlas_gpg',
+    });
+
+    it('skips a non-deliverable dispatch: alias and returns "" when that is the only JID', () => {
+      // cross-review F2: a bridge company workspace is registered under a
+      // logical `dispatch:{folder}` alias that no outbound channel owns. The
+      // result-delivery message path does not resolve dispatch→real, so a
+      // dispatch callback_group would route the result to data/ipc/errors.
+      // Return '' (skip delivery, best-effort) rather than an undeliverable JID.
+      const registeredGroups: Record<string, RegisteredGroup> = {
+        'dispatch:atlas_gpg': group('atlas_gpg'),
+      };
+      expect(resolveCallbackJid(registeredGroups, 'atlas_gpg')).toBe('');
+    });
+
+    it('prefers a real channel JID over a dispatch alias for the same folder', () => {
+      // If a folder somehow has BOTH a dispatch alias and a real channel JID,
+      // the deliverable real JID wins regardless of iteration order.
+      const dispatchFirst: Record<string, RegisteredGroup> = {
+        'dispatch:atlas_gpg': group('atlas_gpg'),
+        'msteams:a:gpg': group('atlas_gpg'),
+      };
+      expect(resolveCallbackJid(dispatchFirst, 'atlas_gpg')).toBe(
+        'msteams:a:gpg',
       );
     });
 

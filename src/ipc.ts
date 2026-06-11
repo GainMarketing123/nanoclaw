@@ -65,10 +65,26 @@ export function resolveCallbackJid(
   registeredGroups: Record<string, RegisteredGroup>,
   sourceGroup: string,
 ): string {
+  // The callback target must be DELIVERABLE by the outbound channel router
+  // (findChannel → channel.ownsJid). A logical `dispatch:` alias (the bridge's
+  // "dispatch:{folder}" form for Paperclip company workspaces) is NOT owned by
+  // any channel — the result-delivery message path does not resolve
+  // dispatch→real-JID (only schedule_task targeting does) — so stamping a
+  // dispatch alias here yields an undeliverable callback that routes the result
+  // to data/ipc/errors (cross-review F2). Prefer a real channel JID; if the
+  // folder is registered ONLY under a dispatch alias, return '' so the executor
+  // skips result delivery (best-effort) rather than producing a non-routable
+  // target. (Bridge-group result delivery is a separate mechanism, out of scope
+  // here.)
   for (const [jid, group] of Object.entries(registeredGroups)) {
-    if (group.folder === sourceGroup) {
-      return jid;
+    if (group.folder !== sourceGroup) {
+      continue;
     }
+    // Skip non-deliverable dispatch aliases; keep scanning for a real JID.
+    if (jid.startsWith('dispatch:')) {
+      continue;
+    }
+    return jid;
   }
   return '';
 }
@@ -167,10 +183,28 @@ export function startIpcWatcher(deps: IpcDeps): void {
                       'IPC document file not found',
                     );
                   } else {
-                    await deps.sendDocument(data.chatJid, absPath, {
-                      caption: data.caption,
-                      filename: data.filename,
-                    });
+                    try {
+                      await deps.sendDocument(data.chatJid, absPath, {
+                        caption: data.caption,
+                        filename: data.filename,
+                      });
+                    } catch (sendErr) {
+                      // A retired-channel drop is an INTENTIONAL non-delivery
+                      // (cross-review F1): clean up the uploaded payload here —
+                      // while absPath is in scope — so it does not leak, then
+                      // re-throw so the outer catch removes the IPC envelope as
+                      // handled (not routed to data/ipc/errors). Any other send
+                      // error propagates untouched (payload preserved for retry
+                      // via the error dir, matching the message path).
+                      if (sendErr instanceof RetiredChannelDropError) {
+                        try {
+                          fs.unlinkSync(absPath);
+                        } catch {
+                          // already gone
+                        }
+                      }
+                      throw sendErr;
+                    }
                     // Clean up the uploaded file after sending
                     try {
                       fs.unlinkSync(absPath);
