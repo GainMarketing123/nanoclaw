@@ -160,6 +160,18 @@ retired JIDs drop quietly; a genuine misroute still surfaces and is preserved.
   stall contract. Blocking verdicts were ack'd as "fixing at root" (never
   waved) and superseded by the clean PASS at HEAD.
 
+## Boarded follow-up (out of this lane's two-topic scope)
+
+- **`resolveCallbackJid` stale-JID-per-folder (cross-review soft, re-flagged):**
+  the in-memory `registeredGroups` map can in principle retain a stale JID key
+  for a re-registered folder; the resolver returns the first deliverable match.
+  Worst case is a syntactically-valid-but-stale JID (the router drops an unowned
+  one — no cross-group misroute), and the map is rebuilt from the DB at startup.
+  A full fix is a DB migration enforcing one-current-JID-per-folder — a
+  schema/migration-layer change outside the host-task-round-trip + Telegram
+  scope of this lane. Documented in code as a best-effort contract; board for a
+  dedicated DB-hygiene change. NOT chased here (avoiding scope creep / spiral).
+
 ## Blockers / decisions for morning
 
 1. **Host Claude credential (Topic A live E2E):** the host's `claude -p` OAuth
