@@ -44,6 +44,34 @@ export interface IpcDeps {
   ) => void;
 }
 
+/**
+ * Resolve a requester group folder to its REGISTERED chat JID for use as a
+ * host-task `callback_group` (cross-review 44a873d1 F1). `registeredGroups` is
+ * keyed by JID with a `.folder` field; the host_task IPC case knows the
+ * requester only by its unforgeable directory-derived `sourceGroup` folder, so
+ * we map folder -> JID here. The JID is what the executor's `send_result`
+ * emits as the IPC `chatJid` and the message loop routes by
+ * `registeredGroups[chatJid]`, so a folder-shaped value silently fails
+ * delivery — the value MUST be the JID.
+ *
+ * Returns '' when no registered group has that folder. An empty result is a
+ * valid (best-effort) outcome: the task still runs, but the executor skips
+ * result delivery. Extracted as a pure function so the issuer round-trip test
+ * and production share one resolver implementation (design review: a test that
+ * re-implements the loop can preserve a broken impl and still pass).
+ */
+export function resolveCallbackJid(
+  registeredGroups: Record<string, RegisteredGroup>,
+  sourceGroup: string,
+): string {
+  for (const [jid, group] of Object.entries(registeredGroups)) {
+    if (group.folder === sourceGroup) {
+      return jid;
+    }
+  }
+  return '';
+}
+
 let ipcWatcherRunning = false;
 
 export function startIpcWatcher(deps: IpcDeps): void {
@@ -388,13 +416,9 @@ export async function processTaskIpc(
       // because the executor's send_result emits it as the IPC "chatJid" and
       // the message loop routes by registeredGroups[chatJid]. Resolution is
       // server-side from the unforgeable sourceGroup — never container input.
-      let callbackJid = '';
-      for (const [jid, group] of Object.entries(registeredGroups)) {
-        if (group.folder === sourceGroup) {
-          callbackJid = jid;
-          break;
-        }
-      }
+      // Shared resolver (see resolveCallbackJid) so prod + the issuer
+      // round-trip test exercise one implementation.
+      const callbackJid = resolveCallbackJid(registeredGroups, sourceGroup);
       if (!callbackJid) {
         logger.warn(
           { sourceGroup },

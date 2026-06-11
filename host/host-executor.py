@@ -1312,11 +1312,34 @@ def process_task(task_path: Path) -> None:
             task_path.unlink()
             return
 
-        # Validate project directory exists
+        # Validate the project directory is visible to THIS process.
+        #
+        # The path here already passed the orchestrator issuer's realpath +
+        # policy-allowlist check before the task was signed (the SEC-1 origin
+        # auth gate above proves that), so an isdir-False at execute time is
+        # most often a sandbox VISIBILITY gap rather than a typo: this service
+        # runs under a systemd drop-in with ProtectHome=tmpfs + a BindPaths
+        # allowlist, so a real, host-present directory that is NOT bind-mounted
+        # into the executor's mount namespace reads back as absent (observed
+        # 2026-06-11: /home/atlas/projects/gpg exists on the host but
+        # /home/atlas/projects is not in BindPaths). We do NOT assert misconfig
+        # as fact — a verified task can still legitimately reference a path that
+        # was deleted/renamed/unmounted after issuance — so the message points
+        # at BOTH possibilities and names the concrete remediation to check.
         if not project_dir or not os.path.isdir(project_dir):
             write_result(task_id, entity, "error", 1,
-                         f"Project directory not found: {project_dir}",
+                         f"Project directory not found or not visible to the "
+                         f"host-executor: {project_dir}. The path passed the "
+                         f"issuer's policy+realpath check, so if it exists on "
+                         f"the host this is most likely a sandbox visibility "
+                         f"gap — verify the directory is covered by the "
+                         f"executor service's BindPaths (ProtectHome=tmpfs "
+                         f"hides /home except bind-mounted paths). Otherwise the "
+                         f"directory was removed/renamed/unmounted after the "
+                         f"task was issued.",
                          [], False)
+            log(f"DIR-NOT-VISIBLE {task_id}: project_dir absent in executor "
+                f"namespace (check BindPaths / post-issuance removal): {project_dir}")
             task_path.unlink()
             return
 
