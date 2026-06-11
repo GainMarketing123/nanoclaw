@@ -320,6 +320,21 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
       }
     }
   }
+  // Mirror the DB-layer single-JID-per-folder invariant in memory: if this
+  // folder was previously registered under a DIFFERENT jid (e.g. a channel
+  // re-registration that changed the chat JID), drop the stale entry so the map
+  // holds exactly one current JID per folder. Without this, folder→JID lookups
+  // (e.g. resolveCallbackJid for host-task callback_group) could resolve to a
+  // stale JID until process restart (cross-review F1: registerGroup persisted
+  // the new row but left the old in-memory entry intact).
+  for (const otherJid of Object.keys(registeredGroups)) {
+    if (
+      otherJid !== jid &&
+      registeredGroups[otherJid].folder === group.folder
+    ) {
+      delete registeredGroups[otherJid];
+    }
+  }
   registeredGroups[jid] = group;
 
   // Create group folder
