@@ -402,10 +402,21 @@ export async function processTaskIpc(
           }
         }
 
-        if (!targetGroupEntry || targetJid.startsWith('dispatch:')) {
+        // Final deliverability guard (cross-review FAIL_BLOCKING R4): reject
+        // ANY non-deliverable target before createTask(), not just unresolved
+        // dispatch: aliases. A caller can pass a direct retired-channel JID
+        // (e.g. `tg:...`) whose row still exists in registeredGroups, making
+        // targetGroupEntry truthy and skipping the dispatch block entirely;
+        // persisting it as scheduled_tasks.chat_jid would make every scheduled
+        // run silently non-deliver ("No channel owns JID" / RetiredChannelDrop).
+        if (
+          !targetGroupEntry ||
+          targetJid.startsWith('dispatch:') ||
+          isRetiredChannelJid(targetJid)
+        ) {
           logger.warn(
             { targetJid, original: data.targetJid },
-            'Cannot schedule task: no deliverable channel JID for target (dispatch resolution failed)',
+            'Cannot schedule task: no deliverable channel JID for target (dispatch/retired resolution failed)',
           );
           break;
         }

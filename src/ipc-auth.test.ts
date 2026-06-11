@@ -143,6 +143,58 @@ describe('schedule_task authorization', () => {
     const allTasks = getAllTasks();
     expect(allTasks.length).toBe(0);
   });
+
+  it('rejects a direct retired-channel targetJid instead of persisting it', async () => {
+    // cross-review FAIL_BLOCKING R4: a caller passes a retired tg: JID whose
+    // row still exists in registeredGroups. The dispatch block is skipped (no
+    // dispatch: prefix), so the final deliverability guard must catch it —
+    // otherwise the scheduler would persist an undeliverable chat_jid and
+    // silently non-deliver every run.
+    groups['tg:7322433447'] = {
+      name: 'Legacy TG',
+      folder: 'tg-legacy',
+      trigger: '@Andy',
+      added_at: '2024-01-01T00:00:00.000Z',
+    };
+    await processTaskIpc(
+      {
+        type: 'schedule_task',
+        prompt: 'to a dead channel',
+        schedule_type: 'once',
+        schedule_value: '2025-06-01T00:00:00',
+        targetJid: 'tg:7322433447',
+      },
+      'whatsapp_main',
+      true,
+      deps,
+    );
+
+    expect(getAllTasks().length).toBe(0);
+  });
+
+  it('resolves a dispatch: target to the real JID and persists the deliverable JID', async () => {
+    // The bridge addresses a company workspace as dispatch:{folder}; the task
+    // must be created against the real channel JID for that folder, never the
+    // dispatch alias (which src/index.ts cannot route).
+    groups['dispatch:other-group'] = { ...OTHER_GROUP };
+    await processTaskIpc(
+      {
+        type: 'schedule_task',
+        prompt: 'via dispatch',
+        schedule_type: 'once',
+        schedule_value: '2025-06-01T00:00:00',
+        targetJid: 'dispatch:other-group',
+      },
+      'whatsapp_main',
+      true,
+      deps,
+    );
+
+    const allTasks = getAllTasks();
+    expect(allTasks.length).toBe(1);
+    expect(allTasks[0].chat_jid).toBe('other@g.us');
+    expect(allTasks[0].group_folder).toBe('other-group');
+  });
 });
 
 // --- pause_task authorization ---
