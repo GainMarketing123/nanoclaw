@@ -55,7 +55,12 @@ import {
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
-import { findChannel, formatMessages, formatOutbound } from './router.js';
+import {
+  findChannel,
+  formatMessages,
+  formatOutbound,
+  isRetiredChannelJid,
+} from './router.js';
 import {
   restoreRemoteControl,
   startRemoteControl,
@@ -1010,16 +1015,55 @@ async function main(): Promise<void> {
       if (text) await channel.sendMessage(jid, text);
     },
   });
+  // No channel owns this JID. Two cases, deliberately distinct:
+  //
+  //   (a) RETIRED channel (e.g. Telegram, removed 2026-06-03 — Teams is
+  //       primary). Retired `tg:` group rows still live in the DB and an IPC
+  //       consumer (e.g. the host-executor's auth-failure alert) may still
+  //       target one. This absence is CORRECT, not a fault — throwing here
+  //       surfaced a false "No channel for JID: tg:…" alarm in
+  //       health/diagnostics. Warn-and-drop (best-effort fire-and-notify).
+  //
+  //   (b) ANY OTHER unowned JID — a live channel that is temporarily
+  //       unmapped/misconfigured. This IS a fault: dropping it silently would
+  //       lose a message destined for a real recipient AND (for documents)
+  //       unlink the payload, with a FALSE "sent" success log, because the IPC
+  //       watcher (src/ipc.ts) only preserves the IPC file to data/ipc/errors
+  //       when the send THROWS. So for the non-retired case we keep throwing,
+  //       preserving the original error-routing/retry contract.
+  //
+  // (cross-review 4ce737e F1: the first cut warn-dropped ALL unowned JIDs,
+  // silently losing live-but-unmapped sends. Discriminate by retired prefix.)
+  const handleNoChannel = (op: string, jid: string): void => {
+    if (isRetiredChannelJid(jid)) {
+      logger.warn(
+        { jid, op },
+        'No channel owns JID; dropping IPC send (expected — retired channel)',
+      );
+      return;
+    }
+    // Live-but-unmapped: surface so the IPC watcher routes the file to
+    // data/ipc/errors instead of silently dropping it.
+    throw new Error(`No channel for JID: ${jid}`);
+  };
   startIpcWatcher({
     sendMessage: (jid, text) => {
       const channel = findChannel(channels, jid);
-      if (!channel) throw new Error(`No channel for JID: ${jid}`);
+      if (!channel) {
+        handleNoChannel('sendMessage', jid);
+        return Promise.resolve();
+      }
       return channel.sendMessage(jid, text);
     },
     sendDocument: (jid, filePath, options) => {
       const channel = findChannel(channels, jid);
-      if (!channel) throw new Error(`No channel for JID: ${jid}`);
+      if (!channel) {
+        handleNoChannel('sendDocument', jid);
+        return Promise.resolve();
+      }
       if (!channel.sendDocument) {
+        // A LIVE channel that genuinely lacks document support is a real
+        // capability error, distinct from an absent channel — keep throwing.
         throw new Error(
           `Channel ${channel.name} does not support sendDocument`,
         );
@@ -1028,7 +1072,10 @@ async function main(): Promise<void> {
     },
     sendMessageWithKeyboard: (jid, text, buttons) => {
       const channel = findChannel(channels, jid);
-      if (!channel) throw new Error(`No channel for JID: ${jid}`);
+      if (!channel) {
+        handleNoChannel('sendMessageWithKeyboard', jid);
+        return Promise.resolve();
+      }
       // Use keyboard method if available, otherwise fall back to plain text
       if (channel.sendMessageWithKeyboard) {
         return channel.sendMessageWithKeyboard(jid, text, buttons);

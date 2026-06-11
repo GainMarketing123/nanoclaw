@@ -64,3 +64,19 @@ export function findChannel(
 ): Channel | undefined {
   return channels.find((c) => c.ownsJid(jid));
 }
+
+/**
+ * JID prefixes for channels that were INTENTIONALLY retired (no longer
+ * registered in the running build) but whose group rows still live in the DB.
+ * Telegram (`tg:`) was removed 2026-06-03 in favour of Teams (CEO decision —
+ * see memory feedback_no_telegram_retired); its absence is the correct, desired
+ * state, so an IPC send targeting a retired JID must degrade quietly rather
+ * than raise a false "No channel for JID" fault. Any unowned JID that is NOT in
+ * this set is a genuine misroute (a live channel temporarily unmapped) and must
+ * still surface as an error.
+ */
+export const RETIRED_CHANNEL_JID_PREFIXES = ['tg:'] as const;
+
+export function isRetiredChannelJid(jid: string): boolean {
+  return RETIRED_CHANNEL_JID_PREFIXES.some((p) => jid.startsWith(p));
+}

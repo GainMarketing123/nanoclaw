@@ -18,12 +18,6 @@
     "allowed_project_dirs": ["/home/atlas/projects/gpg"],
     "allowed_models": ["sonnet", "haiku"]
   },
-  "telegram_atlas-marketing": {
-    "entity": "gpg",
-    "max_tier": 1,
-    "allowed_project_dirs": ["/home/atlas/projects/gpg"],
-    "allowed_models": ["haiku", "sonnet"]
-  },
   "atlas_teams": {
     "entity": "atlas",
     "max_tier": 3,
