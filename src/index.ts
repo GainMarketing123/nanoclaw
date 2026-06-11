@@ -60,6 +60,7 @@ import {
   formatMessages,
   formatOutbound,
   isRetiredChannelJid,
+  RetiredChannelDropError,
 } from './router.js';
 import {
   restoreRemoteControl,
@@ -1015,32 +1016,30 @@ async function main(): Promise<void> {
       if (text) await channel.sendMessage(jid, text);
     },
   });
-  // No channel owns this JID. Two cases, deliberately distinct:
+  // No channel owns this JID. Two cases, deliberately distinct — and BOTH
+  // throw, so the IPC watcher (src/ipc.ts) never records a false "sent":
   //
   //   (a) RETIRED channel (e.g. Telegram, removed 2026-06-03 — Teams is
   //       primary). Retired `tg:` group rows still live in the DB and an IPC
   //       consumer (e.g. the host-executor's auth-failure alert) may still
-  //       target one. This absence is CORRECT, not a fault — throwing here
-  //       surfaced a false "No channel for JID: tg:…" alarm in
-  //       health/diagnostics. Warn-and-drop (best-effort fire-and-notify).
+  //       target one. This absence is CORRECT, not a fault — a plain throw here
+  //       surfaced a false "No channel for JID: tg:…" alarm AND would route the
+  //       file to data/ipc/errors for pointless retry. Throw a TYPED
+  //       RetiredChannelDropError so the watcher logs a "dropped" outcome and
+  //       cleans up the file as handled (no error-dir, no retry).
   //
   //   (b) ANY OTHER unowned JID — a live channel that is temporarily
-  //       unmapped/misconfigured. This IS a fault: dropping it silently would
-  //       lose a message destined for a real recipient AND (for documents)
-  //       unlink the payload, with a FALSE "sent" success log, because the IPC
-  //       watcher (src/ipc.ts) only preserves the IPC file to data/ipc/errors
-  //       when the send THROWS. So for the non-retired case we keep throwing,
-  //       preserving the original error-routing/retry contract.
+  //       unmapped/misconfigured. This IS a fault: throw a plain Error so the
+  //       watcher preserves the IPC file to data/ipc/errors for investigation
+  //       /retry (original contract).
   //
-  // (cross-review 4ce737e F1: the first cut warn-dropped ALL unowned JIDs,
-  // silently losing live-but-unmapped sends. Discriminate by retired prefix.)
-  const handleNoChannel = (op: string, jid: string): void => {
+  // (cross-review F1+F2: the first cut warn-dropped ALL unowned JIDs and let
+  // the watcher log "sent" for an intentionally-dropped send — a false success
+  // in the delivery/audit log. Discriminate by retired prefix AND signal
+  // non-delivery via a typed error so the watcher logs it accurately.)
+  const handleNoChannel = (jid: string): never => {
     if (isRetiredChannelJid(jid)) {
-      logger.warn(
-        { jid, op },
-        'No channel owns JID; dropping IPC send (expected — retired channel)',
-      );
-      return;
+      throw new RetiredChannelDropError(jid);
     }
     // Live-but-unmapped: surface so the IPC watcher routes the file to
     // data/ipc/errors instead of silently dropping it.
@@ -1050,16 +1049,14 @@ async function main(): Promise<void> {
     sendMessage: (jid, text) => {
       const channel = findChannel(channels, jid);
       if (!channel) {
-        handleNoChannel('sendMessage', jid);
-        return Promise.resolve();
+        return handleNoChannel(jid);
       }
       return channel.sendMessage(jid, text);
     },
     sendDocument: (jid, filePath, options) => {
       const channel = findChannel(channels, jid);
       if (!channel) {
-        handleNoChannel('sendDocument', jid);
-        return Promise.resolve();
+        return handleNoChannel(jid);
       }
       if (!channel.sendDocument) {
         // A LIVE channel that genuinely lacks document support is a real
@@ -1073,8 +1070,7 @@ async function main(): Promise<void> {
     sendMessageWithKeyboard: (jid, text, buttons) => {
       const channel = findChannel(channels, jid);
       if (!channel) {
-        handleNoChannel('sendMessageWithKeyboard', jid);
-        return Promise.resolve();
+        return handleNoChannel(jid);
       }
       // Use keyboard method if available, otherwise fall back to plain text
       if (channel.sendMessageWithKeyboard) {

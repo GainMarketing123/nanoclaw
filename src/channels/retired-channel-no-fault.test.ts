@@ -1,6 +1,10 @@
 import { describe, it, expect } from 'vitest';
 
-import { findChannel, isRetiredChannelJid } from '../router.js';
+import {
+  findChannel,
+  isRetiredChannelJid,
+  RetiredChannelDropError,
+} from '../router.js';
 import { Channel } from '../types.js';
 
 /**
@@ -71,6 +75,29 @@ describe('retired Telegram channel is not a fault', () => {
       expect(isRetiredChannelJid('12345678@g.us')).toBe(false);
       expect(isRetiredChannelJid('dispatch:atlas_gpg')).toBe(false);
       expect(isRetiredChannelJid('typo-unmapped-jid')).toBe(false);
+    });
+  });
+
+  // cross-review F2: a retired-channel drop must be a TYPED signal, not a
+  // resolved promise — otherwise the IPC watcher logs a false "sent" success
+  // and unlinks the document payload for something intentionally dropped. The
+  // typed error lets src/ipc.ts log "dropped" and clean up as handled (not
+  // errored), while a NON-retired unowned JID throws a plain Error so the
+  // watcher preserves the file to data/ipc/errors.
+  describe('RetiredChannelDropError carries the JID and is distinguishable', () => {
+    it('is an Error subclass carrying the dropped JID', () => {
+      const err = new RetiredChannelDropError('tg:7322433447');
+      expect(err).toBeInstanceOf(Error);
+      expect(err).toBeInstanceOf(RetiredChannelDropError);
+      expect(err.jid).toBe('tg:7322433447');
+      expect(err.name).toBe('RetiredChannelDropError');
+    });
+
+    it('a plain Error (live-but-unmapped fault) is NOT a RetiredChannelDropError', () => {
+      // The watcher branches on `instanceof RetiredChannelDropError`; a generic
+      // "No channel for JID" Error must fall through to the error-dir path.
+      const plain = new Error('No channel for JID: typo-unmapped-jid');
+      expect(plain instanceof RetiredChannelDropError).toBe(false);
     });
   });
 });

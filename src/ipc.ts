@@ -10,6 +10,7 @@ import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
 import { RegisteredGroup } from './types.js';
+import { RetiredChannelDropError } from './router.js';
 import { loadHostTaskKey } from './host-task-key.js';
 import { policyForGroup } from './host-task-policy.js';
 import {
@@ -190,6 +191,24 @@ export function startIpcWatcher(deps: IpcDeps): void {
               }
               fs.unlinkSync(filePath);
             } catch (err) {
+              if (err instanceof RetiredChannelDropError) {
+                // INTENTIONAL non-delivery to a retired channel (e.g. tg:).
+                // NOT a "sent" success and NOT an error to retry: log a
+                // truthful "dropped" outcome and remove the IPC file as
+                // HANDLED (do not route to data/ipc/errors — the channel is
+                // gone, retry is pointless). This keeps the delivery/audit log
+                // accurate (cross-review F2).
+                logger.warn(
+                  { jid: err.jid, sourceGroup, file },
+                  'IPC send dropped — retired channel (expected, not delivered)',
+                );
+                try {
+                  fs.unlinkSync(filePath);
+                } catch {
+                  // already removed
+                }
+                continue;
+              }
               logger.error(
                 { file, sourceGroup, err },
                 'Error processing IPC message',

@@ -80,3 +80,25 @@ export const RETIRED_CHANNEL_JID_PREFIXES = ['tg:'] as const;
 export function isRetiredChannelJid(jid: string): boolean {
   return RETIRED_CHANNEL_JID_PREFIXES.some((p) => jid.startsWith(p));
 }
+
+/**
+ * Thrown when an IPC send targets a retired-channel JID (e.g. `tg:`) that no
+ * live channel owns. This is an INTENTIONAL non-delivery, distinct from both a
+ * successful send and a genuine misroute:
+ *   - The IPC watcher (src/ipc.ts) must NOT log it as "sent" (a false success
+ *     that misleads operators into thinking an alert/result was delivered) and
+ *     must NOT unlink a document payload as if delivered.
+ *   - It must NOT be routed to data/ipc/errors for retry (the channel is gone;
+ *     retry is pointless) — unlike a non-retired unowned JID, which DOES throw a
+ *     plain Error and IS preserved for investigation.
+ * The watcher catches this specific type, logs a "dropped" outcome, and cleans
+ * up the IPC file as handled (not errored).
+ */
+export class RetiredChannelDropError extends Error {
+  readonly jid: string;
+  constructor(jid: string) {
+    super(`Retired channel for JID, dropping IPC send: ${jid}`);
+    this.name = 'RetiredChannelDropError';
+    this.jid = jid;
+  }
+}
