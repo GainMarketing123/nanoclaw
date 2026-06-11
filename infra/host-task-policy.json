@@ -1,0 +1,52 @@
+{
+  "atlas_main": {
+    "entity": "atlas",
+    "max_tier": 3,
+    "allowed_project_dirs": [
+      "/home/atlas/.atlas",
+      "/home/atlas/.atlas-operations",
+      "/home/atlas/nanoclaw",
+      "/home/atlas/projects/gpg",
+      "/home/atlas/projects/crownscape",
+      "/home/atlas/projects/wisestream"
+    ],
+    "allowed_models": ["sonnet", "haiku"]
+  },
+  "atlas_gpg": {
+    "entity": "gpg",
+    "max_tier": 2,
+    "allowed_project_dirs": ["/home/atlas/projects/gpg"],
+    "allowed_models": ["sonnet", "haiku"]
+  },
+  "telegram_atlas-marketing": {
+    "entity": "gpg",
+    "max_tier": 1,
+    "allowed_project_dirs": ["/home/atlas/projects/gpg"],
+    "allowed_models": ["haiku", "sonnet"]
+  },
+  "atlas_teams": {
+    "entity": "atlas",
+    "max_tier": 3,
+    "allowed_project_dirs": [
+      "/home/atlas/.atlas",
+      "/home/atlas/.atlas-operations",
+      "/home/atlas/nanoclaw",
+      "/home/atlas/projects/gpg",
+      "/home/atlas/projects/crownscape",
+      "/home/atlas/projects/wisestream"
+    ],
+    "allowed_models": ["sonnet", "haiku"]
+  },
+  "atlas_crownscape": {
+    "entity": "crownscape",
+    "max_tier": 2,
+    "allowed_project_dirs": ["/home/atlas/projects/crownscape"],
+    "allowed_models": ["sonnet", "haiku"]
+  },
+  "atlas_wisestream": {
+    "entity": "wisestream",
+    "max_tier": 2,
+    "allowed_project_dirs": ["/home/atlas/projects/wisestream"],
+    "allowed_models": ["sonnet", "haiku"]
+  }
+}
