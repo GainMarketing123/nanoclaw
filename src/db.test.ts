@@ -611,3 +611,97 @@ describe('registered group isMain', () => {
     expect(stillMain[0][0]).toBe('teams-main@live');
   });
 });
+
+describe('single-JID-per-folder invariant (cross-review FAIL_BLOCKING)', () => {
+  it('re-registering a folder under a new JID drops the stale row durably', () => {
+    setRegisteredGroup('old-jid@teams', {
+      name: 'GPG',
+      folder: 'atlas_gpg',
+      trigger: '@Atlas',
+      added_at: '2024-01-01T00:00:00.000Z',
+    });
+    // Channel re-registration changes the JID for the SAME folder.
+    setRegisteredGroup('new-jid@teams', {
+      name: 'GPG',
+      folder: 'atlas_gpg',
+      trigger: '@Atlas',
+      added_at: '2024-02-01T00:00:00.000Z',
+    });
+
+    const groups = getAllRegisteredGroups();
+    // Only ONE row for the folder survives on disk (the stale-JID duplicate
+    // must not reload after restart).
+    const forFolder = Object.entries(groups).filter(
+      ([, g]) => g.folder === 'atlas_gpg',
+    );
+    expect(forFolder).toHaveLength(1);
+    expect(forFolder[0][0]).toBe('new-jid@teams');
+    expect(groups['old-jid@teams']).toBeUndefined();
+  });
+
+  it('re-registration migrates existing scheduled_tasks.chat_jid to the new JID', () => {
+    setRegisteredGroup('old-jid@teams', {
+      name: 'GPG',
+      folder: 'atlas_gpg',
+      trigger: '@Atlas',
+      added_at: '2024-01-01T00:00:00.000Z',
+    });
+    createTask({
+      id: 'task-migrate',
+      group_folder: 'atlas_gpg',
+      chat_jid: 'old-jid@teams',
+      prompt: 'recurring',
+      schedule_type: 'interval',
+      schedule_value: '60000',
+      context_mode: 'isolated',
+      next_run: '2024-06-01T00:00:00.000Z',
+      status: 'active',
+      created_at: '2024-01-01T00:00:00.000Z',
+    });
+
+    // Re-register the folder under a new channel JID.
+    setRegisteredGroup('new-jid@teams', {
+      name: 'GPG',
+      folder: 'atlas_gpg',
+      trigger: '@Atlas',
+      added_at: '2024-02-01T00:00:00.000Z',
+    });
+
+    // The scheduled task now points at the live JID, not the dead one — so the
+    // scheduler no longer routes its output to a JID no channel owns.
+    const task = getTaskById('task-migrate');
+    expect(task).toBeDefined();
+    expect(task!.chat_jid).toBe('new-jid@teams');
+  });
+
+  it('a plain same-JID re-register leaves other folders\' tasks untouched', () => {
+    setRegisteredGroup('jid-a@teams', {
+      name: 'A',
+      folder: 'folder_a',
+      trigger: '@Atlas',
+      added_at: '2024-01-01T00:00:00.000Z',
+    });
+    createTask({
+      id: 'task-other',
+      group_folder: 'folder_b',
+      chat_jid: 'jid-b@teams',
+      prompt: 'unrelated',
+      schedule_type: 'once',
+      schedule_value: '2024-06-01T00:00:00.000Z',
+      context_mode: 'isolated',
+      next_run: '2024-06-01T00:00:00.000Z',
+      status: 'active',
+      created_at: '2024-01-01T00:00:00.000Z',
+    });
+
+    // Re-register folder_a under the SAME jid — must not touch folder_b's task.
+    setRegisteredGroup('jid-a@teams', {
+      name: 'A',
+      folder: 'folder_a',
+      trigger: '@Atlas',
+      added_at: '2024-02-01T00:00:00.000Z',
+    });
+
+    expect(getTaskById('task-other')!.chat_jid).toBe('jid-b@teams');
+  });
+});

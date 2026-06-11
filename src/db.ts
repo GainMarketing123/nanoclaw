@@ -730,6 +730,19 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
     db.prepare(
       'DELETE FROM registered_groups WHERE folder = ? AND jid != ?',
     ).run(group.folder, jid);
+    // Migrate dependent scheduled_tasks rows in the SAME write (cross-review
+    // FAIL_BLOCKING round 2, src/task-scheduler.ts:199-223,295-300):
+    // scheduled_tasks.chat_jid is captured at creation time and nothing else
+    // rewrites it. When a folder's channel JID changes (re-registration), the
+    // scheduler would keep routing container output, result delivery, idle
+    // tracking, and auto-pause escalation to the now-dead old JID
+    // ("No channel owns JID"). Repoint this folder's tasks at the current JID
+    // so the strengthened single-JID-per-folder invariant stays consistent
+    // end-to-end. Constrained to rows that don't already match, so a plain
+    // re-register of the same JID is a no-op.
+    db.prepare(
+      'UPDATE scheduled_tasks SET chat_jid = ? WHERE group_folder = ? AND chat_jid != ?',
+    ).run(jid, group.folder, jid);
     upsert.run(
       jid,
       group.name,
