@@ -347,33 +347,58 @@ export async function processTaskIpc(
         // Resolve the target group from JID — supports both real channel JIDs
         // and logical dispatch: JIDs from the bridge (e.g. "dispatch:atlas_gpg")
         let targetJid = data.targetJid as string;
-        let targetGroupEntry = registeredGroups[targetJid];
+        let targetGroupEntry: RegisteredGroup | undefined =
+          registeredGroups[targetJid];
 
         // Dispatch JID resolution: bridge uses "dispatch:{folder}" format.
-        // Map to the real channel JID by matching the group folder name.
-        if (!targetGroupEntry && targetJid.startsWith('dispatch:')) {
+        // A `dispatch:` alias is NOT owned by any outbound channel — persisting
+        // it as `chat_jid` makes task-scheduler forward results to a JID
+        // src/index.ts cannot route ("No channel owns JID"), so scheduled-task
+        // output is silently dropped (cross-review FAIL_BLOCKING ipc.ts:348-365).
+        // Therefore: whenever the target is a `dispatch:` alias, ALWAYS rewrite
+        // it to the real (non-dispatch) deliverable JID for the same folder —
+        // even when the in-memory registry happens to hold a literal
+        // `dispatch:{folder}` row (the prior `!targetGroupEntry` guard skipped
+        // resolution in exactly that case and let the undeliverable alias
+        // through). Resolution mirrors resolveCallbackJid: skip dispatch keys,
+        // take the first real channel JID for the folder. If none exists, reject
+        // the schedule request rather than persist a non-routable chat_jid.
+        if (targetJid.startsWith('dispatch:')) {
           const dispatchFolder = targetJid.slice('dispatch:'.length);
+          let resolvedJid: string | null = null;
+          let resolvedGroup: RegisteredGroup | undefined;
           for (const [jid, group] of Object.entries(registeredGroups)) {
-            if (group.folder === dispatchFolder) {
-              targetJid = jid;
-              targetGroupEntry = group;
-              logger.info(
-                {
-                  dispatch: data.targetJid,
-                  resolved: jid,
-                  folder: dispatchFolder,
-                },
-                'Dispatch JID resolved to registered group',
-              );
+            if (
+              group.folder === dispatchFolder &&
+              !jid.startsWith('dispatch:')
+            ) {
+              resolvedJid = jid;
+              resolvedGroup = group;
               break;
             }
           }
+          if (resolvedJid && resolvedGroup) {
+            logger.info(
+              {
+                dispatch: data.targetJid,
+                resolved: resolvedJid,
+                folder: dispatchFolder,
+              },
+              'Dispatch JID resolved to registered group',
+            );
+            targetJid = resolvedJid;
+            targetGroupEntry = resolvedGroup;
+          } else {
+            // No deliverable channel JID for this folder — do not persist an
+            // undeliverable dispatch: alias as chat_jid.
+            targetGroupEntry = undefined;
+          }
         }
 
-        if (!targetGroupEntry) {
+        if (!targetGroupEntry || targetJid.startsWith('dispatch:')) {
           logger.warn(
             { targetJid, original: data.targetJid },
-            'Cannot schedule task: target group not registered (dispatch resolution failed)',
+            'Cannot schedule task: no deliverable channel JID for target (dispatch resolution failed)',
           );
           break;
         }
