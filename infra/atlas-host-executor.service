@@ -104,6 +104,18 @@ EnvironmentFile=-/etc/atlas/atlas.env
 #     incomplete provisioning.
 LoadCredential=anthropic-api-key:/etc/atlas/anthropic-api-key.secret
 
+# SEC-1 host-task origin auth (live since 2026-05-25): expose the HMAC key
+# to this unit so host/host-executor.py can verify task signatures
+# (host/host_task_runtime.py:load_hmac_key reads
+# $CREDENTIALS_DIRECTORY/host-task-hmac first, then falls back to the
+# /etc/atlas path — the fallback is unreadable under the service user, so
+# this credential line is the operative path). The live VPS carries this
+# line via the drop-in
+# /etc/systemd/system/atlas-host-executor.service.d/host-task-hmac.conf
+# (source: infra/systemd-dropins/); added here 2026-06-10 (SEC-1 gap G2)
+# so the repo unit matches the effective live unit.
+LoadCredential=host-task-hmac:/etc/atlas/host-task-hmac.secret
+
 # Codex 7c7401b F2 BLOCKING revert: a previous version of this file added
 # Environment=CLAUDE_CONFIG_DIR=/home/nanoclaw-he/.claude here, but this
 # unit still runs as User=atlas. The atlas user cannot read a 0600
