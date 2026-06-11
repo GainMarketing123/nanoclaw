@@ -717,6 +717,19 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
         jid,
       );
     }
+    // Durably enforce the single-JID-per-folder invariant (cross-review
+    // FAIL_BLOCKING, src/index.ts:304-338). registerGroup()'s in-memory
+    // pruning deletes a re-registered folder's stale JID from RAM only; the
+    // upsert here is keyed by JID, so a prior row for the SAME folder under a
+    // DIFFERENT JID survives on disk. After a restart loadState() reloads both
+    // rows from getAllRegisteredGroups(), re-introducing the stale-JID
+    // duplicate that folder-based resolution (resolveCallbackJid / dispatch
+    // target rewriting) can once again pick. Delete any other row for this
+    // folder before upserting so the DB holds exactly one current JID per
+    // folder, matching the in-memory contract.
+    db.prepare(
+      'DELETE FROM registered_groups WHERE folder = ? AND jid != ?',
+    ).run(group.folder, jid);
     upsert.run(
       jid,
       group.name,
