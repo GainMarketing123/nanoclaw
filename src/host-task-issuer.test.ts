@@ -48,6 +48,7 @@ describe('host-task-issuer', () => {
         model: 'model-b',
       },
       'group-a',
+      'jid-a@test',
       policy,
       key,
       now,
@@ -58,6 +59,41 @@ describe('host-task-issuer', () => {
       return;
     }
     expect(verify(result.task, key, now)).toEqual({ ok: true, reason: 'ok' });
+    // callback_group carries the caller-resolved registered chat JID — the
+    // executor emits it as the IPC chatJid, so it must be JID-shaped, not the
+    // group folder name (cross-review 44a873d1 F1).
+    expect(result.task.callback_group).toBe('jid-a@test');
+  });
+
+  it('callback_group is the resolved JID and ignores data.callback_group', () => {
+    const root = makeTempDir('host-task-issuer-callback-root-');
+    cleanupPaths.push(root);
+
+    const policy: HostTaskPolicy = {
+      entity: 'policy-entity',
+      max_tier: 3,
+      allowed_project_dirs: [root],
+      allowed_models: ['model-a'],
+    };
+
+    const result = evaluateHostTaskRequest(
+      {
+        prompt: 'run task',
+        project_dir: root,
+        callback_group: 'attacker-jid@evil',
+      },
+      'group-a',
+      'jid-a@test',
+      policy,
+      Buffer.from('99'.repeat(32), 'hex'),
+      1_717_000_000,
+    );
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
+    expect(result.task.callback_group).toBe('jid-a@test');
   });
 
   it('entity always comes from policy and ignores data.entity', () => {
@@ -78,6 +114,7 @@ describe('host-task-issuer', () => {
         entity: 'attacker-entity',
       },
       'group-a',
+      'jid-a@test',
       policy,
       Buffer.from('22'.repeat(32), 'hex'),
       1_717_000_000,
@@ -106,6 +143,7 @@ describe('host-task-issuer', () => {
     const clamped = evaluateHostTaskRequest(
       { prompt: 'run task', project_dir: root, tier: 5 },
       'group-a',
+      'jid-a@test',
       policy,
       key,
       now,
@@ -118,6 +156,7 @@ describe('host-task-issuer', () => {
     const preserved = evaluateHostTaskRequest(
       { prompt: 'run task', project_dir: root, tier: 2 },
       'group-a',
+      'jid-a@test',
       policy,
       key,
       now,
@@ -142,6 +181,7 @@ describe('host-task-issuer', () => {
     const result = evaluateHostTaskRequest(
       { prompt: 'run task', project_dir: root, model: 'bad-model' },
       'group-a',
+      'jid-a@test',
       policy,
       Buffer.from('44'.repeat(32), 'hex'),
       1_717_000_000,
@@ -168,6 +208,7 @@ describe('host-task-issuer', () => {
     const result = evaluateHostTaskRequest(
       { prompt: 'run task', project_dir: outsideRoot },
       'group-a',
+      'jid-a@test',
       policy,
       Buffer.from('55'.repeat(32), 'hex'),
       1_717_000_000,
@@ -195,6 +236,7 @@ describe('host-task-issuer', () => {
     const result = evaluateHostTaskRequest(
       { prompt: 'run task', project_dir: escapePath },
       'group-a',
+      'jid-a@test',
       policy,
       Buffer.from('66'.repeat(32), 'hex'),
       1_717_000_000,
@@ -217,6 +259,7 @@ describe('host-task-issuer', () => {
     const result = evaluateHostTaskRequest(
       { project_dir: root },
       'group-a',
+      'jid-a@test',
       policy,
       Buffer.from('77'.repeat(32), 'hex'),
       1_717_000_000,
@@ -239,6 +282,7 @@ describe('host-task-issuer', () => {
     const result = evaluateHostTaskRequest(
       { prompt: 'run task', project_dir: root },
       'group-a',
+      'jid-a@test',
       policy,
       Buffer.alloc(0),
       1_717_000_000,
@@ -264,6 +308,7 @@ describe('host-task-issuer', () => {
     const evalResult = evaluateHostTaskRequest(
       { prompt: 'run task', project_dir: root },
       'group-a',
+      'jid-a@test',
       policy,
       key,
       now,

@@ -31,6 +31,12 @@ function isNonEmptyString(value: unknown): value is string {
 export function evaluateHostTaskRequest(
   data: unknown,
   sourceGroup: string,
+  // The requester's REGISTERED chat JID, resolved by the trusted caller
+  // (src/ipc.ts) from registeredGroups by sourceGroup folder — never a
+  // container-supplied value. May be '' when the folder has no registered
+  // JID; the executor then skips result delivery (fire-and-notify is
+  // best-effort) while the task itself still runs.
+  callbackJid: string,
   policy: HostTaskPolicy,
   key: Buffer,
   now: number,
@@ -100,11 +106,16 @@ export function evaluateHostTaskRequest(
     model,
     project_dir: realDir,
     prompt: payload.prompt,
-    // callback_group is ALWAYS the requester's own group, never a container
-    // claim (cross-review 3a75c45 F1): the executor routes results by this
-    // field, so honoring a container-supplied value would enable cross-group
-    // result delivery / exfiltration.
-    callback_group: sourceGroup,
+    // callback_group is ALWAYS the requester's own registered chat JID,
+    // never a container claim (cross-review 3a75c45 F1): the executor routes
+    // results by this field, so honoring a container-supplied value would
+    // enable cross-group result delivery / exfiltration. It is a JID — not a
+    // group FOLDER — because the read side (host-executor.py send_result →
+    // IPC "chatJid" → src/ipc.ts registeredGroups[chatJid] → sendMessage)
+    // consumes JIDs end-to-end; a folder name here silently failed delivery
+    // (cross-review 44a873d1 F1). The trusted caller resolves folder → JID
+    // from registeredGroups before calling this function.
+    callback_group: callbackJid,
     nonce: randomBytes(16).toString('hex'),
     issued_at: now,
     expires_at: now + HOST_TASK_TTL_S,

@@ -383,10 +383,29 @@ export async function processTaskIpc(
         logger.warn({ sourceGroup }, 'host_task rejected: rate limit exceeded');
         break;
       }
+      // Resolve the requester's registered chat JID from its folder (cross-
+      // review 44a873d1 F1): callback_group must be JID-shaped on the wire
+      // because the executor's send_result emits it as the IPC "chatJid" and
+      // the message loop routes by registeredGroups[chatJid]. Resolution is
+      // server-side from the unforgeable sourceGroup — never container input.
+      let callbackJid = '';
+      for (const [jid, group] of Object.entries(registeredGroups)) {
+        if (group.folder === sourceGroup) {
+          callbackJid = jid;
+          break;
+        }
+      }
+      if (!callbackJid) {
+        logger.warn(
+          { sourceGroup },
+          'host_task: no registered JID for group; task will run but result delivery will be skipped',
+        );
+      }
       try {
         const hostTaskResult = evaluateHostTaskRequest(
           data,
           sourceGroup,
+          callbackJid,
           hostTaskPolicy,
           loadHostTaskKey(),
           Math.floor(Date.now() / 1000),
