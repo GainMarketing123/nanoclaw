@@ -100,12 +100,24 @@ export function isRetiredChannelJid(jid: string): boolean {
  * the row the schema migration promotes), else the first encountered.
  * Returns undefined when NO live candidate exists — callers must treat that
  * as "no main group" rather than falling back to a retired JID.
+ *
+ * selectLiveMain returns the full candidate (callers that write privileged
+ * IPC need the selected main's FOLDER too — the IPC watcher authorizes by
+ * main-folder match, so host-side writers must emit from the live main's
+ * own source directory, not a hard-coded one); selectLiveMainJid is the
+ * jid-only convenience over it.
  */
+export function selectLiveMain<T extends { jid: string; folder?: string }>(
+  candidates: T[],
+): T | undefined {
+  const live = candidates.filter((c) => !isRetiredChannelJid(c.jid));
+  return live.find((c) => c.folder === 'main') ?? live[0];
+}
+
 export function selectLiveMainJid(
   candidates: Array<{ jid: string; folder?: string }>,
 ): string | undefined {
-  const live = candidates.filter((c) => !isRetiredChannelJid(c.jid));
-  return (live.find((c) => c.folder === 'main') ?? live[0])?.jid;
+  return selectLiveMain(candidates)?.jid;
 }
 
 /**

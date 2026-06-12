@@ -399,6 +399,13 @@ export function _loadState(): void {
  *    registered" shape of the original implementation could never promote
  *    it, leaving the system permanently mainless (alerts dropped, commands
  *    refused) until manual SQL. A live main elsewhere is never stolen.
+ *    Preserving a non-'atlas_main' folder is safe end-to-end: the host-side
+ *    privileged IPC writers (host/host-executor.py send_alert/send_result,
+ *    src/credential-proxy.ts sendAlert) resolve the LIVE main group's folder
+ *    from the DB per send and emit from that source directory, so the IPC
+ *    watcher's main-folder authorization keeps matching (codex 460b9c7
+ *    finding 1 — they previously hard-coded data/ipc/atlas_main/messages,
+ *    which a re-promoted main in another folder would have black-holed).
  *
  * Idempotent: an already-main chat returns immediately.
  *
@@ -435,15 +442,14 @@ export function ensureOwnerMainGroup(chatJid: string): void {
   }
   registerGroup(chatJid, {
     name: 'Atlas',
-    // MUST be 'atlas_main': the host-side IPC writers (host/host-executor.py
-    // IPC_DIR and src/credential-proxy.ts) emit alert/result messages from a
-    // hard-coded `data/ipc/atlas_main/messages` source, and startIpcWatcher
-    // authorizes by SOURCE folder (folder===is_main folder). A divergent
-    // folder here would make the main group's folder !== 'atlas_main', so
-    // those CEO alerts (auth-expiry, outage, escalation, task results) would
-    // be rejected as "Unauthorized IPC message attempt blocked" even though
-    // the target JID resolves. 'atlas_main' also matches the name→folder
-    // convention ("Atlas" ↔ atlas_main).
+    // 'atlas_main' is the CONVENTION for fresh owner-chat registrations
+    // (matches the name→folder convention "Atlas" ↔ atlas_main and the
+    // existing groups/atlas_main memory dir). It is no longer a hard
+    // requirement for alert delivery: the host-side privileged IPC writers
+    // (host/host-executor.py send_alert/send_result, src/credential-proxy.ts
+    // sendAlert) resolve the live main group's folder from the DB per send
+    // and emit from that source directory, so startIpcWatcher's main-folder
+    // authorization follows whichever folder the live main carries.
     folder: 'atlas_main',
     trigger: `@${ASSISTANT_NAME}`,
     added_at: new Date().toISOString(),

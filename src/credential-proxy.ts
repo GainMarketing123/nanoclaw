@@ -42,10 +42,17 @@ import { createServer, Server } from 'http';
 import { request as httpsRequest } from 'https';
 import { request as httpRequest, IncomingMessage, RequestOptions } from 'http';
 
+// ESM import, NOT require(): this package builds as NodeNext ESM
+// ("type": "module"), where `require` is undefined at runtime — the old
+// inline `require('better-sqlite3')` in sendAlert threw ReferenceError on
+// every call and the surrounding catch{} swallowed it, so credential-proxy
+// alerts silently never emitted (codex 460b9c7 finding 2).
+import Database from 'better-sqlite3';
+
 import { ATLAS_DIR, HOST_CLAUDE_DIR } from './config.js';
 import { readEnvFile } from './env.js';
 import { logger } from './logger.js';
-import { selectLiveMainJid } from './router.js';
+import { selectLiveMain } from './router.js';
 
 export type AuthMode = 'api-key' | 'oauth';
 
@@ -469,22 +476,12 @@ function startOutageRecovery(creds: {
  */
 function sendAlert(message: string): void {
   try {
-    const ipcDir = path.join(
-      process.cwd(),
-      'data',
-      'ipc',
-      'atlas_main',
-      'messages',
-    );
-    fs.mkdirSync(ipcDir, { recursive: true });
-
-    // Read main group JID. Fetch ALL is_main rows and pick retirement-aware:
+    // Read the main group. Fetch ALL is_main rows and pick retirement-aware:
     // a bare `LIMIT 1` could return a retired-channel JID (e.g. the legacy
     // Telegram main from the 2026-06-11 trace), routing the alert to a
-    // target no channel owns. selectLiveMainJid never returns a retired JID;
+    // target no channel owns. selectLiveMain never returns a retired row;
     // when no live main exists, drop the alert here rather than write an
     // undeliverable IPC file.
-    const Database = require('better-sqlite3');
     const dbPath = path.join(process.cwd(), 'store', 'messages.db');
     const db = new Database(dbPath, { readonly: true });
     const rows = db
@@ -492,15 +489,30 @@ function sendAlert(message: string): void {
       .all() as Array<{ jid: string; folder: string }>;
     db.close();
 
-    const mainJid = selectLiveMainJid(rows);
-    if (!mainJid) return;
+    const main = selectLiveMain(rows);
+    if (!main) return;
+
+    // Write into the LIVE main group's own IPC source directory. The IPC
+    // watcher (src/ipc.ts) authorizes privileged sends by matching the
+    // source folder against the registered main group's folder, so a
+    // hard-coded 'atlas_main' source would be rejected as unauthorized
+    // whenever the live main's folder differs (e.g. the VPS Teams main in
+    // folder 'atlas_teams') — codex 460b9c7 finding 1.
+    const ipcDir = path.join(
+      process.cwd(),
+      'data',
+      'ipc',
+      main.folder,
+      'messages',
+    );
+    fs.mkdirSync(ipcDir, { recursive: true });
 
     const alertFile = path.join(ipcDir, `auth-alert-${Date.now()}.json`);
     fs.writeFileSync(
       alertFile,
       JSON.stringify({
         type: 'message',
-        chatJid: mainJid,
+        chatJid: main.jid,
         text: message,
       }),
     );

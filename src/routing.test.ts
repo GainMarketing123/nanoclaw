@@ -13,7 +13,7 @@ import {
   _loadState,
   _setRegisteredGroups,
 } from './index.js';
-import { selectLiveMainJid } from './router.js';
+import { selectLiveMain, selectLiveMainJid } from './router.js';
 
 beforeEach(() => {
   _initTestDatabase();
@@ -221,6 +221,18 @@ describe('selectLiveMainJid', () => {
 
   it('returns undefined for an empty candidate list', () => {
     expect(selectLiveMainJid([])).toBe(undefined);
+  });
+
+  it('selectLiveMain returns the full row — privileged IPC writers need the folder too', () => {
+    // host-executor.py / credential-proxy.ts emit alerts from the live
+    // main's OWN IPC source dir (the watcher authorizes by main-folder
+    // match), so the selection must expose the folder, not just the jid.
+    expect(
+      selectLiveMain([
+        { jid: 'tg:7322433447', folder: 'main' },
+        { jid: 'msteams:a:owner', folder: 'atlas_teams' },
+      ]),
+    ).toEqual({ jid: 'msteams:a:owner', folder: 'atlas_teams' });
   });
 });
 

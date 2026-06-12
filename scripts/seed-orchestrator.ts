@@ -17,10 +17,15 @@ import { CronExpressionParser } from 'cron-parser';
 import fs from 'fs';
 import path from 'path';
 
-import { selectLiveMainJid } from '../src/router.js';
+import { selectLiveMain } from '../src/router.js';
 
 const TASK_ID = 'atlas-orchestrator-daily';
-const GROUP_FOLDER = 'atlas_main';
+// Fallback only — when the main group can be resolved from the DB, the task
+// is seeded under the LIVE main group's folder (a task whose group_folder
+// names an unregistered folder never runs: the scheduler resolves the group
+// by folder). Used solely for the explicit --chat-jid path where no main row
+// is consulted.
+const FALLBACK_GROUP_FOLDER = 'atlas_main';
 const SCHEDULE_TYPE = 'cron';
 const SCHEDULE_VALUE = '0 6 * * *'; // 6AM daily
 const TIMEZONE = process.env.TZ || 'America/New_York';
@@ -109,22 +114,30 @@ if (!fs.existsSync(dbPath)) {
 
 const db = new Database(dbPath);
 
-// Resolve chat_jid from registered groups if not provided. Retirement-aware:
-// a bare `LIMIT 1` could seed the daily digest task against a retired-channel
-// JID (e.g. the legacy Telegram main row from the 2026-06-11 trace), so every
-// digest delivery would silently fail. selectLiveMainJid never returns a
-// retired JID.
+// Resolve chat_jid (and the task's group_folder) from registered groups if
+// not provided. Retirement-aware: a bare `LIMIT 1` could seed the daily
+// digest task against a retired-channel JID (e.g. the legacy Telegram main
+// row from the 2026-06-11 trace), so every digest delivery would silently
+// fail. selectLiveMain never returns a retired row. The task must also be
+// seeded under the LIVE main group's folder: the scheduler resolves the
+// group by `g.folder === task.group_folder` (src/task-scheduler.ts), so a
+// hard-coded 'atlas_main' folder produces a permanently failing "Group not
+// found" task whenever the live main lives in another folder (e.g. the VPS
+// Teams main in 'atlas_teams').
+let groupFolder = FALLBACK_GROUP_FOLDER;
 if (!chatJid) {
   const mains = db.prepare(
     'SELECT jid, folder FROM registered_groups WHERE is_main = 1'
   ).all() as Array<{ jid: string; folder: string }>;
 
-  chatJid = selectLiveMainJid(mains);
-  if (!chatJid) {
+  const main = selectLiveMain(mains);
+  if (!main) {
     console.error('No live-channel main group found in registered_groups. Provide --chat-jid.');
     process.exit(1);
   }
-  console.log(`Found main group: ${chatJid}`);
+  chatJid = main.jid;
+  groupFolder = main.folder;
+  console.log(`Found main group: ${chatJid} (folder ${groupFolder})`);
 }
 
 // Check if task already exists
@@ -156,7 +169,7 @@ if (existing) {
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     TASK_ID,
-    GROUP_FOLDER,
+    groupFolder,
     chatJid,
     ORCHESTRATOR_PROMPT,
     SCHEDULE_TYPE,
@@ -170,7 +183,7 @@ if (existing) {
 }
 
 console.log(`  ID:       ${TASK_ID}`);
-console.log(`  Group:    ${GROUP_FOLDER}`);
+console.log(`  Group:    ${groupFolder}`);
 console.log(`  Chat JID: ${chatJid}`);
 console.log(`  Schedule: ${SCHEDULE_VALUE} (${TIMEZONE})`);
 console.log(`  Next run: ${nextRun}`);

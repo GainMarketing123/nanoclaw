@@ -247,8 +247,8 @@ print('  Config verified: valid JSON')
 db.close()
 "
 
-# --- Step 4: Update atlas_main mounts to include this shared workspace ---
-echo "Step 4: Ensuring atlas_main has shared workspace access..."
+# --- Step 4: Update the main group's mounts to include this shared workspace ---
+echo "Step 4: Ensuring the main group has shared workspace access..."
 
 python3 -c "
 import sqlite3, json

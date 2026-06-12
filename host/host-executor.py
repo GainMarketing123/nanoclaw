@@ -428,7 +428,15 @@ PENDING_DIR = ATLAS_DIR / "host-tasks" / "pending"
 COMPLETED_DIR = ATLAS_DIR / "host-tasks" / "completed"
 OUTPUTS_DIR = ATLAS_DIR / "host-tasks" / "outputs"
 AUDIT_DIR = ATLAS_DIR / "audit"
-IPC_DIR = NANOCLAW_DIR / "data" / "ipc" / "atlas_main" / "messages"
+# Base of NanoClaw's file-IPC tree. Host-side writers must emit from the
+# LIVE main group's own source directory (IPC_BASE_DIR / <main folder> /
+# "messages") — the IPC watcher (src/ipc.ts) authorizes privileged sends by
+# matching the source folder against the registered main group's folder, so
+# the old hard-coded ".../atlas_main/messages" path was rejected as
+# unauthorized whenever the live main's folder differed (e.g. the VPS Teams
+# main in folder 'atlas_teams') — codex 460b9c7 finding 1. Resolution is
+# per-send via get_live_main_row() below.
+IPC_BASE_DIR = NANOCLAW_DIR / "data" / "ipc"
 
 # Config
 POLL_INTERVAL = 5  # seconds
@@ -966,39 +974,70 @@ def log(msg: str) -> None:
     print(f"[{ts}] {msg}", flush=True)
 
 
+def select_live_main_row(rows):
+    """Pick the live main group among (jid, folder) is_main=1 rows.
+
+    EXACT mirror of selectLiveMain/selectLiveMainJid in src/router.ts — keep
+    in lockstep (codex 460b9c7 finding 3: a first-non-retired shortcut here
+    diverged from the TypeScript folder-priority rule, so with multiple live
+    legacy mains host alerts could target a different chat than the
+    orchestrator considers canonical):
+      - retired-channel JIDs are NEVER eligible (a retired JID cannot
+        deliver — the live "No channel for JID: tg:…" mis-route from the
+        2026-06-11 trace);
+      - among live rows the canonical folder == 'main' wins (the row the
+        schema migration promotes);
+      - else the first live row encountered;
+      - None when no live candidate exists — callers must treat that as
+        "no main group", never fall back to a retired JID.
+    """
+    live = [r for r in rows if not r[0].startswith(RETIRED_CHANNEL_JID_PREFIXES)]
+    for row in live:
+        if row[1] == "main":
+            return row
+    return live[0] if live else None
+
+
+def get_live_main_row():
+    """Read (jid, folder) of the live main group from the NanoClaw DB.
+
+    Returns None (after logging) when the DB is missing or no live-channel
+    main group is registered.
+    """
+    import sqlite3
+    db_path = NANOCLAW_DIR / "store" / "messages.db"
+    if not db_path.exists():
+        log(f"Cannot resolve main group — DB not found at {db_path}")
+        return None
+    conn = sqlite3.connect(str(db_path))
+    try:
+        rows = conn.execute(
+            "SELECT jid, folder FROM registered_groups WHERE is_main = 1"
+        ).fetchall()
+    finally:
+        conn.close()
+    return select_live_main_row(rows)
+
+
 def send_alert(message: str) -> None:
-    """Send an alert to CEO via NanoClaw's IPC system (atlas_main group).
+    """Send an alert to CEO via NanoClaw's IPC system (the live main group).
 
     Channel-agnostic: writes an IPC message addressed to the registered main
     group JID; the NanoClaw channel layer delivers it by JID prefix (now a
-    Teams `msteams:` JID post-2026-06-03 comms cutover).
+    Teams `msteams:` JID post-2026-06-03 comms cutover). The file is written
+    into the LIVE main group's own IPC source directory — the watcher
+    authorizes privileged sends by main-folder match (see IPC_BASE_DIR note).
     """
     try:
-        IPC_DIR.mkdir(parents=True, exist_ok=True)
-        # Read main group JID from NanoClaw DB
-        import sqlite3
-        db_path = NANOCLAW_DIR / "store" / "messages.db"
-        if not db_path.exists():
-            log(f"Cannot send alert — DB not found at {db_path}")
-            return
-        conn = sqlite3.connect(str(db_path))
-        rows = conn.execute("SELECT jid FROM registered_groups WHERE is_main = 1").fetchall()
-        conn.close()
-        # Retirement-aware selection (mirrors selectLiveMainJid in
-        # src/router.ts): a bare LIMIT 1 could return a retired-channel JID
-        # (e.g. the legacy Telegram is_main row from the 2026-06-11 trace),
-        # routing the CEO alert to a target no channel owns. Never route to a
-        # retired JID; if no live main exists, log-and-drop here instead of
-        # writing an undeliverable IPC file.
-        main_jid = next(
-            (r[0] for r in rows if not r[0].startswith(RETIRED_CHANNEL_JID_PREFIXES)),
-            None,
-        )
-        if not main_jid:
+        main = get_live_main_row()
+        if not main:
             log("Cannot send alert — no live-channel main group registered")
             return
+        main_jid, main_folder = main
 
-        alert_file = IPC_DIR / f"alert-{int(time.time() * 1000)}.json"
+        ipc_dir = IPC_BASE_DIR / main_folder / "messages"
+        ipc_dir.mkdir(parents=True, exist_ok=True)
+        alert_file = ipc_dir / f"alert-{int(time.time() * 1000)}.json"
         alert_file.write_text(json.dumps({
             "type": "message",
             "chatJid": main_jid,
@@ -1024,12 +1063,21 @@ def send_result(callback_group: str, content: str, task_id: str, entity: str) ->
     never landed. The surrounding try/except Exception caught the NameError
     silently, so callback_group routing has been a no-op (just logged the
     failure) since those commits. Defining at root closes the latent gap.
+
+    The result file is written into the LIVE main group's IPC source
+    directory (privileged source — the watcher authorizes a send to another
+    group's chatJid only from the main folder; see IPC_BASE_DIR note).
     """
     try:
-        IPC_DIR.mkdir(parents=True, exist_ok=True)
         if not callback_group:
             log(f"Result skipped — empty callback_group for task {task_id}")
             return
+        main = get_live_main_row()
+        if not main:
+            log(f"Result skipped — no live-channel main group registered (task {task_id})")
+            return
+        ipc_dir = IPC_BASE_DIR / main[1] / "messages"
+        ipc_dir.mkdir(parents=True, exist_ok=True)
         # Truncate large payloads to keep the IPC message size bounded — chat
         # channels cap message length; we leave headroom for the entity /
         # task_id prefix and any wrapper the channel adds.
@@ -1038,7 +1086,7 @@ def send_result(callback_group: str, content: str, task_id: str, entity: str) ->
             content[:max_chars] + f"\n... (truncated, full output in ~/.atlas/host-tasks/outputs/{task_id}.txt)"
         )
         prefix = f"[{entity}] task {task_id}\n"
-        result_file = IPC_DIR / f"result-{int(time.time() * 1000)}-{task_id}.json"
+        result_file = ipc_dir / f"result-{int(time.time() * 1000)}-{task_id}.json"
         result_file.write_text(json.dumps({
             "type": "message",
             "chatJid": callback_group,
