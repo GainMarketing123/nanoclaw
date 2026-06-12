@@ -731,6 +731,30 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
   // channel that no longer exists. Demote every other row before promoting
   // this one, atomically, so at most one main can exist.
   const apply = db.transaction(() => {
+    // Same-JID FOLDER-RENAME migration (codex 66873e9 soft finding): the
+    // upsert below is keyed by JID, so re-registering an existing JID under
+    // a DIFFERENT folder moves the group row — but scheduled_tasks rows stay
+    // keyed to the OLD folder, which after this write has no registered
+    // group. task-scheduler resolves tasks by group_folder, so those tasks
+    // would error "Group not found" on every retry, forever. Migrate them to
+    // the new folder FIRST (the chat_jid repoint below then also covers
+    // them). The old folder's sessions row is DELETED, not migrated: the
+    // on-disk session transcripts live under data/sessions/<oldFolder>/
+    // .claude, which the new folder's container does not mount — a migrated
+    // session_id would fail SDK resume, and a row left behind would hand the
+    // old conversation to whatever group registers at the vacated folder
+    // next (cross-group context leak).
+    const priorRow = db
+      .prepare('SELECT folder FROM registered_groups WHERE jid = ?')
+      .get(jid) as { folder: string } | undefined;
+    if (priorRow && priorRow.folder !== group.folder) {
+      db.prepare(
+        'UPDATE scheduled_tasks SET group_folder = ? WHERE group_folder = ?',
+      ).run(group.folder, priorRow.folder);
+      db.prepare('DELETE FROM sessions WHERE group_folder = ?').run(
+        priorRow.folder,
+      );
+    }
     if (group.isMain) {
       db.prepare('UPDATE registered_groups SET is_main = 0 WHERE jid != ?').run(
         jid,

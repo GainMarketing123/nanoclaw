@@ -9,9 +9,11 @@ import {
   getAllRegisteredGroups,
   getMessagesSince,
   getNewMessages,
+  getSession,
   getTaskById,
   normalizeLegacyMigratedGroup,
   setRegisteredGroup,
+  setSession,
   storeChatMetadata,
   storeMessage,
   storeMessageDirect,
@@ -740,6 +742,111 @@ describe('single-JID-per-folder invariant (cross-review FAIL_BLOCKING)', () => {
     });
 
     expect(getTaskById('task-keep-jid')!.chat_jid).toBe('real-jid@teams');
+  });
+});
+
+describe('same-JID folder-rename migration (codex 66873e9 soft finding)', () => {
+  const register = (jid: string, folder: string) =>
+    setRegisteredGroup(jid, {
+      name: folder,
+      folder,
+      trigger: '@Atlas',
+      added_at: '2024-01-01T00:00:00.000Z',
+    });
+
+  it('repointing a JID to a new folder migrates its scheduled tasks', () => {
+    register('jid-x@teams', 'folder_old');
+    createTask({
+      id: 'task-rename',
+      group_folder: 'folder_old',
+      chat_jid: 'jid-x@teams',
+      prompt: 'recurring',
+      schedule_type: 'interval',
+      schedule_value: '60000',
+      context_mode: 'isolated',
+      next_run: '2024-06-01T00:00:00.000Z',
+      status: 'active',
+      created_at: '2024-01-01T00:00:00.000Z',
+    });
+
+    // Same JID, different folder — the task must follow, or the scheduler
+    // resolves group_folder='folder_old' against registered groups forever
+    // and the task errors "Group not found" on every retry.
+    register('jid-x@teams', 'folder_new');
+
+    const task = getTaskById('task-rename');
+    expect(task!.group_folder).toBe('folder_new');
+    expect(task!.chat_jid).toBe('jid-x@teams');
+  });
+
+  it('a rename also repoints stale chat_jids on the migrated tasks', () => {
+    register('jid-x@teams', 'folder_old');
+    createTask({
+      id: 'task-stale-jid',
+      group_folder: 'folder_old',
+      chat_jid: 'ancient-jid@teams',
+      prompt: 'recurring',
+      schedule_type: 'interval',
+      schedule_value: '60000',
+      context_mode: 'isolated',
+      next_run: '2024-06-01T00:00:00.000Z',
+      status: 'active',
+      created_at: '2024-01-01T00:00:00.000Z',
+    });
+
+    register('jid-x@teams', 'folder_new');
+
+    // Migration order is load-bearing: group_folder moves first, then the
+    // existing chat_jid repoint (scoped to the NEW folder) covers the row.
+    const task = getTaskById('task-stale-jid');
+    expect(task!.group_folder).toBe('folder_new');
+    expect(task!.chat_jid).toBe('jid-x@teams');
+  });
+
+  it('deletes the vacated folder session instead of migrating it', () => {
+    register('jid-x@teams', 'folder_old');
+    setSession('folder_old', 'session-old');
+
+    register('jid-x@teams', 'folder_new');
+
+    // The transcript lives under data/sessions/folder_old/.claude, which the
+    // new folder's container does not mount — a migrated pointer would fail
+    // SDK resume; a leftover row would leak the old conversation to the
+    // folder's next tenant.
+    expect(getSession('folder_old')).toBeUndefined();
+    expect(getSession('folder_new')).toBeUndefined();
+  });
+
+  it('a rename does not disturb the new folder existing session or other tasks', () => {
+    register('jid-other@teams', 'folder_other');
+    setSession('folder_other', 'session-other');
+    createTask({
+      id: 'task-other-grp',
+      group_folder: 'folder_other',
+      chat_jid: 'jid-other@teams',
+      prompt: 'unrelated',
+      schedule_type: 'once',
+      schedule_value: '2024-06-01T00:00:00.000Z',
+      context_mode: 'isolated',
+      next_run: '2024-06-01T00:00:00.000Z',
+      status: 'active',
+      created_at: '2024-01-01T00:00:00.000Z',
+    });
+
+    register('jid-x@teams', 'folder_old');
+    register('jid-x@teams', 'folder_new');
+
+    expect(getSession('folder_other')).toBe('session-other');
+    expect(getTaskById('task-other-grp')!.group_folder).toBe('folder_other');
+  });
+
+  it('a plain same-folder re-register leaves the session untouched', () => {
+    register('jid-x@teams', 'folder_same');
+    setSession('folder_same', 'session-keep');
+
+    register('jid-x@teams', 'folder_same');
+
+    expect(getSession('folder_same')).toBe('session-keep');
   });
 });
 

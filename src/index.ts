@@ -309,11 +309,22 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
     return;
   }
 
+  // Capture the prior folder BEFORE the write: a same-JID folder rename must
+  // also drop the in-memory session pointer for the vacated folder (the DB
+  // transaction in setRegisteredGroup deletes the sessions row — codex
+  // 66873e9 soft finding; the in-memory map must not resurrect it for a
+  // future tenant of that folder within this process lifetime).
+  const priorFolder = registeredGroups[jid]?.folder;
+
   // Persist to the DB FIRST (atomic single-main transaction in
   // setRegisteredGroup), then mirror the result in memory only on success. If
   // the DB write throws, process memory is left untouched and stays consistent
   // with the database rather than being mutated ahead of a failed persist.
   setRegisteredGroup(jid, group);
+
+  if (priorFolder && priorFolder !== group.folder) {
+    delete sessions[priorFolder];
+  }
 
   // Mirror the DB-layer single-main invariant in the in-memory map. The router
   // and command path trust `registeredGroups[chatJid]?.isMain`, not the DB, so
