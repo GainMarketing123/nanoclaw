@@ -216,3 +216,62 @@ instead of discovering it adversarially:
 Tracking: roadmap item to be added under the al22 arc carry-overs
 (operational tracking lives in ~/.atlas/plans/ecosystem-roadmap.md, not
 here — this file is the in-repo record of the walk-back itself).
+
+## Round 4 — landing range review of 66873e9f..a336f503 (FAIL_BLOCKING, 4 findings) and dispositions
+
+Manual drive of the official run_code_review (force codex, pinned
+head_sha a336f503ef1e5a7bb27061a412c29e824e9492ed), verdict
+FAIL_BLOCKING, files_reviewed 16, cross_file_traces 8, duration 144.6s.
+The range cert for this landing is issued acknowledged=True against this
+verdict; per-finding dispositions:
+
+1. [cross_file_call / blocking] scripts/seed-orchestrator.ts:21-23,111-154 —
+   "The seeder still hard-codes `group_folder = 'atlas_main'` and defaults
+   `chat_jid` from `WHERE is_main = 1 LIMIT 1`, instead of resolving the
+   live deliverable main-group row."
+   DISPOSITION: CARRIED OVER — this IS the walked-back item. The range
+   diff for this file is only the two uncontested wording lines; the
+   cumulative-diff review re-reads the whole file and re-states the
+   origin/main defects already recorded verbatim above (rounds 0-3) and
+   already covered by the OPERATIONAL WARNING + reland spec. No new code
+   ships in this area.
+2. [state_mutation / blocking] scripts/seed-orchestrator.ts:140-145 —
+   "`--force` does not rewrite the task's routing columns."
+   DISPOSITION: CARRIED OVER — identical to round-1 finding 1 (verbatim
+   above), walked back with the script; part of the reland spec.
+3. [if_completeness / blocking] scripts/seed-orchestrator.ts:95-123,148-154 —
+   "The explicit `--chat-jid` path accepts any string and never validates
+   that it maps to a registered, deliverable chat."
+   DISPOSITION: CARRIED OVER — the union of round-1 finding 2, round-2
+   finding 2, and round-3 finding 1 (verbatim above); the deliverability
+   helper is the centerpiece of the reland spec.
+4. [state_mutation / blocking] src/index.ts:216-230 — "Startup
+   normalization can persistently demote the only `is_main` row to 'no
+   main' and then return without promoting any replacement... A cold
+   restart in this DB state silently black-holes main-channel
+   notifications until the owner manually speaks first." Suggested fix:
+   "Promote a deterministic live candidate during normalization and
+   persist it, or fail startup loudly."
+   DISPOSITION: DELIBERATE DESIGN, NOT TAKEN — first-occurrence objection
+   in the 5th review pass over this code (rounds 0-3 examined the same
+   loadState block without raising it). The demote-then-owner-re-promote
+   design is intentional and security-relevant:
+   - Auto-promoting "a deterministic live candidate" would hand an
+     arbitrary NON-OWNER registered group (e.g. a staff group) the main
+     control role — main-folder identity authorizes privileged IPC
+     (src/ipc.ts) and CEO alert delivery. That is a privilege escalation,
+     strictly worse than a bounded alert gap.
+   - Failing startup loudly would brick ALL channels including the
+     owner-gated recovery path itself (ensureOwnerMainGroup fires on the
+     owner's next message — src/index.ts:417); an orchestrator that
+     refuses to boot can never self-heal.
+   - The drop window is bounded (owner's first message on a live
+     owner-gated channel) and every drop is logged with an explicit
+     reason. The PRE-wave-2 behavior in the identical DB state was
+     strictly worse: alerts routed to the dead tg: JID forever — the
+     2026-06-11 incident this landing exists to fix — with NO recovery
+     path at all.
+   If the bounded gap matters operationally, the right follow-up is an
+   owner-notification side-channel or a startup WARN surfaced in the
+   health endpoint, not silent auto-promotion; tracked with the al22
+   carry-overs.
