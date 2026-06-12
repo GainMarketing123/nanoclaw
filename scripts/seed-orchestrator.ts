@@ -6,11 +6,8 @@
  *   tsx scripts/seed-orchestrator.ts [--chat-jid <jid>] [--force]
  *
  * Defaults:
- *   --chat-jid: reads from registered_groups where is_main=1 (live main).
- *     An explicit JID must itself be a registered group on a LIVE (non-
- *     retired) channel — the task's group_folder is resolved from its row,
- *     never assumed, and a retired-channel JID is rejected outright.
- *   --force: fully replace the existing orchestrator task (routing included)
+ *   --chat-jid: reads from registered_groups where is_main=1
+ *   --force: replace existing orchestrator task if one exists
  *
  * Run this on the VPS after Phase 3 deploy, or locally for testing.
  */
@@ -20,9 +17,8 @@ import { CronExpressionParser } from 'cron-parser';
 import fs from 'fs';
 import path from 'path';
 
-import { isRetiredChannelJid, selectLiveMain } from '../src/router.js';
-
 const TASK_ID = 'atlas-orchestrator-daily';
+const GROUP_FOLDER = 'atlas_main';
 const SCHEDULE_TYPE = 'cron';
 const SCHEDULE_VALUE = '0 6 * * *'; // 6AM daily
 const TIMEZONE = process.env.TZ || 'America/New_York';
@@ -111,61 +107,18 @@ if (!fs.existsSync(dbPath)) {
 
 const db = new Database(dbPath);
 
-// Resolve chat_jid (and the task's group_folder) from registered groups if
-// not provided. Retirement-aware: a bare `LIMIT 1` could seed the daily
-// digest task against a retired-channel JID (e.g. the legacy Telegram main
-// row from the 2026-06-11 trace), so every digest delivery would silently
-// fail. selectLiveMain never returns a retired row. The task must also be
-// seeded under the LIVE main group's folder: the scheduler resolves the
-// group by `g.folder === task.group_folder` (src/task-scheduler.ts), so a
-// hard-coded 'atlas_main' folder produces a permanently failing "Group not
-// found" task whenever the live main lives in another folder (e.g. the VPS
-// Teams main in 'atlas_teams').
-let groupFolder: string;
+// Resolve chat_jid from registered groups if not provided
 if (!chatJid) {
-  const mains = db.prepare(
-    'SELECT jid, folder FROM registered_groups WHERE is_main = 1'
-  ).all() as Array<{ jid: string; folder: string }>;
+  const mainGroup = db.prepare(
+    'SELECT jid FROM registered_groups WHERE is_main = 1 LIMIT 1'
+  ).get() as { jid: string } | undefined;
 
-  const main = selectLiveMain(mains);
-  if (!main) {
-    console.error('No live-channel main group found in registered_groups. Provide --chat-jid.');
+  if (!mainGroup) {
+    console.error('No main group found in registered_groups. Provide --chat-jid.');
     process.exit(1);
   }
-  chatJid = main.jid;
-  groupFolder = main.folder;
-  console.log(`Found main group: ${chatJid} (folder ${groupFolder})`);
-} else {
-  // Explicit --chat-jid: must be DELIVERABLE, not merely registered. A
-  // retired-channel JID (e.g. the legacy Telegram main) can still hold a
-  // registered_groups row, and the default path is retirement-aware via
-  // selectLiveMain — so without this check the explicit path was the one
-  // remaining way to seed a task whose runs succeed but whose digest +
-  // auto-pause escalations are forwarded to a dead task.chat_jid
-  // (src/task-scheduler.ts) — a permanently black-holed morning briefing
-  // (codex 20924e0 finding 2).
-  if (isRetiredChannelJid(chatJid)) {
-    console.error(`--chat-jid ${chatJid} targets a retired channel; every digest delivery would silently fail.`);
-    console.error('Pass a live registered group JID, or omit --chat-jid to use the live main.');
-    process.exit(1);
-  }
-  // Resolve the task's group_folder from the registered row for that JID.
-  // The scheduler executes a task by matching task.group_folder against the
-  // registered groups' folders — NOT by chat_jid — so silently falling back
-  // to a hard-coded folder here seeded a permanently failing "Group not
-  // found" task whenever the JID's real folder differed (codex 6859c4f
-  // finding 2). An unregistered JID is rejected outright for the same
-  // reason: its task could never run.
-  const row = db.prepare(
-    'SELECT folder FROM registered_groups WHERE jid = ?'
-  ).get(chatJid) as { folder: string } | undefined;
-  if (!row) {
-    console.error(`--chat-jid ${chatJid} is not in registered_groups; register the group first.`);
-    console.error('(The scheduler resolves tasks by the registered group folder, so a task seeded against an unregistered JID never runs.)');
-    process.exit(1);
-  }
-  groupFolder = row.folder;
-  console.log(`Resolved group folder for ${chatJid}: ${groupFolder}`);
+  chatJid = mainGroup.jid;
+  console.log(`Found main group: ${chatJid}`);
 }
 
 // Check if task already exists
@@ -185,27 +138,11 @@ const nextRun = interval.next().toISOString();
 
 // Upsert the task
 if (existing) {
-  // A --force reseed must be a TRUE replace. The point of reseeding is to
-  // move the task off a stale group_folder / retired-channel chat_jid, so an
-  // update that only touched prompt/schedule/next_run left the old routing
-  // in place: the scheduler kept resolving the stale folder ("Group not
-  // found") and any dead-channel chat_jid stayed live (codex 6859c4f
-  // finding 1). Rewrite every column the INSERT sets except created_at.
   db.prepare(`
     UPDATE scheduled_tasks
-    SET group_folder = ?, chat_jid = ?, prompt = ?, schedule_type = ?,
-        schedule_value = ?, context_mode = ?, next_run = ?, status = 'active'
+    SET prompt = ?, schedule_value = ?, next_run = ?, status = 'active'
     WHERE id = ?
-  `).run(
-    groupFolder,
-    chatJid,
-    ORCHESTRATOR_PROMPT,
-    SCHEDULE_TYPE,
-    SCHEDULE_VALUE,
-    'isolated', // Fresh context each run — no session carryover
-    nextRun,
-    TASK_ID,
-  );
+  `).run(ORCHESTRATOR_PROMPT, SCHEDULE_VALUE, nextRun, TASK_ID);
   console.log(`Updated existing orchestrator task.`);
 } else {
   db.prepare(`
@@ -213,7 +150,7 @@ if (existing) {
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     TASK_ID,
-    groupFolder,
+    GROUP_FOLDER,
     chatJid,
     ORCHESTRATOR_PROMPT,
     SCHEDULE_TYPE,
@@ -227,7 +164,7 @@ if (existing) {
 }
 
 console.log(`  ID:       ${TASK_ID}`);
-console.log(`  Group:    ${groupFolder}`);
+console.log(`  Group:    ${GROUP_FOLDER}`);
 console.log(`  Chat JID: ${chatJid}`);
 console.log(`  Schedule: ${SCHEDULE_VALUE} (${TIMEZONE})`);
 console.log(`  Next run: ${nextRun}`);
