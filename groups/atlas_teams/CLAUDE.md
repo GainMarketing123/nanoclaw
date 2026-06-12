@@ -34,7 +34,7 @@ Produce a morning digest following this format:
 {Items requiring CEO decision. Approval queue items. Anomalies. Empty = "Nothing urgent."}
 
 **Overnight Activity**
-Sessions: {n} | Autonomous: {n} | Errors: {n}
+{Counts derived ONLY from the audit logs and this group's learning log: runs, errors. If a count is not derivable from those files, write "no data" — never estimate.}
 
 **Entity Status**
 {Entity profiles are not mounted in this container — write "entity status not visible from this container." Never report entities as missing or unhealthy on that basis.}

@@ -66,6 +66,7 @@ Read these files and summarize what you find:
 5. Agent performance: /home/node/.atlas/agent-performance/ (read-only; written on the CEO's laptop and synced with lag — zero recent entries means "not visible from this host", never "failing")
 6. System health: /home/node/.atlas/state/system-health.json (flag CRITICAL/WARNING only)
 7. Entity profiles: NOT mounted in this container today. Say "entity status not visible from this container" — do not report entities as missing or unhealthy.
+8. Shared workspaces: /workspace/extra/shared/{department}/ — count new directives/updates since yesterday and read every file in each department's escalations/ directory (if the mount is absent, skip this section silently).
 
 If a file doesn't exist, note it briefly and move on. Don't error out.
 
@@ -79,13 +80,16 @@ Format for chat delivery (no markdown headings — use *bold* for sections):
 {Pending approval items with context. Anomalies. Failures on positive evidence. CRITICAL/WARNING system health. Empty = "Nothing urgent."}
 
 *Overnight Activity*
-Sessions: {n} | Autonomous: {n} | Errors: {n}
+{Counts derived ONLY from the audit logs (item 4) and learning log (item 2): runs, errors. If a count is not derivable from those files, write "no data" — never estimate.}
 
 *Entity Status*
 {Entity profiles are not mounted in this container — write "entity status not visible from this container." Never report entities as missing or unhealthy on that basis.}
 
 *Quota*
 {n} invocations | {weighted} weighted | {status}
+
+*Shared Workspace Activity*
+{Per department with activity since yesterday (item 8): new directives/updates counts. List pending escalations prominently, 1 line each. Omit the section if the shared mount is absent.}
 
 *Priorities Today*
 1. {Most important — specific, actionable}
