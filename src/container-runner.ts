@@ -1114,16 +1114,29 @@ export async function runContainerAgent(
       clearTimeout(timeout);
       const duration = Date.now() - startTime;
 
-      // Quality-gate telemetry runs FIRST so every close path (timeout,
-      // error, exit-0) alerts on classified container-side quality-check
-      // failures — they were previously invisible to all host-side alerting.
+      // Quality-gate telemetry is extracted once for every close path
+      // (timeout, error, exit-0): classified container-side quality-check
+      // failures were previously invisible to all host-side alerting. The
+      // alert is emitted exactly once per run, AFTER the per-run log file is
+      // written, so the alert row can carry the log path that holds the
+      // retained exact-reason lines (codex 4f15163 finding 1 — an alert
+      // pointing at no log defeats the retention promise).
       const qualityTelemetry = extractQualityCheckTelemetry(stderr);
-      if (qualityTelemetry.degradedReasons.length > 0) {
+      let qualityAlertEmitted = false;
+      const emitQualityAlert = (logPath: string) => {
+        if (
+          qualityAlertEmitted ||
+          qualityTelemetry.degradedReasons.length === 0
+        ) {
+          return;
+        }
+        qualityAlertEmitted = true;
         logger.error(
           {
             group: group.name,
             containerName,
             reasons: qualityTelemetry.degradedReasons,
+            logPath,
           },
           'Container-side quality check DEGRADED — CEO-facing response shipped unscored (fails open by design); exact reasons retained in the per-run log and data/quality-alerts.jsonl',
         );
@@ -1131,8 +1144,9 @@ export async function runContainerAgent(
           group: group.folder,
           containerName,
           reasons: qualityTelemetry.degradedReasons,
+          logPath,
         });
-      }
+      };
 
       if (timedOut) {
         const ts = new Date().toISOString().replace(/[:.]/g, '-');
@@ -1160,6 +1174,7 @@ export async function runContainerAgent(
           );
         }
         fs.writeFileSync(timeoutLog, timeoutLogLines.join('\n'));
+        emitQualityAlert(timeoutLog);
 
         // Timeout after output = idle cleanup, not failure.
         // The agent already sent its response; this is just the
@@ -1187,12 +1202,17 @@ export async function runContainerAgent(
                   result: null,
                   newSessionId,
                   error: `onOutput callback failed: ${firstCallbackError.message}`,
+                  // codex 4f15163: downstream consumers (bridge mission
+                  // callback forwards result.logPath) must be able to locate
+                  // the timeout log that holds the retained telemetry.
+                  logPath: timeoutLog,
                 });
               } else {
                 resolve({
                   status: 'success',
                   result: null,
                   newSessionId,
+                  logPath: timeoutLog,
                 });
               }
             });
@@ -1212,6 +1232,7 @@ export async function runContainerAgent(
           result: null,
           error: `Container timed out after ${configTimeout}ms`,
           timedOut: true,
+          logPath: timeoutLog,
         });
         return;
       }
@@ -1285,6 +1306,7 @@ export async function runContainerAgent(
 
       fs.writeFileSync(logFile, logLines.join('\n'));
       logger.debug({ logFile, verbose: isVerbose }, 'Container log written');
+      emitQualityAlert(logFile);
 
       if (code !== 0) {
         logger.error(
