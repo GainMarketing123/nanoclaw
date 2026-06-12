@@ -39,6 +39,83 @@ import { RegisteredGroup } from './types.js';
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
 
+// ---------------------------------------------------------------------------
+// Quality-check telemetry (scoring-infra diagnosis 2026-06-12 §4 secondary)
+// ---------------------------------------------------------------------------
+// The container-side CEO-response quality gate writes its EXACT failure
+// reasons only to container stderr (sink-split by design: the JSONL audit
+// carries a coarse `infra_unavailable`). Two operational gaps this closes:
+//   1. Exit-0 stderr was DISCARDED from the per-run group log (only kept on
+//      LOG_LEVEL=debug/trace or exit!=0) — the 2026-06-12 firewall diagnosis
+//      took hours because no exact-reason telemetry survived for any of the
+//      five historical events (all containers exited 0).
+//   2. Container-side classified failures (timeout / host_unreachable /
+//      host_unauthorized / token_missing...) never reached ANY alert path:
+//      host-side alerting (_maybe_send_operator_alert) only sees failures the
+//      host itself produces, and these requests never arrive at the host.
+// Markers must stay in lockstep with the producers:
+//   container/agent-runner/src/governance/response-interceptor.ts — all
+//     lines prefixed `[response-interceptor]`;
+//   container/agent-runner/src/index.ts log() — `[agent-runner] Quality ...`
+//     (`Quality DEGRADED: reason=<exact>` is the final-outcome line).
+
+const QUALITY_STDERR_MARKERS = [
+  '[response-interceptor]',
+  '[agent-runner] Quality',
+  '[agent-runner] Local lint fired',
+  '[agent-runner] Retry quality check',
+] as const;
+
+const QUALITY_DEGRADED_RE = /Quality DEGRADED: reason=([A-Za-z0-9_]+)/;
+
+export interface QualityCheckTelemetry {
+  /** All quality-check-related stderr lines, in order. */
+  lines: string[];
+  /** Exact reasons from `Quality DEGRADED: reason=...` final-outcome lines. */
+  degradedReasons: string[];
+}
+
+/** Pure extraction — exported for tests. */
+export function extractQualityCheckTelemetry(
+  stderr: string,
+): QualityCheckTelemetry {
+  const lines: string[] = [];
+  const degradedReasons: string[] = [];
+  if (!stderr) return { lines, degradedReasons };
+  for (const line of stderr.split('\n')) {
+    if (!QUALITY_STDERR_MARKERS.some((m) => line.includes(m))) continue;
+    lines.push(line);
+    const match = QUALITY_DEGRADED_RE.exec(line);
+    if (match) degradedReasons.push(match[1]);
+  }
+  return { lines, degradedReasons };
+}
+
+/**
+ * Orchestrator-scannable alert signal for container-side quality-gate
+ * degradation: one JSONL row per affected container run, host-side at
+ * data/quality-alerts.jsonl (append-only; host-side alerting/briefing can
+ * scan it — the gap was that NOTHING host-visible recorded these). Paired
+ * with a logger.error so the orchestrator log/journal is operator-visible
+ * immediately. Best-effort: never throws into the close path.
+ */
+function appendQualityAlert(alert: {
+  group: string;
+  containerName: string;
+  reasons: string[];
+  logPath?: string;
+}): void {
+  try {
+    const alertsFile = path.join(DATA_DIR, 'quality-alerts.jsonl');
+    fs.appendFileSync(
+      alertsFile,
+      JSON.stringify({ timestamp: new Date().toISOString(), ...alert }) + '\n',
+    );
+  } catch (err) {
+    logger.warn({ err }, 'Failed to append quality-alerts.jsonl row');
+  }
+}
+
 export interface ContainerInput {
   prompt: string;
   sessionId?: string;
@@ -1032,6 +1109,26 @@ export async function runContainerAgent(
       clearTimeout(timeout);
       const duration = Date.now() - startTime;
 
+      // Quality-gate telemetry runs FIRST so every close path (timeout,
+      // error, exit-0) alerts on classified container-side quality-check
+      // failures — they were previously invisible to all host-side alerting.
+      const qualityTelemetry = extractQualityCheckTelemetry(stderr);
+      if (qualityTelemetry.degradedReasons.length > 0) {
+        logger.error(
+          {
+            group: group.name,
+            containerName,
+            reasons: qualityTelemetry.degradedReasons,
+          },
+          'Container-side quality check DEGRADED — CEO-facing response shipped unscored (fails open by design); exact reasons retained in the per-run log and data/quality-alerts.jsonl',
+        );
+        appendQualityAlert({
+          group: group.folder,
+          containerName,
+          reasons: qualityTelemetry.degradedReasons,
+        });
+      }
+
       if (timedOut) {
         const ts = new Date().toISOString().replace(/[:.]/g, '-');
         const timeoutLog = path.join(logsDir, `container-${ts}.log`);
@@ -1156,6 +1253,18 @@ export async function runContainerAgent(
             .join('\n'),
           ``,
         );
+        // Retain quality-check stderr even on a clean exit (scoring-infra
+        // diagnosis 2026-06-12 §4): exit-0 discarding left ZERO exact-reason
+        // telemetry for every historical quality-gate outage — the
+        // interceptor's stderr is the ONLY place the exact unavailable
+        // reason exists (the JSONL audit is deliberately coarse).
+        if (qualityTelemetry.lines.length > 0) {
+          logLines.push(
+            `=== Quality-Check Stderr (retained on exit 0) ===`,
+            ...qualityTelemetry.lines,
+            ``,
+          );
+        }
       }
 
       fs.writeFileSync(logFile, logLines.join('\n'));

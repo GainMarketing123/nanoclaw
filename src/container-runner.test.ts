@@ -89,8 +89,61 @@ vi.mock('child_process', async () => {
   };
 });
 
-import { runContainerAgent, ContainerOutput } from './container-runner.js';
+import {
+  extractQualityCheckTelemetry,
+  runContainerAgent,
+  ContainerOutput,
+} from './container-runner.js';
 import type { RegisteredGroup } from './types.js';
+
+// --- quality-check stderr telemetry (scoring-infra diagnosis 2026-06-12 §4) ---
+
+describe('extractQualityCheckTelemetry', () => {
+  it('retains interceptor and agent-runner quality lines, ignores noise', () => {
+    const stderr = [
+      'sdk debug chatter',
+      '[response-interceptor] Quality-check timed out after 12000ms',
+      '[response-interceptor] Host quality-check UNAVAILABLE: reason=timeout retryable=true detail= sha=9ca3e08625b9',
+      '[agent-runner] Quality DEGRADED: reason=timeout retryable=true detail=Container timed out after 12000ms',
+      '[agent-runner] unrelated line about sessions',
+      'more sdk noise',
+    ].join('\n');
+
+    const t = extractQualityCheckTelemetry(stderr);
+    expect(t.lines).toHaveLength(3);
+    expect(t.lines[0]).toContain('timed out after 12000ms');
+    // The exact classified reason is captured for the alert path — this is
+    // the telemetry that did not exist for any historical event (all five
+    // containers exited 0 and stderr was discarded).
+    expect(t.degradedReasons).toEqual(['timeout']);
+  });
+
+  it('captures every classified degraded reason shape', () => {
+    const stderr = [
+      '[agent-runner] Quality DEGRADED: reason=host_unreachable retryable=true detail=connect ECONNREFUSED',
+      '[agent-runner] Quality DEGRADED: reason=host_unauthorized retryable=false detail=Host endpoint returned 401',
+    ].join('\n');
+    expect(extractQualityCheckTelemetry(stderr).degradedReasons).toEqual([
+      'host_unreachable',
+      'host_unauthorized',
+    ]);
+  });
+
+  it('a passing quality check retains the line but emits no degraded reason', () => {
+    const stderr =
+      '[agent-runner] Quality check: status=pass score=92 violations=0';
+    const t = extractQualityCheckTelemetry(stderr);
+    expect(t.lines).toHaveLength(1);
+    expect(t.degradedReasons).toEqual([]);
+  });
+
+  it('is empty-safe', () => {
+    expect(extractQualityCheckTelemetry('')).toEqual({
+      lines: [],
+      degradedReasons: [],
+    });
+  });
+});
 
 const testGroup: RegisteredGroup = {
   name: 'Test Group',
