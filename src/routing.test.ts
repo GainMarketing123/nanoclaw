@@ -541,6 +541,35 @@ describe('ensureOwnerMainGroup', () => {
     expect(groups['msteams:a:control'].isMain).toBe(true);
   });
 
+  it('a dispatch: alias main does NOT block owner re-promotion', () => {
+    // codex e6dde1a finding 2: "live main" must use the shared
+    // knowably-undeliverable contract, not retired-only. An in-memory
+    // dispatch: main row (legacy/hand-edited state that predates the
+    // write-layer invariant) can no more deliver CEO alerts than a retired
+    // tg: row — the owner's chat must still be promotable without waiting
+    // for a restart.
+    _setRegisteredGroups({
+      'msteams:a:owner': {
+        name: 'Atlas',
+        folder: 'atlas_teams',
+        trigger: '@Atlas',
+        added_at: '2024-01-02T00:00:00.000Z',
+        requiresTrigger: false,
+      },
+      'dispatch:atlas_gpg': {
+        name: 'Bridge alias (stale main)',
+        folder: 'atlas_gpg',
+        trigger: '@Atlas',
+        added_at: '2024-01-01T00:00:00.000Z',
+        isMain: true,
+      },
+    });
+
+    ensureOwnerMainGroup('msteams:a:owner');
+
+    expect(getAllRegisteredGroups()['msteams:a:owner'].isMain).toBe(true);
+  });
+
   it('is a no-op for a chat that is already main', () => {
     setRegisteredGroup('msteams:a:owner', {
       name: 'Atlas',

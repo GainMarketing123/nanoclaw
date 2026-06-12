@@ -10,12 +10,14 @@ import {
   getMessagesSince,
   getNewMessages,
   getTaskById,
+  normalizeLegacyMigratedGroup,
   setRegisteredGroup,
   storeChatMetadata,
   storeMessage,
   storeMessageDirect,
   updateTask,
 } from './db.js';
+import { RegisteredGroup } from './types.js';
 
 beforeEach(() => {
   _initTestDatabase();
@@ -800,5 +802,50 @@ describe('main-group write-layer invariant (al22 reland)', () => {
       added_at: '2024-01-01T00:00:00.000Z',
     });
     expect(getAllRegisteredGroups()['dispatch:atlas_gpg']).toBeDefined();
+  });
+});
+
+describe('normalizeLegacyMigratedGroup (JSON->SQLite upgrade path)', () => {
+  // codex e6dde1a finding 1: a legacy registered_groups.json with a tg: or
+  // dispatch: MAIN row must migrate as NON-main — never throw into the
+  // generic skip-catch and silently drop the registration.
+  const legacy = (overrides: Partial<RegisteredGroup>): RegisteredGroup => ({
+    name: 'Legacy',
+    folder: 'main',
+    trigger: '@Atlas',
+    added_at: '2024-01-01T00:00:00.000Z',
+    ...overrides,
+  });
+
+  it('demotes a legacy retired-channel main to non-main', () => {
+    const group = legacy({ isMain: true });
+    const normalized = normalizeLegacyMigratedGroup('tg:7322433447', group);
+    expect(normalized.isMain).toBeUndefined();
+    expect(normalized.folder).toBe('main'); // everything else preserved
+    // The normalized row passes the write-layer invariant — nothing drops.
+    expect(() =>
+      setRegisteredGroup('tg:7322433447', normalized),
+    ).not.toThrow();
+    expect(getAllRegisteredGroups()['tg:7322433447']).toBeDefined();
+  });
+
+  it('demotes a legacy dispatch: alias main to non-main', () => {
+    const normalized = normalizeLegacyMigratedGroup(
+      'dispatch:atlas_gpg',
+      legacy({ folder: 'atlas_gpg', isMain: true }),
+    );
+    expect(normalized.isMain).toBeUndefined();
+  });
+
+  it('returns the SAME reference for rows needing no normalization', () => {
+    // The caller logs the demotion by reference comparison.
+    const liveMain = legacy({ folder: 'atlas_teams', isMain: true });
+    expect(normalizeLegacyMigratedGroup('msteams:a:owner', liveMain)).toBe(
+      liveMain,
+    );
+    const nonMain = legacy({ folder: 'atlas_gpg' });
+    expect(normalizeLegacyMigratedGroup('dispatch:atlas_gpg', nonMain)).toBe(
+      nonMain,
+    );
   });
 });

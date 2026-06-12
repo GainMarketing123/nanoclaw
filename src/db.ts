@@ -1095,6 +1095,33 @@ export function countMissionsByStatus(status: string, entity?: string): number {
 
 // --- JSON migration ---
 
+/**
+ * Normalize a LEGACY registered-group row at JSON->SQLite migration time.
+ *
+ * Legacy undeliverable MAIN rows (e.g. a tg: main from before the Telegram
+ * retirement, or a hand-edited dispatch: alias) predate the
+ * setRegisteredGroup write-layer invariant; funneling one through it
+ * unchanged would throw, and migrateJsonState's generic catch would then
+ * silently DROP the row — a destructive upgrade path (codex e6dde1a
+ * finding 1). Instead the row migrates as NON-main: identical end state to
+ * what loadState's single-live-main normalization would produce for it, with
+ * no registration data lost. Returns the input object unchanged (same
+ * reference) when no normalization is needed, so the caller can detect and
+ * log the demotion.
+ *
+ * Exported for tests — migrateJsonState itself is fs-driven (DATA_DIR) and
+ * not unit-testable in isolation.
+ */
+export function normalizeLegacyMigratedGroup(
+  jid: string,
+  group: RegisteredGroup,
+): RegisteredGroup {
+  if (group.isMain && isKnownUndeliverableJid(jid)) {
+    return { ...group, isMain: undefined };
+  }
+  return group;
+}
+
 function migrateJsonState(): void {
   const migrateFile = (filename: string) => {
     const filePath = path.join(DATA_DIR, filename);
@@ -1144,7 +1171,14 @@ function migrateJsonState(): void {
   if (groups) {
     for (const [jid, group] of Object.entries(groups)) {
       try {
-        setRegisteredGroup(jid, group);
+        const normalized = normalizeLegacyMigratedGroup(jid, group);
+        if (normalized !== group) {
+          logger.warn(
+            { jid, folder: group.folder },
+            'Migrating legacy undeliverable main row as NON-main (retired/alias JID cannot hold the main role)',
+          );
+        }
+        setRegisteredGroup(jid, normalized);
       } catch (err) {
         logger.warn(
           { jid, folder: group.folder, err },

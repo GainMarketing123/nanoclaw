@@ -59,6 +59,7 @@ import {
   findChannel,
   formatMessages,
   formatOutbound,
+  isKnownUndeliverableJid,
   isRetiredChannelJid,
   RetiredChannelDropError,
   selectLiveMainJid,
@@ -418,8 +419,12 @@ export function ensureOwnerMainGroup(chatJid: string): void {
   const existing = registeredGroups[chatJid];
   if (existing) {
     if (existing.isMain) return;
+    // "Live main" uses the shared knowably-undeliverable contract (codex
+    // e6dde1a finding 2): a legacy/hand-edited dispatch: alias main row can
+    // no more deliver CEO alerts than a retired tg: row, so it must not
+    // block the owner's re-promotion until a restart normalizes it.
     const hasLiveMain = Object.entries(registeredGroups).some(
-      ([jid, group]) => group.isMain && !isRetiredChannelJid(jid),
+      ([jid, group]) => group.isMain && !isKnownUndeliverableJid(jid),
     );
     if (hasLiveMain) return;
     // Promote the owner's already-registered chat in place.
