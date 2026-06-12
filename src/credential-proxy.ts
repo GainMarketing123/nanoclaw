@@ -45,6 +45,7 @@ import { request as httpRequest, IncomingMessage, RequestOptions } from 'http';
 import { ATLAS_DIR, HOST_CLAUDE_DIR } from './config.js';
 import { readEnvFile } from './env.js';
 import { logger } from './logger.js';
+import { selectLiveMainJid } from './router.js';
 
 export type AuthMode = 'api-key' | 'oauth';
 
@@ -477,23 +478,29 @@ function sendAlert(message: string): void {
     );
     fs.mkdirSync(ipcDir, { recursive: true });
 
-    // Read main group JID
+    // Read main group JID. Fetch ALL is_main rows and pick retirement-aware:
+    // a bare `LIMIT 1` could return a retired-channel JID (e.g. the legacy
+    // Telegram main from the 2026-06-11 trace), routing the alert to a
+    // target no channel owns. selectLiveMainJid never returns a retired JID;
+    // when no live main exists, drop the alert here rather than write an
+    // undeliverable IPC file.
     const Database = require('better-sqlite3');
     const dbPath = path.join(process.cwd(), 'store', 'messages.db');
     const db = new Database(dbPath, { readonly: true });
-    const row = db
-      .prepare('SELECT jid FROM registered_groups WHERE is_main = 1 LIMIT 1')
-      .get() as { jid: string } | undefined;
+    const rows = db
+      .prepare('SELECT jid, folder FROM registered_groups WHERE is_main = 1')
+      .all() as Array<{ jid: string; folder: string }>;
     db.close();
 
-    if (!row) return;
+    const mainJid = selectLiveMainJid(rows);
+    if (!mainJid) return;
 
     const alertFile = path.join(ipcDir, `auth-alert-${Date.now()}.json`);
     fs.writeFileSync(
       alertFile,
       JSON.stringify({
         type: 'message',
-        chatJid: row.jid,
+        chatJid: mainJid,
         text: message,
       }),
     );

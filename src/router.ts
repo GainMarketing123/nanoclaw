@@ -82,6 +82,33 @@ export function isRetiredChannelJid(jid: string): boolean {
 }
 
 /**
+ * Choose which `is_main` candidate should act as the main control group —
+ * the JID that CEO alerts route to, and the survivor of load-time
+ * single-main normalization (loadState in index.ts).
+ *
+ * Retired-channel JIDs are NEVER eligible: a retired JID cannot deliver
+ * anything, so keeping one as main silently black-holes CEO alerts — the
+ * live `No channel for JID: tg:7322433447` executor mis-route from the
+ * 2026-06-11 trace, where a legacy Telegram main row survived the Teams
+ * migration as an `is_main = 1` row and the DB-reading alert paths
+ * (host-executor.py send_alert, credential-proxy.ts sendAlert,
+ * seed-orchestrator.ts) picked it via `WHERE is_main = 1 LIMIT 1`.
+ * host-executor.py mirrors this selection in Python (RETIRED_CHANNEL_JID_
+ * PREFIXES there must stay in lockstep with this file).
+ *
+ * Among live candidates the canonical `folder === 'main'` row wins (that is
+ * the row the schema migration promotes), else the first encountered.
+ * Returns undefined when NO live candidate exists — callers must treat that
+ * as "no main group" rather than falling back to a retired JID.
+ */
+export function selectLiveMainJid(
+  candidates: Array<{ jid: string; folder?: string }>,
+): string | undefined {
+  const live = candidates.filter((c) => !isRetiredChannelJid(c.jid));
+  return (live.find((c) => c.folder === 'main') ?? live[0])?.jid;
+}
+
+/**
  * Thrown when an IPC send targets a retired-channel JID (e.g. `tg:`) that no
  * live channel owns. This is an INTENTIONAL non-delivery, distinct from both a
  * successful send and a genuine misroute:

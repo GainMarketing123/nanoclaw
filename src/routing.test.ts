@@ -1,7 +1,19 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 
-import { _initTestDatabase, getAllChats, storeChatMetadata } from './db.js';
-import { getAvailableGroups, _setRegisteredGroups } from './index.js';
+import {
+  _initTestDatabase,
+  getAllChats,
+  getAllRegisteredGroups,
+  setRegisteredGroup,
+  storeChatMetadata,
+} from './db.js';
+import {
+  ensureOwnerMainGroup,
+  getAvailableGroups,
+  _loadState,
+  _setRegisteredGroups,
+} from './index.js';
+import { selectLiveMainJid } from './router.js';
 
 beforeEach(() => {
   _initTestDatabase();
@@ -166,5 +178,161 @@ describe('getAvailableGroups', () => {
   it('returns empty array when no chats exist', () => {
     const groups = getAvailableGroups();
     expect(groups).toHaveLength(0);
+  });
+});
+
+// --- selectLiveMainJid (retirement-aware main selection) ---
+
+describe('selectLiveMainJid', () => {
+  it('never selects a retired-channel JID, even when it is the only candidate', () => {
+    expect(selectLiveMainJid([{ jid: 'tg:7322433447', folder: 'main' }])).toBe(
+      undefined,
+    );
+  });
+
+  it('prefers a live JID over a retired one regardless of folder', () => {
+    // The dead Telegram row may hold the canonical folder 'main' (the schema
+    // migration promotes `folder = 'main'`); liveness must still win.
+    expect(
+      selectLiveMainJid([
+        { jid: 'tg:7322433447', folder: 'main' },
+        { jid: 'msteams:a:owner', folder: 'atlas_teams' },
+      ]),
+    ).toBe('msteams:a:owner');
+  });
+
+  it('prefers the canonical folder === "main" row among live candidates', () => {
+    expect(
+      selectLiveMainJid([
+        { jid: 'msteams:a:other', folder: 'atlas_teams' },
+        { jid: 'whatsapp-main@s.whatsapp.net', folder: 'main' },
+      ]),
+    ).toBe('whatsapp-main@s.whatsapp.net');
+  });
+
+  it('falls back to the first live candidate when none has folder "main"', () => {
+    expect(
+      selectLiveMainJid([
+        { jid: 'msteams:a:first', folder: 'atlas_teams' },
+        { jid: 'dc:123', folder: 'discord_general' },
+      ]),
+    ).toBe('msteams:a:first');
+  });
+
+  it('returns undefined for an empty candidate list', () => {
+    expect(selectLiveMainJid([])).toBe(undefined);
+  });
+});
+
+// --- loadState single-live-main normalization ---
+
+describe('loadState single-live-main normalization', () => {
+  it('durably demotes a sole retired-channel main (the 2026-06-11 VPS state)', () => {
+    // A legacy Telegram main row survives the Teams migration as the only
+    // is_main=1 row. Every DB-reading alert path would mis-route to it.
+    setRegisteredGroup('tg:7322433447', {
+      name: 'Telegram Main (dead)',
+      folder: 'main',
+      trigger: '@Atlas',
+      added_at: '2024-01-01T00:00:00.000Z',
+      isMain: true,
+    });
+
+    _loadState();
+
+    // Demotion must be persisted, not in-memory-only: send_alert and the
+    // credential proxy read the DB directly.
+    const groups = getAllRegisteredGroups();
+    expect(groups['tg:7322433447'].isMain).toBeUndefined();
+  });
+
+  it('keeps a sole live-channel main untouched', () => {
+    setRegisteredGroup('msteams:a:owner', {
+      name: 'Atlas',
+      folder: 'atlas_teams',
+      trigger: '@Atlas',
+      added_at: '2024-01-01T00:00:00.000Z',
+      isMain: true,
+    });
+
+    _loadState();
+
+    expect(getAllRegisteredGroups()['msteams:a:owner'].isMain).toBe(true);
+  });
+});
+
+// --- ensureOwnerMainGroup re-promotion after a retired main is demoted ---
+
+describe('ensureOwnerMainGroup', () => {
+  it('re-promotes the registered owner chat when no live main exists', () => {
+    // VPS state from the 2026-06-11 trace: the owner's Teams chat is already
+    // registered (so the legacy "return early if registered" shape could
+    // never promote it) and the only is_main row is a dead Telegram JID.
+    setRegisteredGroup('msteams:a:owner', {
+      name: 'Atlas',
+      folder: 'atlas_teams',
+      trigger: '@Atlas',
+      added_at: '2024-01-02T00:00:00.000Z',
+      requiresTrigger: false,
+    });
+    setRegisteredGroup('tg:7322433447', {
+      name: 'Telegram Main (dead)',
+      folder: 'main',
+      trigger: '@Atlas',
+      added_at: '2024-01-01T00:00:00.000Z',
+      isMain: true,
+    });
+
+    _loadState(); // demotes the dead Telegram main
+    ensureOwnerMainGroup('msteams:a:owner'); // next owner message
+
+    const groups = getAllRegisteredGroups();
+    expect(groups['msteams:a:owner'].isMain).toBe(true);
+    // Existing registration is preserved — promotion must not rewrite the
+    // folder (host-task policy is keyed by it) or other config.
+    expect(groups['msteams:a:owner'].folder).toBe('atlas_teams');
+    expect(groups['tg:7322433447'].isMain).toBeUndefined();
+  });
+
+  it('does NOT steal main while a live main exists elsewhere', () => {
+    setRegisteredGroup('msteams:a:control', {
+      name: 'Atlas',
+      folder: 'atlas_main',
+      trigger: '@Atlas',
+      added_at: '2024-01-01T00:00:00.000Z',
+      isMain: true,
+    });
+    setRegisteredGroup('msteams:a:owner-side-chat', {
+      name: 'Side chat',
+      folder: 'atlas_teams',
+      trigger: '@Atlas',
+      added_at: '2024-01-02T00:00:00.000Z',
+    });
+
+    _loadState();
+    ensureOwnerMainGroup('msteams:a:owner-side-chat');
+
+    const groups = getAllRegisteredGroups();
+    expect(groups['msteams:a:owner-side-chat'].isMain).toBeUndefined();
+    expect(groups['msteams:a:control'].isMain).toBe(true);
+  });
+
+  it('is a no-op for a chat that is already main', () => {
+    setRegisteredGroup('msteams:a:owner', {
+      name: 'Atlas',
+      folder: 'atlas_teams',
+      trigger: '@Atlas',
+      added_at: '2024-01-01T00:00:00.000Z',
+      isMain: true,
+    });
+
+    _loadState();
+    ensureOwnerMainGroup('msteams:a:owner');
+
+    const groups = getAllRegisteredGroups();
+    expect(groups['msteams:a:owner'].isMain).toBe(true);
+    expect(
+      Object.values(groups).filter((g) => g.isMain),
+    ).toHaveLength(1);
   });
 });

@@ -61,6 +61,7 @@ import {
   formatOutbound,
   isRetiredChannelJid,
   RetiredChannelDropError,
+  selectLiveMainJid,
 } from './router.js';
 import {
   restoreRemoteControl,
@@ -184,42 +185,45 @@ function loadState(): void {
   }
   sessions = getAllSessions();
   registeredGroups = getAllRegisteredGroups();
-  // Defensive single-main normalization. setRegisteredGroup enforces a single
-  // is_main=1 row on WRITE, but legacy data predating that invariant (e.g. a
-  // Telegram main left behind after the Teams migration) could still carry two
-  // is_main=1 rows. Without this, loadState would revive BOTH as isMain in
-  // memory on every restart, re-creating the two-privileged-chats bug the
-  // write-path guard fixes.
+  // Defensive single-LIVE-main normalization. setRegisteredGroup enforces a
+  // single is_main=1 row on WRITE, but legacy data predating that invariant
+  // (e.g. a Telegram main left behind after the Teams migration) can still
+  // carry a retired-channel main — alone or alongside a live one. Without
+  // this, loadState would revive it as isMain in memory on every restart,
+  // and the DB-reading alert paths (credential-proxy.ts sendAlert,
+  // host/host-executor.py send_alert, scripts/seed-orchestrator.ts) would
+  // keep routing CEO alerts to a JID no channel owns — the live
+  // "No channel for JID: tg:7322433447" mis-route from the 2026-06-11 trace.
   //
-  // Critically, the demotion must be PERSISTED, not just applied in memory: the
-  // alert router (credential-proxy.ts) reads the DB directly with
-  // `SELECT jid FROM registered_groups WHERE is_main = 1 LIMIT 1`. With two
-  // is_main=1 rows still on disk, that query's LIMIT 1 can pick the dead
-  // (e.g. Telegram) main, so after a restart auth alerts route to a target that
-  // no longer exists. An in-memory-only demotion never reaches that query.
+  // Critically, the demotion must be PERSISTED, not just applied in memory:
+  // those alert paths read the DB directly (`SELECT jid FROM
+  // registered_groups WHERE is_main = 1 ...`). A row left is_main=1 on disk
+  // can be picked by them even though memory was normalized. An
+  // in-memory-only demotion never reaches those queries.
   //
   // Which main survives must also be deterministic across restarts (SELECT
-  // order is not stable across a SQLite vacuum/rewrite). We keep the canonical
-  // `folder === 'main'` group when present — that is the row the schema
-  // migration promotes (`UPDATE ... SET is_main = 1 WHERE folder = 'main'`) —
-  // and otherwise fall back to the first main encountered. Every other main is
-  // demoted in memory AND on disk.
-  const mainJids = Object.entries(registeredGroups)
+  // order is not stable across a SQLite vacuum/rewrite). selectLiveMainJid
+  // is retirement-aware: a retired-channel JID is NEVER kept — even when it
+  // is the ONLY main, in which case every main is demoted and the owner's
+  // next message on a live owner-gated channel re-promotes their chat via
+  // ensureOwnerMainGroup below. Among live candidates the canonical
+  // `folder === 'main'` row wins (the row the schema migration promotes:
+  // `UPDATE ... SET is_main = 1 WHERE folder = 'main'`), else the first
+  // encountered. Every other main is demoted in memory AND on disk.
+  const mainEntries = Object.entries(registeredGroups)
     .filter(([, group]) => group.isMain)
-    .map(([jid]) => jid);
-  if (mainJids.length > 1) {
-    const keepJid =
-      mainJids.find((jid) => registeredGroups[jid].folder === 'main') ??
-      mainJids[0];
-    for (const jid of mainJids) {
+    .map(([jid, group]) => ({ jid, folder: group.folder }));
+  if (mainEntries.length > 0) {
+    const keepJid = selectLiveMainJid(mainEntries);
+    for (const { jid } of mainEntries) {
       if (jid === keepJid) continue;
       const group = registeredGroups[jid];
       logger.warn(
-        { jid, name: group.name, keepJid },
-        'Demoting duplicate is_main group on load (single-main invariant) — persisting to DB',
+        { jid, name: group.name, keepJid: keepJid ?? null },
+        'Demoting is_main group on load (single-live-main invariant) — persisting to DB',
       );
       registeredGroups[jid] = { ...group, isMain: undefined };
-      // Persist the demotion so the DB-backed alert router cannot revive it.
+      // Persist the demotion so the DB-backed alert paths cannot revive it.
       clearGroupIsMain(jid);
     }
   }
@@ -369,6 +373,84 @@ export function _setRegisteredGroups(
   groups: Record<string, RegisteredGroup>,
 ): void {
   registeredGroups = groups;
+}
+
+/** @internal - exported for testing (loadState is otherwise module-private) */
+export function _loadState(): void {
+  loadState();
+}
+
+/**
+ * Auto-register or re-promote the owner's 1:1 chat as the main control group.
+ * Called by owner-gated channels (Teams) for every verified owner message in
+ * a personal chat — the channel has already verified the sender is the owner
+ * (fail-closed gate), so this is the sanctioned entry point; no second owner
+ * check is needed here.
+ *
+ * Two cases:
+ *  - UNREGISTERED chat: register it as main. Without this, owner messages
+ *    are stored but never processed, because the message loop only acts on
+ *    JIDs present in registeredGroups.
+ *  - REGISTERED chat that is NOT main, while NO live-channel main exists:
+ *    re-promote it (keeping its existing folder/name/config). This is the
+ *    recovery path after load-time normalization demotes a retired-channel
+ *    main (e.g. the legacy Telegram is_main row from the 2026-06-11 trace):
+ *    the owner's live chat may already be registered — the "return early if
+ *    registered" shape of the original implementation could never promote
+ *    it, leaving the system permanently mainless (alerts dropped, commands
+ *    refused) until manual SQL. A live main elsewhere is never stolen.
+ *
+ * Idempotent: an already-main chat returns immediately.
+ *
+ * @internal exported for tests; wired into channelOpts in main().
+ */
+export function ensureOwnerMainGroup(chatJid: string): void {
+  const existing = registeredGroups[chatJid];
+  if (existing) {
+    if (existing.isMain) return;
+    const hasLiveMain = Object.entries(registeredGroups).some(
+      ([jid, group]) => group.isMain && !isRetiredChannelJid(jid),
+    );
+    if (hasLiveMain) return;
+    // Promote the owner's already-registered chat in place.
+    // setRegisteredGroup's transaction durably demotes every other row;
+    // mirror that single-main invariant in memory. No registerGroup() here:
+    // the group folder already exists for a registered group, and the
+    // existing folder/name/config must be preserved (e.g. the VPS Teams
+    // main lives in folder 'atlas_teams', whose host-task policy is keyed
+    // by that folder name).
+    const promoted = { ...existing, isMain: true };
+    setRegisteredGroup(chatJid, promoted);
+    for (const [otherJid, otherGroup] of Object.entries(registeredGroups)) {
+      if (otherJid !== chatJid && otherGroup.isMain) {
+        registeredGroups[otherJid] = { ...otherGroup, isMain: undefined };
+      }
+    }
+    registeredGroups[chatJid] = promoted;
+    logger.info(
+      { chatJid, folder: existing.folder },
+      'Owner chat re-promoted to main control group (no live main existed)',
+    );
+    return;
+  }
+  registerGroup(chatJid, {
+    name: 'Atlas',
+    // MUST be 'atlas_main': the host-side IPC writers (host/host-executor.py
+    // IPC_DIR and src/credential-proxy.ts) emit alert/result messages from a
+    // hard-coded `data/ipc/atlas_main/messages` source, and startIpcWatcher
+    // authorizes by SOURCE folder (folder===is_main folder). A divergent
+    // folder here would make the main group's folder !== 'atlas_main', so
+    // those CEO alerts (auth-expiry, outage, escalation, task results) would
+    // be rejected as "Unauthorized IPC message attempt blocked" even though
+    // the target JID resolves. 'atlas_main' also matches the name→folder
+    // convention ("Atlas" ↔ atlas_main).
+    folder: 'atlas_main',
+    trigger: `@${ASSISTANT_NAME}`,
+    added_at: new Date().toISOString(),
+    requiresTrigger: false,
+    isMain: true,
+  });
+  logger.info({ chatJid }, 'Owner chat auto-registered as main control group');
 }
 
 /**
@@ -952,37 +1034,10 @@ async function main(): Promise<void> {
 
       storeMessage(msg);
     },
-    // Auto-register the owner's 1:1 chat as the main control group the first
-    // time they message from an owner-gated channel (Teams). The channel has
-    // already verified the sender is the owner (fail-closed gate), so this is
-    // the sanctioned entry point — no second owner check is needed here. Without
-    // it, owner messages are stored but never processed, because the message
-    // loop only acts on JIDs present in registeredGroups. Idempotent: a chat
-    // that is already registered is left untouched.
-    ensureOwnerMainGroup: (chatJid: string) => {
-      if (registeredGroups[chatJid]) return;
-      registerGroup(chatJid, {
-        name: 'Atlas',
-        // MUST be 'atlas_main': the host-side IPC writers (host/host-executor.py
-        // IPC_DIR and src/credential-proxy.ts) emit alert/result messages from a
-        // hard-coded `data/ipc/atlas_main/messages` source, and startIpcWatcher
-        // authorizes by SOURCE folder (folder===is_main folder). A divergent
-        // folder here would make the main group's folder !== 'atlas_main', so
-        // those CEO alerts (auth-expiry, outage, escalation, task results) would
-        // be rejected as "Unauthorized IPC message attempt blocked" even though
-        // the target JID resolves. 'atlas_main' also matches the name→folder
-        // convention ("Atlas" ↔ atlas_main).
-        folder: 'atlas_main',
-        trigger: `@${ASSISTANT_NAME}`,
-        added_at: new Date().toISOString(),
-        requiresTrigger: false,
-        isMain: true,
-      });
-      logger.info(
-        { chatJid },
-        'Owner chat auto-registered as main control group',
-      );
-    },
+    // Auto-register or re-promote the owner's 1:1 chat as the main control
+    // group (module-level function above — registration rationale and the
+    // post-Telegram-retirement re-promotion path are documented there).
+    ensureOwnerMainGroup,
     onChatMetadata: (
       chatJid: string,
       timestamp: string,

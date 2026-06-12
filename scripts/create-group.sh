@@ -254,13 +254,21 @@ python3 -c "
 import sqlite3, json
 
 db = sqlite3.connect('${DB_PATH}')
-row = db.execute('SELECT container_config FROM registered_groups WHERE is_main = 1').fetchone()
-if not row or not row[0]:
-    print('  Warning: atlas_main has no container config')
+# Retirement-aware main lookup (mirror of RETIRED_CHANNEL_JID_PREFIXES in
+# src/router.ts — keep in lockstep): a legacy retired-channel row (e.g. a
+# Telegram main left behind by the Teams migration) may still carry
+# is_main=1; writing the shared mount onto that dead row would silently
+# leave the LIVE main without shared-workspace access.
+rows = db.execute('SELECT jid, container_config FROM registered_groups WHERE is_main = 1').fetchall()
+live = [r for r in rows if not r[0].startswith(('tg:',))]
+row = live[0] if live else None
+if not row or not row[1]:
+    print('  Warning: no live main group with a container config')
     db.close()
     exit(0)
 
-config = json.loads(row[0])
+main_jid = row[0]
+config = json.loads(row[1])
 mounts = config.get('additionalMounts', [])
 
 # Check if shared workspace mount already exists
@@ -274,12 +282,12 @@ if not has_shared:
         'readonly': False
     })
     config['additionalMounts'] = mounts
-    db.execute('UPDATE registered_groups SET container_config = ? WHERE is_main = 1',
-               (json.dumps(config),))
+    db.execute('UPDATE registered_groups SET container_config = ? WHERE jid = ?',
+               (json.dumps(config), main_jid))
     db.commit()
-    print('  Added shared workspace mount to atlas_main')
+    print('  Added shared workspace mount to the main group')
 else:
-    print('  atlas_main already has shared workspace mount')
+    print('  Main group already has shared workspace mount')
 
 db.close()
 "

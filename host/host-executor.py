@@ -454,6 +454,12 @@ MAX_TASKS_PER_POLL = 20  # consumer-side flood bound (plan §12.7-D4)
 _HOST_TASK_HMAC_KEY = b""  # loaded in main(); empty => fail-closed reject all
 _NONCE_CACHE = None        # built in main()
 AUTH_ERROR_PATTERNS = ["authentication_error", "OAuth token has expired", "401", "token expired"]
+# JID prefixes of INTENTIONALLY retired channels (Telegram removed 2026-06-03;
+# Teams is primary). Mirror of RETIRED_CHANNEL_JID_PREFIXES in src/router.ts —
+# keep in lockstep. A retired-channel JID can never deliver, so alert routing
+# must skip such rows even when they still carry is_main=1 in the DB (the live
+# "No channel for JID: tg:7322433447" mis-route from the 2026-06-11 trace).
+RETIRED_CHANNEL_JID_PREFIXES = ("tg:",)
 OUTAGE_ERROR_PATTERNS = [
     "500 internal server error", "502 bad gateway", "503 service",
     "529", "overloaded", "connection refused", "connection reset",
@@ -976,12 +982,21 @@ def send_alert(message: str) -> None:
             log(f"Cannot send alert — DB not found at {db_path}")
             return
         conn = sqlite3.connect(str(db_path))
-        row = conn.execute("SELECT jid FROM registered_groups WHERE is_main = 1 LIMIT 1").fetchone()
+        rows = conn.execute("SELECT jid FROM registered_groups WHERE is_main = 1").fetchall()
         conn.close()
-        if not row:
-            log("Cannot send alert — no main group registered")
+        # Retirement-aware selection (mirrors selectLiveMainJid in
+        # src/router.ts): a bare LIMIT 1 could return a retired-channel JID
+        # (e.g. the legacy Telegram is_main row from the 2026-06-11 trace),
+        # routing the CEO alert to a target no channel owns. Never route to a
+        # retired JID; if no live main exists, log-and-drop here instead of
+        # writing an undeliverable IPC file.
+        main_jid = next(
+            (r[0] for r in rows if not r[0].startswith(RETIRED_CHANNEL_JID_PREFIXES)),
+            None,
+        )
+        if not main_jid:
+            log("Cannot send alert — no live-channel main group registered")
             return
-        main_jid = row[0]
 
         alert_file = IPC_DIR / f"alert-{int(time.time() * 1000)}.json"
         alert_file.write_text(json.dumps({

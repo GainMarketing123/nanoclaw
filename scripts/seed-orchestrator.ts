@@ -17,6 +17,8 @@ import { CronExpressionParser } from 'cron-parser';
 import fs from 'fs';
 import path from 'path';
 
+import { selectLiveMainJid } from '../src/router.js';
+
 const TASK_ID = 'atlas-orchestrator-daily';
 const GROUP_FOLDER = 'atlas_main';
 const SCHEDULE_TYPE = 'cron';
@@ -107,17 +109,21 @@ if (!fs.existsSync(dbPath)) {
 
 const db = new Database(dbPath);
 
-// Resolve chat_jid from registered groups if not provided
+// Resolve chat_jid from registered groups if not provided. Retirement-aware:
+// a bare `LIMIT 1` could seed the daily digest task against a retired-channel
+// JID (e.g. the legacy Telegram main row from the 2026-06-11 trace), so every
+// digest delivery would silently fail. selectLiveMainJid never returns a
+// retired JID.
 if (!chatJid) {
-  const mainGroup = db.prepare(
-    'SELECT jid FROM registered_groups WHERE is_main = 1 LIMIT 1'
-  ).get() as { jid: string } | undefined;
+  const mains = db.prepare(
+    'SELECT jid, folder FROM registered_groups WHERE is_main = 1'
+  ).all() as Array<{ jid: string; folder: string }>;
 
-  if (!mainGroup) {
-    console.error('No main group found in registered_groups. Provide --chat-jid.');
+  chatJid = selectLiveMainJid(mains);
+  if (!chatJid) {
+    console.error('No live-channel main group found in registered_groups. Provide --chat-jid.');
     process.exit(1);
   }
-  chatJid = mainGroup.jid;
   console.log(`Found main group: ${chatJid}`);
 }
 
