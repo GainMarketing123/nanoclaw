@@ -490,12 +490,21 @@ export async function processTaskIpc(
       // server-side from the unforgeable sourceGroup — never container input.
       // Shared resolver (see resolveCallbackJid) so prod + the issuer
       // round-trip test exercise one implementation.
+      //
+      // Populate-or-fail-closed (al22 wave-3): an unresolvable callback means
+      // the task's results — including failure output — could never route
+      // back to the requester. Reject HERE with a clear operator log instead
+      // of signing a callback_group:'' task whose outcome silently
+      // disappears (the SEC-1 live-test defect). evaluateHostTaskRequest
+      // enforces the same contract at the issuer root (unit-tested); this
+      // pre-check exists for the precise log line.
       const callbackJid = resolveCallbackJid(registeredGroups, sourceGroup);
       if (!callbackJid) {
         logger.warn(
           { sourceGroup },
-          'host_task: no registered JID for group; task will run but result delivery will be skipped',
+          'host_task rejected: no registered channel JID for requester folder (fail-closed — result delivery would be impossible)',
         );
+        break;
       }
       try {
         const hostTaskResult = evaluateHostTaskRequest(

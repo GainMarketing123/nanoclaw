@@ -32,10 +32,13 @@ export function evaluateHostTaskRequest(
   data: unknown,
   sourceGroup: string,
   // The requester's REGISTERED chat JID, resolved by the trusted caller
-  // (src/ipc.ts) from registeredGroups by sourceGroup folder — never a
-  // container-supplied value. May be '' when the folder has no registered
-  // JID; the executor then skips result delivery (fire-and-notify is
-  // best-effort) while the task itself still runs.
+  // (src/ipc.ts resolveCallbackJid -> shared resolveChannelJidForFolder) —
+  // never a container-supplied value. MUST be non-empty: the issuer
+  // populates-or-fails-closed (al22 wave-3). The previous best-effort
+  // contract signed callback_group:'' and let the executor silently skip
+  // result delivery — a task that runs (and can commit/push on the host)
+  // while its result, including failure output, is delivered to NO ONE.
+  // Fire-and-notify is only honest when "notify" is guaranteed a route.
   callbackJid: string,
   policy: HostTaskPolicy,
   key: Buffer,
@@ -46,6 +49,16 @@ export function evaluateHostTaskRequest(
   // short key passed directly by any other caller before it reaches sign().
   if (key.length < 32) {
     return { ok: false, reason: 'no_key' };
+  }
+
+  // Fail closed on an unresolvable callback (al22 wave-3): an empty
+  // callbackJid means the requester folder has no registered channel JID, so
+  // the signed task's results could never route back. Reject at issuance —
+  // the one place every host task passes through — instead of running work
+  // whose outcome silently disappears (SEC-1 live-test defect class:
+  // completed tasks with callback_group:'' and no delivery).
+  if (!isNonEmptyString(callbackJid)) {
+    return { ok: false, reason: 'no_deliverable_callback' };
   }
 
   const payload = (data ?? {}) as Record<string, unknown>;

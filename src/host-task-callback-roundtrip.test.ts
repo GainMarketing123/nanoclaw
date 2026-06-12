@@ -168,7 +168,7 @@ describe('host-task callback_group round-trip (folder -> JID -> signed task)', (
     expect(verify(result.task, otherKey, now).ok).toBe(false);
   });
 
-  it('unresolvable requester folder yields an empty signed callback_group', () => {
+  it('unresolvable requester folder REJECTS issuance (populate-or-fail-closed)', () => {
     const root = makeTempDir('host-task-cb-empty-');
     const project = join(root, 'project');
     mkdirSync(project, { recursive: true });
@@ -183,8 +183,11 @@ describe('host-task callback_group round-trip (folder -> JID -> signed task)', (
     const key = Buffer.from('77'.repeat(32), 'hex');
     const now = 1_717_000_000;
 
-    // Folder has no registered JID — best-effort: task still issues + verifies,
-    // but callback_group is '' so the executor skips result delivery.
+    // Folder has no registered channel JID. The OLD contract signed the task
+    // with callback_group:'' best-effort and let the executor silently skip
+    // result delivery — work that runs while its outcome (including failure
+    // output) is delivered to no one. al22 wave-3: the issuer now fails
+    // closed at the root instead.
     const callbackJid = resolveCallbackJid({}, 'atlas_orphan');
     expect(callbackJid).toBe('');
 
@@ -197,11 +200,50 @@ describe('host-task callback_group round-trip (folder -> JID -> signed task)', (
       now,
     );
 
-    expect(result.ok).toBe(true);
-    if (!result.ok) {
+    expect(result.ok).toBe(false);
+    if (result.ok) {
       return;
     }
-    expect(result.task.callback_group).toBe('');
-    expect(verify(result.task, key, now)).toEqual({ ok: true, reason: 'ok' });
+    expect(result.reason).toBe('no_deliverable_callback');
+  });
+
+  it('a folder registered ONLY under a dispatch: alias also rejects issuance', () => {
+    // The resolver skips alias rows (no outbound channel owns them), so the
+    // issuer's fail-closed gate fires for alias-only folders too — same
+    // contract, one resolver, one rejection point.
+    const root = makeTempDir('host-task-cb-alias-');
+    const project = join(root, 'project');
+    mkdirSync(project, { recursive: true });
+    cleanupPaths.push(root);
+
+    const policy: HostTaskPolicy = {
+      entity: 'gpg',
+      max_tier: 1,
+      allowed_project_dirs: [root],
+      allowed_models: ['haiku'],
+    };
+    const key = Buffer.from('88'.repeat(32), 'hex');
+    const now = 1_717_000_000;
+
+    const callbackJid = resolveCallbackJid(
+      { 'dispatch:atlas_gpg': group('atlas_gpg') },
+      'atlas_gpg',
+    );
+    expect(callbackJid).toBe('');
+
+    const result = evaluateHostTaskRequest(
+      { prompt: 'run task', project_dir: project },
+      'atlas_gpg',
+      callbackJid,
+      policy,
+      key,
+      now,
+    );
+
+    expect(result.ok).toBe(false);
+    if (result.ok) {
+      return;
+    }
+    expect(result.reason).toBe('no_deliverable_callback');
   });
 });
