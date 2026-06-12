@@ -60,7 +60,8 @@ export function runPreflightChecks(entity: string): PreflightResult {
             fs.writeFileSync(modePath, JSON.stringify({ mode: 'passive', reason: failureReason, timestamp: new Date().toISOString() }));
           } catch { /* best effort */ }
 
-          // ALERT CEO on Telegram immediately via IPC
+          // ALERT CEO immediately via IPC (delivered on the chat channel
+          // that owns this container's JID — Teams for the main group)
           try {
             const ipcDir = '/workspace/ipc/messages';
             fs.mkdirSync(ipcDir, { recursive: true });
@@ -69,7 +70,7 @@ export function runPreflightChecks(entity: string): PreflightResult {
               `Pattern: \`${check.pattern.source}\`\n` +
               `Result: NOT FOUND in constitution.md\n\n` +
               `Atlas is now in passive mode. All autonomous actions stopped.\n` +
-              `To restore: send /reset-mode from Telegram.`;
+              `To restore: send /reset-mode from the main Atlas chat.`;
             const alertFile = path.join(ipcDir, `canary-alert-${Date.now()}.json`);
             // Use the container's chatJid to route the alert
             const chatJid = process.env.NANOCLAW_CHAT_JID || '';

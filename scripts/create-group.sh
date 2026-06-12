@@ -11,7 +11,7 @@ set -euo pipefail
 #     --department operations \
 #     --entity gpg \
 #     --trigger "@Atlas" \
-#     --jid "tg:XXXXXXX" \
+#     --jid "msteams:a:1AbCdEf..." \
 #     [--requires-trigger true|false] \
 #     [--context-transfer]   # Run LLM-powered context extraction
 #
@@ -74,11 +74,11 @@ if [[ -z "$NAME" || -z "$FOLDER" || -z "$DEPARTMENT" || -z "$ENTITY" || -z "$JID
   echo "Usage:"
   echo "  create-group.sh \\"
   echo "    --name \"GPG Marketing\" \\"
-  echo "    --folder telegram_atlas-marketing \\"
+  echo "    --folder teams_gpg-marketing \\"
   echo "    --department marketing \\"
   echo "    --entity gpg \\"
   echo "    --trigger \"@Atlas\" \\"
-  echo "    --jid \"tg:-5063551496\""
+  echo "    --jid \"msteams:a:1AbCdEf...\""
   exit 1
 fi
 

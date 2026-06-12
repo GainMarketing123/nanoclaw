@@ -51,8 +51,8 @@ export interface QualityViolation {
 // Audit log shape v2. Sink-split (R5): the JSONL audit emits a coarse
 // reason='infra_unavailable' so non-operator readers don't see exact billing/
 // auth/token state. Exact reason still goes to container stderr (operator log)
-// and host-side Telegram alert. Old fields preserved for back-compat with any
-// directory-level digest readers.
+// and the host-side CEO alert (Teams main chat). Old fields preserved for
+// back-compat with any directory-level digest readers.
 export interface InterceptionLog {
   timestamp: string;
   entity: string;
@@ -438,7 +438,7 @@ async function callHaiku(responseText: string): Promise<QualityCheckResult> {
   // self-trigger HTTP 429 busy. Cross-review F1 on 1672f4c flagged this.
   // Set container timeouts to host_timeout + 2s slack on both attempts.
   // First 12s + ~250ms jitter + second 12s = ~24.3s worst case, still
-  // inside the <30s SDK Telegram-reply envelope.
+  // inside the <30s SDK chat-reply envelope.
   const attempt1 = await attemptQualityCheck(responseText, 12000);
   if (attempt1.legacy && !LEGACY_HOST_WARNED) {
     LEGACY_HOST_WARNED = true;
@@ -592,8 +592,8 @@ function violationsOf(r: QualityCheckResult): QualityViolation[] {
 // Coarsen the exact unavailable reason for the JSONL audit log. Per codex R5:
 // non-operator readers may scan the audit dir; we don't want them seeing
 // `billing` / `auth` / `token_missing` which are operational state. Exact
-// reason still goes to container stderr (operator log) and host-side Telegram
-// alert. The coarse string is `infra_unavailable` regardless of cause.
+// reason still goes to container stderr (operator log) and the host-side CEO
+// alert (Teams). The coarse string is `infra_unavailable` regardless of cause.
 function coarseReason(r: QualityCheckResult): 'infra_unavailable' | null {
   return r.status === 'unavailable' ? 'infra_unavailable' : null;
 }
@@ -606,7 +606,7 @@ function coarseReason(r: QualityCheckResult): 'infra_unavailable' | null {
  *     non-operator readers don't see exact billing/auth state.
  *   - stderr gets the exact reason via separate log statements at the call
  *     site (index.ts UNAVAILABLE log line, includes prompt SHA).
- *   - Telegram alert gets exact reason via host-executor's
+ *   - The CEO alert (Teams main chat) gets exact reason via host-executor's
  *     _maybe_send_operator_alert (host-side persistent dedup).
  */
 export function logInterceptionResult(

@@ -95,9 +95,10 @@ if this group migrates to a live channel. Until then, draft coding
 changes (website updates, email templates) and route them through the
 main Atlas channel for CEO review.
 
-## Telegram Formatting
+## Message Formatting
 
-Use Telegram Markdown (MarkdownV1):
+Use chat-friendly markdown (applies on whichever live channel this group
+migrates to — its original Telegram channel was retired 2026-06-03):
 - *Bold* (single asterisks)
 - _Italic_ (underscores)
 - `Code` (backticks)

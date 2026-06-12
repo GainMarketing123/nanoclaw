@@ -133,7 +133,7 @@ Groups are registered in the SQLite `registered_groups` table:
 ```
 
 Fields:
-- **Key**: The chat JID (unique identifier — WhatsApp, Telegram, Slack, Discord, etc.)
+- **Key**: The chat JID (unique identifier — Teams, WhatsApp, Slack, Discord, etc.)
 - **name**: Display name for the group
 - **folder**: Channel-prefixed folder name under `groups/` for this group's files and memory
 - **trigger**: The trigger word (usually same as global, but could differ)
@@ -156,8 +156,8 @@ Fields:
 5. Optionally create an initial `CLAUDE.md` for the group
 
 Folder naming convention — channel prefix with underscore separator:
+- Teams "Exec Chat" → `teams_exec-chat`
 - WhatsApp "Family Chat" → `whatsapp_family-chat`
-- Telegram "Dev Team" → `telegram_dev-team`
 - Discord "General" → `discord_general`
 - Slack "Engineering" → `slack_engineering`
 - Use lowercase, hyphens for the group name part

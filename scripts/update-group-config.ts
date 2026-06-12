@@ -3,27 +3,29 @@
  * Safely update registered group configuration in NanoClaw's SQLite database.
  * Handles JSON serialization properly — no shell escaping risks.
  *
- * Usage:
+ * Usage (find your group's JID with --list; e.g. a Teams chat JID looks like
+ * "msteams:a:1AbCdEf...", a WhatsApp group like "1203...@g.us"):
+ *
  *   # Add a mount to a group
- *   tsx scripts/update-group-config.ts --jid "tg:7322433447" --add-mount /home/atlas/projects:projects:ro
+ *   tsx scripts/update-group-config.ts --jid "msteams:a:1AbCdEf" --add-mount /home/atlas/projects:projects:ro
  *
  *   # Set full container config from a JSON file
- *   tsx scripts/update-group-config.ts --jid "tg:7322433447" --config-file config.json
+ *   tsx scripts/update-group-config.ts --jid "msteams:a:1AbCdEf" --config-file config.json
  *
  *   # Update group name
- *   tsx scripts/update-group-config.ts --jid "tg:7322433447" --name "New Name"
+ *   tsx scripts/update-group-config.ts --jid "msteams:a:1AbCdEf" --name "New Name"
  *
  *   # Update trigger pattern
- *   tsx scripts/update-group-config.ts --jid "tg:7322433447" --trigger "@Atlas"
+ *   tsx scripts/update-group-config.ts --jid "msteams:a:1AbCdEf" --trigger "@Atlas"
  *
  *   # Set requires-trigger
- *   tsx scripts/update-group-config.ts --jid "tg:7322433447" --requires-trigger false
+ *   tsx scripts/update-group-config.ts --jid "msteams:a:1AbCdEf" --requires-trigger false
  *
  *   # List all groups
  *   tsx scripts/update-group-config.ts --list
  *
  *   # Show one group's full config
- *   tsx scripts/update-group-config.ts --jid "tg:7322433447" --show
+ *   tsx scripts/update-group-config.ts --jid "msteams:a:1AbCdEf" --show
  *
  * Run from the NanoClaw project root (where store/messages.db lives).
  */

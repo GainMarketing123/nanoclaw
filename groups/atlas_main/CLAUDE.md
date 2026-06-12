@@ -59,13 +59,13 @@ Escalations pending: {n} — {1-line each with department and topic}
 
 Keep it under 500 words. Quantified. No fluff.
 
-## Telegram Formatting
+## Message Formatting
 
-Use Telegram Markdown (MarkdownV1):
+Use chat-friendly markdown (delivered via Teams, the primary CEO channel):
 - *Bold* (single asterisks)
 - _Italic_ (underscores)
 - `Code` (backticks)
-- Do NOT use ## headings — they don't render in Telegram
+- Do NOT use ## headings — they don't render reliably in chat clients
 - Use *Bold* text as section headers instead
 
 ## Host-Executor Delegation
@@ -95,7 +95,7 @@ Pending approvals are JSON files in /workspace/extra/atlas-state/approval-queue/
 Each contains: id, entity, tier, action, summary, created_at.
 Present pending items in the morning digest with context.
 
-CEO can approve/reject via Telegram commands (/approve, /reject) — these
+CEO can approve/reject via Teams commands (/approve, /reject) — these
 are handled mechanically by NanoClaw, not by you.
 
 ## Commands Reference

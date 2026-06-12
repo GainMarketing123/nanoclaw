@@ -69,7 +69,7 @@ export function getAllowedToolsForTier(tier: number): string[] {
 
 /**
  * Get the default tools (no tier restriction — CEO interactive session).
- * Used when no tier is specified (direct CEO Telegram message).
+ * Used when no tier is specified (direct CEO chat message, e.g. Teams).
  */
 export function getDefaultTools(): string[] {
   return [

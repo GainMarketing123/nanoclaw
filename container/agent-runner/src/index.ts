@@ -566,7 +566,7 @@ async function runQuery(
             continue; // Skip writeOutput — wait for corrected response
           }
           // Lint clean → ship + audit. Coarse reason in JSONL; exact reason
-          // already in stderr above and in host-side Telegram alert.
+          // already in stderr above and in the host-side CEO alert (Teams).
           logInterceptionResult(
             containerInput.groupFolder,
             qualityResult,

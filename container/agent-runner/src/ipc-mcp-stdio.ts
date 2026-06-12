@@ -45,7 +45,7 @@ server.tool(
   "Send a message to the user or group immediately while you're still running. Use this for progress updates or to send multiple messages. You can call this multiple times.",
   {
     text: z.string().describe('The message text to send'),
-    sender: z.string().optional().describe('Your role/identity name (e.g. "Researcher"). When set, messages appear from a dedicated bot in Telegram.'),
+    sender: z.string().optional().describe('Your role/identity name (e.g. "Researcher"). When set, messages are attributed to that identity on channels that support per-sender display.'),
   },
   async (args) => {
     const data: Record<string, string | undefined> = {
@@ -67,7 +67,7 @@ server.tool(
   'send_document',
   `Send a file to the user or group as a document attachment (PDF, XLSX, CSV, MD, etc.). The file must exist on disk — generate it first using Bash/Write, then call this tool with the path.
 
-Steps: 1) Create the file (e.g., write an XLSX, generate a PDF). 2) Call send_document with the absolute path. The file is copied to the IPC staging area and delivered as a Telegram/channel attachment.`,
+Steps: 1) Create the file (e.g., write an XLSX, generate a PDF). 2) Call send_document with the absolute path. The file is copied to the IPC staging area and delivered as a channel attachment (Teams, WhatsApp, etc.).`,
   {
     file_path: z.string().describe('Absolute path to the file to send (e.g., "/workspace/group/report.xlsx")'),
     caption: z.string().optional().describe('Caption text shown with the file attachment'),
@@ -344,11 +344,11 @@ server.tool(
   'register_group',
   `Register a new chat/group so the agent can respond to messages there. Main group only.
 
-Use available_groups.json to find the JID for a group. The folder name must be channel-prefixed: "{channel}_{group-name}" (e.g., "whatsapp_family-chat", "telegram_dev-team", "discord_general"). Use lowercase with hyphens for the group name part.`,
+Use available_groups.json to find the JID for a group. The folder name must be channel-prefixed: "{channel}_{group-name}" (e.g., "teams_exec-chat", "whatsapp_family-chat", "discord_general"). Use lowercase with hyphens for the group name part.`,
   {
-    jid: z.string().describe('The chat JID (e.g., "120363336345536173@g.us", "tg:-1001234567890", "dc:1234567890123456")'),
+    jid: z.string().describe('The chat JID (e.g., "msteams:a:1AbCdEf...", "120363336345536173@g.us", "dc:1234567890123456")'),
     name: z.string().describe('Display name for the group'),
-    folder: z.string().describe('Channel-prefixed folder name (e.g., "whatsapp_family-chat", "telegram_dev-team")'),
+    folder: z.string().describe('Channel-prefixed folder name (e.g., "teams_exec-chat", "whatsapp_family-chat")'),
     trigger: z.string().describe('Trigger word (e.g., "@Andy")'),
   },
   async (args) => {

@@ -28,7 +28,7 @@ const TIMEZONE = process.env.TZ || 'America/New_York';
 const ORCHESTRATOR_PROMPT = `[ORCHESTRATOR — Daily Morning Digest]
 
 You are Atlas running the daily 6AM orchestrator task. Your job: gather system state
-across all entities and produce a concise morning briefing for the CEO via Telegram.
+across all entities and produce a concise morning briefing for the CEO via Teams.
 
 *Step 1: Preflight* (governance module handles this — if you're reading this, you passed)
 
@@ -54,7 +54,7 @@ If a file doesn't exist, note it briefly and move on. Don't error out.
 
 *Step 3: Produce the digest*
 
-Format for Telegram (no markdown headings — use *bold* for sections):
+Format for chat delivery (no markdown headings — use *bold* for sections):
 
 *Morning Briefing — {today's date}*
 
