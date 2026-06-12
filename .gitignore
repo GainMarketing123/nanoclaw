@@ -41,6 +41,9 @@ groups/atlas_teams/*
 .tmp-*
 build-state.json
 
+# Lane worktrees (FleetView/conductor checkouts) — never authored repo content
+.worktrees/
+
 # Python cache
 __pycache__/
 
