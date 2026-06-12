@@ -106,6 +106,11 @@ function appendQualityAlert(alert: {
   logPath?: string;
 }): void {
   try {
+    // Ensure the parent exists (codex 7589fcc finding 1): this sink must
+    // not depend on a distant invariant having created data/ first — an
+    // ENOENT here would silently drop the one durable record of the exact
+    // failure reason.
+    fs.mkdirSync(DATA_DIR, { recursive: true });
     const alertsFile = path.join(DATA_DIR, 'quality-alerts.jsonl');
     fs.appendFileSync(
       alertsFile,
@@ -1132,18 +1137,29 @@ export async function runContainerAgent(
       if (timedOut) {
         const ts = new Date().toISOString().replace(/[:.]/g, '-');
         const timeoutLog = path.join(logsDir, `container-${ts}.log`);
-        fs.writeFileSync(
-          timeoutLog,
-          [
-            `=== Container Run Log (TIMEOUT) ===`,
-            `Timestamp: ${new Date().toISOString()}`,
-            `Group: ${group.name}`,
-            `Container: ${containerName}`,
-            `Duration: ${duration}ms`,
-            `Exit Code: ${code}`,
-            `Had Streaming Output: ${hadStreamingOutput}`,
-          ].join('\n'),
-        );
+        const timeoutLogLines = [
+          `=== Container Run Log (TIMEOUT) ===`,
+          `Timestamp: ${new Date().toISOString()}`,
+          `Group: ${group.name}`,
+          `Container: ${containerName}`,
+          `Duration: ${duration}ms`,
+          `Exit Code: ${code}`,
+          `Had Streaming Output: ${hadStreamingOutput}`,
+        ];
+        // Keep the retention promise on the timeout path too (codex 7589fcc
+        // finding 2): the alert log line claims the exact reasons live in
+        // the per-run log, so the timeout log must carry them as well — a
+        // degraded quality check followed by a container timeout would
+        // otherwise lose the only exact-reason record if the JSONL append
+        // also failed.
+        if (qualityTelemetry.lines.length > 0) {
+          timeoutLogLines.push(
+            ``,
+            `=== Quality-Check Stderr ===`,
+            ...qualityTelemetry.lines,
+          );
+        }
+        fs.writeFileSync(timeoutLog, timeoutLogLines.join('\n'));
 
         // Timeout after output = idle cleanup, not failure.
         // The agent already sent its response; this is just the
