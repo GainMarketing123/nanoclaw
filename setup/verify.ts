@@ -22,6 +22,52 @@ import {
 } from './platform.js';
 import { emitStatus } from './status.js';
 
+/** Inputs to the overall verify verdict — pure data, exported for tests. */
+export interface VerifyStatusInputs {
+  /** Service state: 'running' | 'stopped' | 'not_found'. */
+  service: string;
+  /** Credential state: 'configured' | 'missing'. */
+  credentials: string;
+  /** Per-channel auth map, e.g. { teams: 'configured', whatsapp: 'authenticated' }. */
+  channelAuth: Record<string, string>;
+  /** Count of rows in registered_groups. */
+  registeredGroups: number;
+}
+
+/**
+ * Teams success gate: Teams is the PRIMARY CEO command channel — owner
+ * commands, mission approvals, escalation alerts, and host-task results all
+ * land there. An install where another channel happens to be configured but
+ * Teams is not (bot creds or owner identity missing) is not operational for
+ * the CEO, so verify must NOT declare success for it. Channel detection
+ * itself (section 4 above) already requires BOTH the bot credential triple
+ * and an owner identity before reporting Teams configured.
+ */
+export function teamsGateSatisfied(
+  channelAuth: Record<string, string>,
+): boolean {
+  return channelAuth.teams === 'configured';
+}
+
+/**
+ * Compute the overall verify verdict. Pure — exported so the success gate is
+ * unit-testable without execSync/launchctl/DB scaffolding.
+ *
+ * Success requires: service running, credentials present, the Teams gate
+ * (see teamsGateSatisfied — any-channel-configured is NOT sufficient), and
+ * at least one registered group.
+ */
+export function computeVerifyStatus(
+  inputs: VerifyStatusInputs,
+): 'success' | 'failed' {
+  return inputs.service === 'running' &&
+    inputs.credentials !== 'missing' &&
+    teamsGateSatisfied(inputs.channelAuth) &&
+    inputs.registeredGroups > 0
+    ? 'success'
+    : 'failed';
+}
+
 export async function run(_args: string[]): Promise<void> {
   const projectRoot = process.cwd();
   const platform = getPlatform();
@@ -217,8 +263,9 @@ export async function run(_args: string[]): Promise<void> {
     channelAuth.discord = 'configured';
   }
 
+  // Reported for diagnostics; the success verdict requires the TEAMS gate
+  // specifically (computeVerifyStatus), not just any configured channel.
   const configuredChannels = Object.keys(channelAuth);
-  const anyChannelConfigured = configuredChannels.length > 0;
 
   // 5. Check registered groups (using better-sqlite3, not sqlite3 CLI)
   let registeredGroups = 0;
@@ -247,13 +294,21 @@ export async function run(_args: string[]): Promise<void> {
   }
 
   // Determine overall status
-  const status =
-    service === 'running' &&
-    credentials !== 'missing' &&
-    anyChannelConfigured &&
-    registeredGroups > 0
-      ? 'success'
-      : 'failed';
+  const status = computeVerifyStatus({
+    service,
+    credentials,
+    channelAuth,
+    registeredGroups,
+  });
+
+  if (status === 'failed' && !teamsGateSatisfied(channelAuth)) {
+    logger.error(
+      { channelAuth },
+      'Teams gate failed: Teams is the primary CEO command channel and must ' +
+        'be configured (bot creds + owner identity) before verify can report ' +
+        'success — see teams/PROVISIONING.md and .env.example',
+    );
+  }
 
   logger.info({ status, channelAuth }, 'Verification complete');
 

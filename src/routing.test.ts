@@ -331,8 +331,6 @@ describe('ensureOwnerMainGroup', () => {
 
     const groups = getAllRegisteredGroups();
     expect(groups['msteams:a:owner'].isMain).toBe(true);
-    expect(
-      Object.values(groups).filter((g) => g.isMain),
-    ).toHaveLength(1);
+    expect(Object.values(groups).filter((g) => g.isMain)).toHaveLength(1);
   });
 });
