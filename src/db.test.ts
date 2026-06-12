@@ -848,6 +848,40 @@ describe('same-JID folder-rename migration (codex 66873e9 soft finding)', () => 
 
     expect(getSession('folder_same')).toBe('session-keep');
   });
+
+  it('renaming INTO an occupied folder clears that folder prior-tenant session', () => {
+    // codex a98b146 finding 1: the complement of the vacated-folder delete.
+    // Group Y holds folder_dest with a live conversation; group X renames
+    // into folder_dest — X must NOT resume Y's conversation.
+    register('jid-y@teams', 'folder_dest');
+    setSession('folder_dest', 'session-of-y');
+    register('jid-x@teams', 'folder_src');
+
+    register('jid-x@teams', 'folder_dest'); // same-JID rename into folder_dest
+
+    expect(getSession('folder_dest')).toBeUndefined();
+  });
+
+  it('a different JID replacing a folder tenant clears the folder session', () => {
+    register('jid-old@teams', 'folder_swap');
+    setSession('folder_swap', 'session-of-old');
+
+    // Channel re-registration under a NEW JID (the single-JID-per-folder
+    // replacement path) — the conversation belonged to the old tenant.
+    register('jid-new@teams', 'folder_swap');
+
+    expect(getSession('folder_swap')).toBeUndefined();
+  });
+
+  it('registering into a vacant folder with a stale legacy session clears it', () => {
+    // No registered tenant, but a sessions row survives from a departed
+    // tenant (pre-fix data) — the incoming group must start fresh.
+    setSession('folder_stale', 'session-of-ghost');
+
+    register('jid-x@teams', 'folder_stale');
+
+    expect(getSession('folder_stale')).toBeUndefined();
+  });
 });
 
 describe('main-group write-layer invariant (al22 reland)', () => {

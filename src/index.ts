@@ -315,6 +315,13 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
   // 66873e9 soft finding; the in-memory map must not resurrect it for a
   // future tenant of that folder within this process lifetime).
   const priorFolder = registeredGroups[jid]?.folder;
+  // Likewise capture the DESTINATION folder's current in-memory tenant
+  // (codex a98b146 finding 1): if this registration changes the folder's
+  // tenant JID, the folder's existing session belongs to ANOTHER tenant and
+  // must not be resumed by the incoming group (cross-group context leak).
+  const destTenantJid = Object.keys(registeredGroups).find(
+    (otherJid) => registeredGroups[otherJid].folder === group.folder,
+  );
 
   // Persist to the DB FIRST (atomic single-main transaction in
   // setRegisteredGroup), then mirror the result in memory only on success. If
@@ -324,6 +331,13 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
 
   if (priorFolder && priorFolder !== group.folder) {
     delete sessions[priorFolder];
+  }
+  if (destTenantJid !== jid) {
+    // Tenant changed (or the folder was vacant with a stale entry) — the DB
+    // transaction cleared the sessions row; mirror it in memory. A plain
+    // same-jid re-register keeps its session (conversation continuity
+    // across channel reconnects).
+    delete sessions[group.folder];
   }
 
   // Mirror the DB-layer single-main invariant in the in-memory map. The router

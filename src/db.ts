@@ -755,6 +755,25 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
         priorRow.folder,
       );
     }
+    // DESTINATION-folder session hygiene (codex a98b146 finding 1 — the
+    // complement of the vacated-folder delete above): a session row belongs
+    // to the (folder, tenant) pairing that created it, and sessions are
+    // keyed by folder alone. Whenever this registration CHANGES the folder's
+    // tenant JID — a same-JID rename INTO the folder, a different JID
+    // replacing the folder's row (the single-JID-per-folder DELETE below),
+    // or a vacant folder carrying a stale row from a departed tenant — the
+    // existing session must be cleared, or the incoming group resumes
+    // another tenant's conversation (cross-group context leak). A plain
+    // re-register of the same jid+folder keeps its session (channel
+    // reconnects must not lose conversation continuity).
+    const destTenant = db
+      .prepare('SELECT jid FROM registered_groups WHERE folder = ?')
+      .get(group.folder) as { jid: string } | undefined;
+    if (!destTenant || destTenant.jid !== jid) {
+      db.prepare('DELETE FROM sessions WHERE group_folder = ?').run(
+        group.folder,
+      );
+    }
     if (group.isMain) {
       db.prepare('UPDATE registered_groups SET is_main = 0 WHERE jid != ?').run(
         jid,
@@ -1176,18 +1195,12 @@ function migrateJsonState(): void {
     }
   }
 
-  // Migrate sessions.json
-  const sessions = migrateFile('sessions.json') as Record<
-    string,
-    string
-  > | null;
-  if (sessions) {
-    for (const [folder, sessionId] of Object.entries(sessions)) {
-      setSession(folder, sessionId);
-    }
-  }
-
-  // Migrate registered_groups.json
+  // Migrate registered_groups.json BEFORE sessions.json: setRegisteredGroup
+  // clears the destination folder's session row whenever the folder's tenant
+  // changes (codex a98b146 finding 1) — and during a fresh migration EVERY
+  // registration is a tenant change against an empty table. Sessions from
+  // the same JSON snapshot pair with these same groups, so they must land
+  // AFTER the group rows or the hygiene rule would wipe them all.
   const groups = migrateFile('registered_groups.json') as Record<
     string,
     RegisteredGroup
@@ -1209,6 +1222,17 @@ function migrateJsonState(): void {
           'Skipping migrated registered group with invalid folder',
         );
       }
+    }
+  }
+
+  // Migrate sessions.json (after groups — see ordering note above)
+  const sessions = migrateFile('sessions.json') as Record<
+    string,
+    string
+  > | null;
+  if (sessions) {
+    for (const [folder, sessionId] of Object.entries(sessions)) {
+      setSession(folder, sessionId);
     }
   }
 }
