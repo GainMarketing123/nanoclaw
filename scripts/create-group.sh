@@ -256,11 +256,13 @@ import sqlite3, json
 db = sqlite3.connect('${DB_PATH}')
 # Live-main lookup — EXACT mirror of selectLiveMain in src/router.ts (and
 # select_live_main_row in host/host-executor.py); keep all three in lockstep:
-#   1. retired-channel JIDs are NEVER eligible (prefixes mirror
-#      RETIRED_CHANNEL_JID_PREFIXES — e.g. a legacy Telegram main row left
+#   1. KNOWABLY-UNDELIVERABLE JIDs are NEVER eligible (prefixes mirror
+#      RETIRED_CHANNEL_JID_PREFIXES + NON_CHANNEL_JID_PREFIXES /
+#      isKnownUndeliverableJid — e.g. a legacy Telegram main row left
 #      behind by the Teams migration may still carry is_main=1, and writing
 #      the shared mount onto that dead row would silently leave the LIVE
-#      main without shared-workspace access);
+#      main without shared-workspace access; same for a logical dispatch:
+#      alias row, which no outbound channel ever owns);
 #   2. among live rows, folder == 'main' wins (the row loadState() keeps in
 #      single-main normalization — a bare live[0] under SQLite's undefined
 #      row order could mutate a side row that later gets demoted, codex
@@ -271,7 +273,7 @@ db = sqlite3.connect('${DB_PATH}')
 #      mirrors disagree on which chat is main when two live mains exist and
 #      neither folder is literally 'main').
 rows = db.execute('SELECT jid, folder, container_config FROM registered_groups WHERE is_main = 1').fetchall()
-live = [r for r in rows if not r[0].startswith(('tg:',))]
+live = [r for r in rows if not r[0].startswith(('tg:', 'dispatch:'))]
 row = min(live, key=lambda r: (0 if r[1] == 'main' else 1, r[0])) if live else None
 if not row or not row[2]:
     print('  Warning: no live main group with a container config')

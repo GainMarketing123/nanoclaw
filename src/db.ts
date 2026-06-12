@@ -5,6 +5,7 @@ import path from 'path';
 import { ASSISTANT_NAME, DATA_DIR, STORE_DIR } from './config.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
+import { isKnownUndeliverableJid } from './router.js';
 import {
   NewMessage,
   RegisteredGroup,
@@ -702,6 +703,24 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
   if (!isValidGroupFolder(group.folder)) {
     throw new Error(`Invalid group folder "${group.folder}" for JID ${jid}`);
   }
+  // Write-layer main-group invariant (al22 reland spec, commit-review round
+  // 1 finding 2): a knowably-undeliverable JID (logical `dispatch:` alias,
+  // retired channel) can NEVER be stored as is_main. Main-group identity
+  // routes CEO alerts and authorizes privileged IPC; every runtime mirror
+  // (selectLiveMain here, host/host-executor.py, scripts/create-group.sh)
+  // skips such rows on the READ side, so persisting one as main would at
+  // best be ignored and at worst (a stale mirror) black-hole alerts. No
+  // production caller passes such a JID with isMain — channel registration
+  // and ensureOwnerMainGroup only promote live channel JIDs — so this throw
+  // is an invariant backstop, same contract as the invalid-folder throw
+  // above. Tests simulating LEGACY pre-invariant rows seed them with
+  // _setGroupIsMainUnchecked instead.
+  if (group.isMain && isKnownUndeliverableJid(jid)) {
+    throw new Error(
+      `Cannot register ${jid} as main group: JID shape is knowably ` +
+        `undeliverable (logical alias or retired channel)`,
+    );
+  }
   const upsert = db.prepare(
     `INSERT OR REPLACE INTO registered_groups (jid, name, folder, trigger_pattern, added_at, container_config, requires_trigger, is_main)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -740,9 +759,20 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
     // so the strengthened single-JID-per-folder invariant stays consistent
     // end-to-end. Constrained to rows that don't already match, so a plain
     // re-register of the same JID is a no-op.
-    db.prepare(
-      'UPDATE scheduled_tasks SET chat_jid = ? WHERE group_folder = ? AND chat_jid != ?',
-    ).run(jid, group.folder, jid);
+    //
+    // Deliverability guard (al22 reland spec pre-review finding 1): this is
+    // a writer of scheduled_tasks.chat_jid, so it must honor the shared
+    // deliverability contract. Registering a folder under a knowably-
+    // undeliverable JID (e.g. a bridge `dispatch:{folder}` logical row) must
+    // not repoint existing task rows at a target no outbound channel can
+    // ever own — tasks keep their last channel JID instead. The group row
+    // itself still registers (logical rows are legitimate); only the
+    // task-row rewrite is gated.
+    if (!isKnownUndeliverableJid(jid)) {
+      db.prepare(
+        'UPDATE scheduled_tasks SET chat_jid = ? WHERE group_folder = ? AND chat_jid != ?',
+      ).run(jid, group.folder, jid);
+    }
     upsert.run(
       jid,
       group.name,
@@ -769,6 +799,17 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
  */
 export function clearGroupIsMain(jid: string): void {
   db.prepare('UPDATE registered_groups SET is_main = 0 WHERE jid = ?').run(jid);
+}
+
+/**
+ * @internal - for tests ONLY. Flip is_main=1 on an existing row WITHOUT the
+ * setRegisteredGroup write-layer invariants, simulating LEGACY data that
+ * predates them (e.g. the retired Telegram main row from the 2026-06-11
+ * incident, which real VPS DBs contained). Production code must never call
+ * this — go through setRegisteredGroup.
+ */
+export function _setGroupIsMainUnchecked(jid: string): void {
+  db.prepare('UPDATE registered_groups SET is_main = 1 WHERE jid = ?').run(jid);
 }
 
 export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {

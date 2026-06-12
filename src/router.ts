@@ -82,19 +82,163 @@ export function isRetiredChannelJid(jid: string): boolean {
 }
 
 /**
+ * JID prefixes for LOGICAL aliases that no outbound channel ever owns.
+ * `dispatch:{folder}` is the bridge's Paperclip-workspace form; the
+ * result-delivery message path does not resolve dispatch→real, so a send to
+ * such a JID can only fail ("No channel for JID"). Module-internal on
+ * purpose — the public contract is isKnownUndeliverableJid (spec pre-review
+ * finding 4); callers must never re-implement prefix checks.
+ * host/host-executor.py carries a lockstep Python mirror
+ * (NON_CHANNEL_JID_PREFIXES there), as does scripts/create-group.sh step 4.
+ */
+const NON_CHANNEL_JID_PREFIXES = ['dispatch:'] as const;
+
+/**
+ * Shared conservative deliverability predicate (al22 reland spec,
+ * plans/al22-seed-orchestrator-reland-spec-2026-06-12.md, commit-review
+ * round 1): true when the JID's SHAPE alone guarantees that NO outbound
+ * channel can ever own it on the send path (findChannel → channel.ownsJid):
+ *   - logical aliases (`dispatch:` — owned by no channel, never resolved on
+ *     the send path), and
+ *   - retired channels (`tg:` — sends raise RetiredChannelDropError by
+ *     design).
+ *
+ * DELIBERATELY one-sided: a `false` result means "not KNOWABLY undeliverable
+ * by shape", NOT "delivery guaranteed" — a registered, non-retired,
+ * non-alias JID can still be unowned at send time (e.g. a WhatsApp `@g.us`
+ * row while the WhatsApp channel is not running; channels register at
+ * orchestrator startup, and a DB-side script cannot see them at all). Live
+ * channel ownership at send time remains the authoritative check; this
+ * predicate exists so writers of persistent routing targets
+ * (scheduled_tasks.chat_jid, host-task callback_group, is_main promotion)
+ * never store a target that is GUARANTEED dead. Per-call-site prefix lists
+ * are how the wave-2 review spiral started — always use this.
+ */
+export function isKnownUndeliverableJid(jid: string): boolean {
+  return (
+    NON_CHANNEL_JID_PREFIXES.some((p) => jid.startsWith(p)) ||
+    isRetiredChannelJid(jid)
+  );
+}
+
+/**
+ * Resolve a group FOLDER to its registered channel chat JID — undefined when
+ * the folder has none (caller decides whether that fails closed or degrades).
+ *
+ * Skips rows whose JID shape is knowably undeliverable (logical `dispatch:`
+ * aliases, retired channels). NOT a delivery guarantee — see
+ * isKnownUndeliverableJid; runtime channel ownership at send time stays
+ * authoritative.
+ *
+ * The registry holds at most one current JID per folder (single-JID-per-folder
+ * invariant, enforced at the DB layer by setRegisteredGroup), but the
+ * in-memory map can transiently carry stale extras and logical alias rows.
+ * The scan therefore filters by shape and breaks any remaining tie
+ * deterministically — lexicographically smallest JID — so object iteration
+ * order never decides routing (spec pre-review finding 2; same rationale as
+ * selectLiveMain's jid tie-break).
+ */
+export function resolveChannelJidForFolder(
+  registeredGroups: Record<string, { folder: string }>,
+  folder: string,
+): string | undefined {
+  let best: string | undefined;
+  for (const [jid, group] of Object.entries(registeredGroups)) {
+    if (group.folder !== folder || isKnownUndeliverableJid(jid)) {
+      continue;
+    }
+    if (best === undefined || jid < best) {
+      best = jid;
+    }
+  }
+  return best;
+}
+
+/**
+ * Resolution result for seeding a scheduled task (see resolveSeedTarget).
+ * `reason` is operator-facing — seeders print it and exit non-zero.
+ */
+export type SeedTargetResult =
+  | { ok: true; jid: string; folder: string }
+  | { ok: false; reason: string };
+
+/**
+ * Resolve the (chat_jid, group_folder) pair a seeded scheduled task must
+ * target. The scheduler executes tasks by matching task.group_folder to a
+ * registered group's folder and delivers output to task.chat_jid
+ * (src/task-scheduler.ts), so BOTH must come from a real registered row —
+ * never a constant folder, never an unvalidated JID. This closes the four
+ * wave-2 seed-orchestrator review findings at root (al22 reland spec).
+ *
+ *   - explicitJid path: the JID must be a registered row AND deliverable
+ *     (rejects retired `tg:` rows and `dispatch:` aliases with the same
+ *     shared predicate); the folder is the row's.
+ *   - default path: selectLiveMain over the DELIVERABLE is_main candidates —
+ *     retirement-aware and deterministic, the same winner every runtime
+ *     mirror computes.
+ *
+ * Validation is "registered + not knowably undeliverable by shape": a
+ * DB-side seeder runs outside the orchestrator process and cannot see which
+ * channels are live, so runtime channel ownership at send time remains the
+ * authoritative delivery check (see isKnownUndeliverableJid).
+ *
+ * Pure function over pre-fetched rows: no DB handle, unit-testable.
+ */
+export function resolveSeedTarget(
+  rows: Array<{ jid: string; folder: string; isMain: boolean }>,
+  explicitJid?: string,
+): SeedTargetResult {
+  if (explicitJid !== undefined) {
+    const row = rows.find((r) => r.jid === explicitJid);
+    if (!row) {
+      return {
+        ok: false,
+        reason: `--chat-jid ${explicitJid} is not a registered group JID`,
+      };
+    }
+    if (isKnownUndeliverableJid(explicitJid)) {
+      return {
+        ok: false,
+        reason:
+          `--chat-jid ${explicitJid} is registered but knowably ` +
+          `undeliverable (retired channel or logical alias) — no outbound ` +
+          `channel can ever own it`,
+      };
+    }
+    return { ok: true, jid: row.jid, folder: row.folder };
+  }
+
+  const live = selectLiveMain(rows.filter((r) => r.isMain));
+  if (!live) {
+    return {
+      ok: false,
+      reason:
+        'no live main group found in registered_groups ' +
+        '(every is_main row is retired or a logical alias, or none exists) — ' +
+        'provide --chat-jid for an explicit live target',
+    };
+  }
+  return { ok: true, jid: live.jid, folder: live.folder };
+}
+
+/**
  * Choose which `is_main` candidate should act as the main control group —
  * the JID that CEO alerts route to, and the survivor of load-time
  * single-main normalization (loadState in index.ts).
  *
- * Retired-channel JIDs are NEVER eligible: a retired JID cannot deliver
- * anything, so keeping one as main silently black-holes CEO alerts — the
- * live `No channel for JID: tg:7322433447` executor mis-route from the
- * 2026-06-11 trace, where a legacy Telegram main row survived the Teams
- * migration as an `is_main = 1` row and the DB-reading alert paths
- * (host-executor.py send_alert, credential-proxy.ts sendAlert,
- * seed-orchestrator.ts) picked it via `WHERE is_main = 1 LIMIT 1`.
- * host-executor.py mirrors this selection in Python (RETIRED_CHANNEL_JID_
- * PREFIXES there must stay in lockstep with this file).
+ * KNOWABLY-UNDELIVERABLE JIDs are NEVER eligible (isKnownUndeliverableJid):
+ * a retired JID cannot deliver anything, so keeping one as main silently
+ * black-holes CEO alerts — the live `No channel for JID: tg:7322433447`
+ * executor mis-route from the 2026-06-11 trace, where a legacy Telegram
+ * main row survived the Teams migration as an `is_main = 1` row and the
+ * DB-reading alert paths (host-executor.py send_alert, credential-proxy.ts
+ * sendAlert, seed-orchestrator.ts) picked it via
+ * `WHERE is_main = 1 LIMIT 1`. The same holds for logical `dispatch:` alias
+ * rows (al22 reland spec, commit-review round 1): setRegisteredGroup now
+ * rejects promoting one, but a legacy/hand-edited row must not win selection
+ * in ANY runtime mirror. host-executor.py mirrors this selection in Python
+ * (RETIRED_CHANNEL_JID_PREFIXES + NON_CHANNEL_JID_PREFIXES there must stay
+ * in lockstep with this file), as does scripts/create-group.sh step 4.
  *
  * Among live candidates the canonical `folder === 'main'` row wins (that is
  * the row the schema migration promotes), else the row with the
@@ -121,7 +265,7 @@ export function isRetiredChannelJid(jid: string): boolean {
 export function selectLiveMain<T extends { jid: string; folder?: string }>(
   candidates: T[],
 ): T | undefined {
-  const live = candidates.filter((c) => !isRetiredChannelJid(c.jid));
+  const live = candidates.filter((c) => !isKnownUndeliverableJid(c.jid));
   if (live.length === 0) return undefined;
   // Deterministic total order: (folder === 'main' rank, then smallest jid).
   return live.reduce((best, c) => {

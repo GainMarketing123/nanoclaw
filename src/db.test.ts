@@ -704,4 +704,101 @@ describe('single-JID-per-folder invariant (cross-review FAIL_BLOCKING)', () => {
 
     expect(getTaskById('task-other')!.chat_jid).toBe('jid-b@teams');
   });
+
+  it('registering a folder under a dispatch: alias does NOT rewrite task rows', () => {
+    // al22 reland spec pre-review finding 1: setRegisteredGroup's task-row
+    // rewrite is a writer of scheduled_tasks.chat_jid and must honor the
+    // shared deliverability contract. A bridge `dispatch:{folder}` row may
+    // register, but existing tasks keep their last channel JID — repointing
+    // them at the alias would make every scheduled run silently non-deliver.
+    setRegisteredGroup('real-jid@teams', {
+      name: 'GPG',
+      folder: 'atlas_gpg',
+      trigger: '@Atlas',
+      added_at: '2024-01-01T00:00:00.000Z',
+    });
+    createTask({
+      id: 'task-keep-jid',
+      group_folder: 'atlas_gpg',
+      chat_jid: 'real-jid@teams',
+      prompt: 'recurring',
+      schedule_type: 'interval',
+      schedule_value: '60000',
+      context_mode: 'isolated',
+      next_run: '2024-06-01T00:00:00.000Z',
+      status: 'active',
+      created_at: '2024-01-01T00:00:00.000Z',
+    });
+
+    setRegisteredGroup('dispatch:atlas_gpg', {
+      name: 'GPG (bridge alias)',
+      folder: 'atlas_gpg',
+      trigger: '@Atlas',
+      added_at: '2024-02-01T00:00:00.000Z',
+    });
+
+    expect(getTaskById('task-keep-jid')!.chat_jid).toBe('real-jid@teams');
+  });
+});
+
+describe('main-group write-layer invariant (al22 reland)', () => {
+  it('rejects promoting a retired-channel JID to main', () => {
+    expect(() =>
+      setRegisteredGroup('tg:7322433447', {
+        name: 'Dead Telegram',
+        folder: 'main',
+        trigger: '@Atlas',
+        added_at: '2024-01-01T00:00:00.000Z',
+        isMain: true,
+      }),
+    ).toThrow(/knowably/);
+  });
+
+  it('rejects promoting a dispatch: alias to main', () => {
+    // Spec commit-review round 1 finding 2: the read-side mirrors
+    // (selectLiveMain, host-executor.py, create-group.sh) all skip such
+    // rows; the write layer must never create one.
+    expect(() =>
+      setRegisteredGroup('dispatch:atlas_gpg', {
+        name: 'Bridge alias',
+        folder: 'atlas_gpg',
+        trigger: '@Atlas',
+        added_at: '2024-01-01T00:00:00.000Z',
+        isMain: true,
+      }),
+    ).toThrow(/knowably/);
+  });
+
+  it('a rejected promotion writes NOTHING (transactional integrity)', () => {
+    setRegisteredGroup('live-main@teams', {
+      name: 'Live main',
+      folder: 'atlas_teams',
+      trigger: '@Atlas',
+      added_at: '2024-01-01T00:00:00.000Z',
+      isMain: true,
+    });
+    expect(() =>
+      setRegisteredGroup('tg:7322433447', {
+        name: 'Dead Telegram',
+        folder: 'main',
+        trigger: '@Atlas',
+        added_at: '2024-01-01T00:00:00.000Z',
+        isMain: true,
+      }),
+    ).toThrow();
+    const groups = getAllRegisteredGroups();
+    // The existing live main keeps its flag; the rejected row never landed.
+    expect(groups['live-main@teams'].isMain).toBe(true);
+    expect(groups['tg:7322433447']).toBeUndefined();
+  });
+
+  it('still registers undeliverable JIDs as NON-main rows', () => {
+    setRegisteredGroup('dispatch:atlas_gpg', {
+      name: 'Bridge alias',
+      folder: 'atlas_gpg',
+      trigger: '@Atlas',
+      added_at: '2024-01-01T00:00:00.000Z',
+    });
+    expect(getAllRegisteredGroups()['dispatch:atlas_gpg']).toBeDefined();
+  });
 });

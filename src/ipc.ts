@@ -10,7 +10,11 @@ import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
 import { RegisteredGroup } from './types.js';
-import { RetiredChannelDropError, isRetiredChannelJid } from './router.js';
+import {
+  RetiredChannelDropError,
+  isKnownUndeliverableJid,
+  resolveChannelJidForFolder,
+} from './router.js';
 import { loadHostTaskKey } from './host-task-key.js';
 import { policyForGroup } from './host-task-policy.js';
 import {
@@ -55,53 +59,25 @@ export interface IpcDeps {
  * `registeredGroups[chatJid]`, so a folder-shaped value silently fails
  * delivery — the value MUST be the JID.
  *
- * Returns '' when no registered group has that folder. An empty result is a
- * valid (best-effort) outcome: the task still runs, but the executor skips
- * result delivery. Extracted as a pure function so the issuer round-trip test
- * and production share one resolver implementation (design review: a test that
- * re-implements the loop can preserve a broken impl and still pass).
+ * Returns '' when no registered group has that folder (the caller decides the
+ * policy for that case). Extracted as a pure function so the issuer round-trip
+ * test and production share one resolver implementation (design review: a test
+ * that re-implements the loop can preserve a broken impl and still pass).
  *
- * Returns the FIRST deliverable (non-dispatch) JID found for the folder. The
- * map should hold at most one current JID per folder — it is rebuilt from the
- * DB at startup and the single-`is_main` invariant is enforced at the DB layer
- * — but it is an in-memory map and is not guaranteed free of a stale key for a
- * re-registered folder (cross-review F2, soft). Keep `registeredGroups` current
- * (re-sync on re-registration) rather than relying on a recency tiebreak here;
- * a worst-case stale-key pick still yields a syntactically valid JID, and the
- * outbound router drops an unowned one (it does not misroute to another group).
+ * Deliverability semantics live in the SHARED helper
+ * (src/router.ts resolveChannelJidForFolder — al22 reland spec): a
+ * `dispatch:` alias is owned by no outbound channel, and a retired-channel JID
+ * (e.g. `tg:` after the Telegram retirement) is guaranteed to raise
+ * RetiredChannelDropError on send (cross-review FAIL_BLOCKING R3) — stamping
+ * either as callback_group would hand the executor a JID whose only outcome is
+ * a dropped result. This wrapper only adapts undefined → '' for the
+ * string-typed wire field.
  */
 export function resolveCallbackJid(
   registeredGroups: Record<string, RegisteredGroup>,
   sourceGroup: string,
 ): string {
-  // The callback target must be DELIVERABLE by the outbound channel router
-  // (findChannel → channel.ownsJid). A logical `dispatch:` alias (the bridge's
-  // "dispatch:{folder}" form for Paperclip company workspaces) is NOT owned by
-  // any channel — the result-delivery message path does not resolve
-  // dispatch→real-JID (only schedule_task targeting does) — so stamping a
-  // dispatch alias here yields an undeliverable callback that routes the result
-  // to data/ipc/errors (cross-review F2). Prefer a real channel JID; if the
-  // folder is registered ONLY under a dispatch alias, return '' so the executor
-  // skips result delivery (best-effort) rather than producing a non-routable
-  // target. (Bridge-group result delivery is a separate mechanism, out of scope
-  // here.)
-  for (const [jid, group] of Object.entries(registeredGroups)) {
-    if (group.folder !== sourceGroup) {
-      continue;
-    }
-    // Skip non-deliverable JIDs; keep scanning for an actually-deliverable one.
-    // A `dispatch:` alias is owned by no outbound channel; a retired-channel
-    // JID (e.g. `tg:` after the Telegram retirement) is guaranteed to raise
-    // RetiredChannelDropError on send, so stamping it as callback_group would
-    // hand the executor a JID whose only outcome is a dropped result
-    // (cross-review FAIL_BLOCKING R3: filter retired prefixes, not just
-    // dispatch:).
-    if (jid.startsWith('dispatch:') || isRetiredChannelJid(jid)) {
-      continue;
-    }
-    return jid;
-  }
-  return '';
+  return resolveChannelJidForFolder(registeredGroups, sourceGroup) ?? '';
 }
 
 let ipcWatcherRunning = false;
@@ -362,29 +338,20 @@ export async function processTaskIpc(
         // src/index.ts cannot route ("No channel owns JID"), so scheduled-task
         // output is silently dropped (cross-review FAIL_BLOCKING ipc.ts:348-365).
         // Therefore: whenever the target is a `dispatch:` alias, ALWAYS rewrite
-        // it to the real (non-dispatch) deliverable JID for the same folder —
-        // even when the in-memory registry happens to hold a literal
-        // `dispatch:{folder}` row (the prior `!targetGroupEntry` guard skipped
-        // resolution in exactly that case and let the undeliverable alias
-        // through). Resolution mirrors resolveCallbackJid: skip dispatch keys,
-        // take the first real channel JID for the folder. If none exists, reject
-        // the schedule request rather than persist a non-routable chat_jid.
+        // it to the real deliverable JID for the same folder — even when the
+        // in-memory registry happens to hold a literal `dispatch:{folder}` row
+        // (the prior `!targetGroupEntry` guard skipped resolution in exactly
+        // that case and let the undeliverable alias through). Resolution is the
+        // SHARED helper (src/router.ts, al22 reland spec) — the same contract
+        // resolveCallbackJid uses. If no deliverable JID exists, reject the
+        // schedule request rather than persist a non-routable chat_jid.
         if (targetJid.startsWith('dispatch:')) {
           const dispatchFolder = targetJid.slice('dispatch:'.length);
-          let resolvedJid: string | null = null;
-          let resolvedGroup: RegisteredGroup | undefined;
-          for (const [jid, group] of Object.entries(registeredGroups)) {
-            if (
-              group.folder === dispatchFolder &&
-              !jid.startsWith('dispatch:') &&
-              !isRetiredChannelJid(jid)
-            ) {
-              resolvedJid = jid;
-              resolvedGroup = group;
-              break;
-            }
-          }
-          if (resolvedJid && resolvedGroup) {
+          const resolvedJid = resolveChannelJidForFolder(
+            registeredGroups,
+            dispatchFolder,
+          );
+          if (resolvedJid) {
             logger.info(
               {
                 dispatch: data.targetJid,
@@ -394,7 +361,7 @@ export async function processTaskIpc(
               'Dispatch JID resolved to registered group',
             );
             targetJid = resolvedJid;
-            targetGroupEntry = resolvedGroup;
+            targetGroupEntry = registeredGroups[resolvedJid];
           } else {
             // No deliverable channel JID for this folder — do not persist an
             // undeliverable dispatch: alias as chat_jid.
@@ -409,11 +376,11 @@ export async function processTaskIpc(
         // targetGroupEntry truthy and skipping the dispatch block entirely;
         // persisting it as scheduled_tasks.chat_jid would make every scheduled
         // run silently non-deliver ("No channel owns JID" / RetiredChannelDrop).
-        if (
-          !targetGroupEntry ||
-          targetJid.startsWith('dispatch:') ||
-          isRetiredChannelJid(targetJid)
-        ) {
+        // isKnownUndeliverableJid is the shared predicate covering both prefix
+        // classes (dispatch aliases + retired channels); registration is the
+        // targetGroupEntry check beside it. Runtime channel ownership at send
+        // time remains the authoritative delivery check.
+        if (!targetGroupEntry || isKnownUndeliverableJid(targetJid)) {
           logger.warn(
             { targetJid, original: data.targetJid },
             'Cannot schedule task: no deliverable channel JID for target (dispatch/retired resolution failed)',

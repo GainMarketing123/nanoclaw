@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 
 import {
   _initTestDatabase,
+  _setGroupIsMainUnchecked,
   getAllChats,
   getAllRegisteredGroups,
   setRegisteredGroup,
@@ -13,7 +14,13 @@ import {
   _loadState,
   _setRegisteredGroups,
 } from './index.js';
-import { selectLiveMain, selectLiveMainJid } from './router.js';
+import {
+  isKnownUndeliverableJid,
+  resolveChannelJidForFolder,
+  resolveSeedTarget,
+  selectLiveMain,
+  selectLiveMainJid,
+} from './router.js';
 
 beforeEach(() => {
   _initTestDatabase();
@@ -261,19 +268,197 @@ describe('selectLiveMainJid', () => {
   });
 });
 
+// --- isKnownUndeliverableJid (shared conservative deliverability predicate) ---
+
+describe('isKnownUndeliverableJid', () => {
+  it('flags retired-channel JIDs (tg:)', () => {
+    expect(isKnownUndeliverableJid('tg:7322433447')).toBe(true);
+  });
+
+  it('flags logical dispatch: aliases', () => {
+    expect(isKnownUndeliverableJid('dispatch:atlas_gpg')).toBe(true);
+  });
+
+  it('does NOT flag real channel JID shapes', () => {
+    expect(isKnownUndeliverableJid('msteams:a:owner')).toBe(false);
+    expect(isKnownUndeliverableJid('12345678@g.us')).toBe(false);
+    expect(isKnownUndeliverableJid('dc:123')).toBe(false);
+  });
+
+  it('is conservative: an unmapped-but-plausible JID is NOT flagged', () => {
+    // The predicate is shape-only — a channel may be down or unregistered at
+    // send time, and runtime ownership stays the authoritative check. The
+    // helper must never claim a plausible channel JID is dead.
+    expect(isKnownUndeliverableJid('typo-unmapped-jid')).toBe(false);
+  });
+});
+
+// --- resolveChannelJidForFolder (folder -> registered channel JID) ---
+
+describe('resolveChannelJidForFolder', () => {
+  it('resolves a folder to its registered channel JID', () => {
+    expect(
+      resolveChannelJidForFolder(
+        {
+          'msteams:a:owner': { folder: 'atlas_teams' },
+          'dc:123': { folder: 'discord_general' },
+        },
+        'atlas_teams',
+      ),
+    ).toBe('msteams:a:owner');
+  });
+
+  it('skips dispatch aliases and retired rows for the same folder', () => {
+    expect(
+      resolveChannelJidForFolder(
+        {
+          'dispatch:atlas_gpg': { folder: 'atlas_gpg' },
+          'tg:999': { folder: 'atlas_gpg' },
+          'msteams:a:gpg': { folder: 'atlas_gpg' },
+        },
+        'atlas_gpg',
+      ),
+    ).toBe('msteams:a:gpg');
+  });
+
+  it('returns undefined when the folder has only undeliverable rows', () => {
+    expect(
+      resolveChannelJidForFolder(
+        { 'dispatch:atlas_gpg': { folder: 'atlas_gpg' } },
+        'atlas_gpg',
+      ),
+    ).toBe(undefined);
+  });
+
+  it('returns undefined when no row has the folder', () => {
+    expect(resolveChannelJidForFolder({}, 'atlas_orphan')).toBe(undefined);
+  });
+
+  it('tie-break is deterministic — insertion order never changes the winner', () => {
+    // Two stale-extra rows for one folder (transient in-memory state): the
+    // lexicographically-smallest JID must win regardless of object insertion
+    // order, mirroring selectLiveMain's jid tie-break.
+    const aFirst = {
+      'msteams:a:aaa': { folder: 'atlas_x' },
+      'msteams:a:bbb': { folder: 'atlas_x' },
+    };
+    const bFirst = {
+      'msteams:a:bbb': { folder: 'atlas_x' },
+      'msteams:a:aaa': { folder: 'atlas_x' },
+    };
+    expect(resolveChannelJidForFolder(aFirst, 'atlas_x')).toBe('msteams:a:aaa');
+    expect(resolveChannelJidForFolder(bFirst, 'atlas_x')).toBe('msteams:a:aaa');
+  });
+});
+
+// --- resolveSeedTarget (seed-orchestrator target resolution) ---
+
+describe('resolveSeedTarget', () => {
+  const rows = [
+    { jid: 'tg:7322433447', folder: 'main', isMain: true },
+    { jid: 'msteams:a:owner', folder: 'atlas_teams', isMain: true },
+    { jid: 'dispatch:atlas_gpg', folder: 'atlas_gpg', isMain: false },
+    { jid: 'msteams:a:side', folder: 'atlas_side', isMain: false },
+  ];
+
+  it('explicit path: resolves a registered channel JID with ITS folder', () => {
+    expect(resolveSeedTarget(rows, 'msteams:a:side')).toEqual({
+      ok: true,
+      jid: 'msteams:a:side',
+      folder: 'atlas_side',
+    });
+  });
+
+  it('explicit path: rejects an unregistered JID', () => {
+    const result = resolveSeedTarget(rows, 'msteams:a:nope');
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toContain('not a registered group JID');
+    }
+  });
+
+  it('explicit path: rejects a registered retired-channel JID', () => {
+    // Wave-2 round-2 finding 2: "registered" is not "deliverable".
+    const result = resolveSeedTarget(rows, 'tg:7322433447');
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toContain('knowably');
+    }
+  });
+
+  it('explicit path: rejects a registered dispatch: alias', () => {
+    // Wave-2 round-3 finding 1: the alias is registered but no outbound
+    // channel owns the prefix — the digest would run and never deliver.
+    const result = resolveSeedTarget(rows, 'dispatch:atlas_gpg');
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toContain('knowably');
+    }
+  });
+
+  it('default path: selects the live main with ITS folder, never a constant', () => {
+    // Wave-2 round-0/round-1 findings: the seeder hard-coded atlas_main and
+    // took WHERE is_main=1 LIMIT 1. The resolver must return the live main
+    // row's own folder (the VPS reality: live main lives in atlas_teams).
+    expect(resolveSeedTarget(rows)).toEqual({
+      ok: true,
+      jid: 'msteams:a:owner',
+      folder: 'atlas_teams',
+    });
+  });
+
+  it('default path: fails closed when every main row is undeliverable', () => {
+    const result = resolveSeedTarget([
+      { jid: 'tg:7322433447', folder: 'main', isMain: true },
+      { jid: 'dispatch:atlas_gpg', folder: 'atlas_gpg', isMain: true },
+    ]);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toContain('no live main group');
+    }
+  });
+
+  it('default path: fails closed on an empty registry', () => {
+    expect(resolveSeedTarget([]).ok).toBe(false);
+  });
+});
+
+// --- selectLiveMain alias exclusion (al22 reland, commit-review round 1) ---
+
+describe('selectLiveMain dispatch-alias exclusion', () => {
+  it('never selects a dispatch: alias row, even as the only candidate', () => {
+    // setRegisteredGroup now rejects promoting one, but a legacy/hand-edited
+    // row must not win selection in any runtime mirror (host-executor.py and
+    // create-group.sh carry the same filter in lockstep).
+    expect(
+      selectLiveMainJid([{ jid: 'dispatch:atlas_gpg', folder: 'atlas_gpg' }]),
+    ).toBe(undefined);
+    expect(
+      selectLiveMainJid([
+        { jid: 'dispatch:atlas_gpg', folder: 'main' },
+        { jid: 'msteams:a:owner', folder: 'atlas_teams' },
+      ]),
+    ).toBe('msteams:a:owner');
+  });
+});
+
 // --- loadState single-live-main normalization ---
 
 describe('loadState single-live-main normalization', () => {
   it('durably demotes a sole retired-channel main (the 2026-06-11 VPS state)', () => {
     // A legacy Telegram main row survives the Teams migration as the only
     // is_main=1 row. Every DB-reading alert path would mis-route to it.
+    // Seeded via the unchecked test helper: setRegisteredGroup now REJECTS
+    // promoting a knowably-undeliverable JID to main (write-layer invariant),
+    // but real pre-invariant DBs contain exactly this row — loadState must
+    // still normalize it.
     setRegisteredGroup('tg:7322433447', {
       name: 'Telegram Main (dead)',
       folder: 'main',
       trigger: '@Atlas',
       added_at: '2024-01-01T00:00:00.000Z',
-      isMain: true,
     });
+    _setGroupIsMainUnchecked('tg:7322433447');
 
     _loadState();
 
@@ -312,13 +497,15 @@ describe('ensureOwnerMainGroup', () => {
       added_at: '2024-01-02T00:00:00.000Z',
       requiresTrigger: false,
     });
+    // Legacy pre-invariant row: seeded via the unchecked test helper because
+    // setRegisteredGroup now rejects undeliverable-JID main promotion.
     setRegisteredGroup('tg:7322433447', {
       name: 'Telegram Main (dead)',
       folder: 'main',
       trigger: '@Atlas',
       added_at: '2024-01-01T00:00:00.000Z',
-      isMain: true,
     });
+    _setGroupIsMainUnchecked('tg:7322433447');
 
     _loadState(); // demotes the dead Telegram main
     ensureOwnerMainGroup('msteams:a:owner'); // next owner message

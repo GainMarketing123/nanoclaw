@@ -468,6 +468,16 @@ AUTH_ERROR_PATTERNS = ["authentication_error", "OAuth token has expired", "401",
 # must skip such rows even when they still carry is_main=1 in the DB (the live
 # "No channel for JID: tg:7322433447" mis-route from the 2026-06-11 trace).
 RETIRED_CHANNEL_JID_PREFIXES = ("tg:",)
+# JID prefixes of LOGICAL aliases no outbound channel ever owns (the bridge's
+# dispatch:{folder} form). Mirror of NON_CHANNEL_JID_PREFIXES /
+# isKnownUndeliverableJid in src/router.ts — keep in lockstep (al22 reland
+# spec, commit-review round 1: setRegisteredGroup now rejects promoting such
+# a row to is_main, but a legacy/hand-edited row must not win live-main
+# selection in ANY runtime mirror).
+NON_CHANNEL_JID_PREFIXES = ("dispatch:",)
+KNOWN_UNDELIVERABLE_JID_PREFIXES = (
+    RETIRED_CHANNEL_JID_PREFIXES + NON_CHANNEL_JID_PREFIXES
+)
 OUTAGE_ERROR_PATTERNS = [
     "500 internal server error", "502 bad gateway", "503 service",
     "529", "overloaded", "connection refused", "connection reset",
@@ -982,9 +992,11 @@ def select_live_main_row(rows):
     diverged from the TypeScript folder-priority rule, so with multiple live
     legacy mains host alerts could target a different chat than the
     orchestrator considers canonical):
-      - retired-channel JIDs are NEVER eligible (a retired JID cannot
-        deliver — the live "No channel for JID: tg:…" mis-route from the
-        2026-06-11 trace);
+      - KNOWABLY-UNDELIVERABLE JIDs are NEVER eligible: retired channels (a
+        retired JID cannot deliver — the live "No channel for JID: tg:…"
+        mis-route from the 2026-06-11 trace) and logical dispatch: aliases
+        (no outbound channel ever owns the prefix; isKnownUndeliverableJid
+        in src/router.ts is the TS twin of this filter);
       - among live rows the canonical folder == 'main' wins (the row the
         schema migration promotes);
       - else the live row with the lexicographically-smallest jid. The jid
@@ -996,7 +1008,9 @@ def select_live_main_row(rows):
       - None when no live candidate exists — callers must treat that as
         "no main group", never fall back to a retired JID.
     """
-    live = [r for r in rows if not r[0].startswith(RETIRED_CHANNEL_JID_PREFIXES)]
+    live = [
+        r for r in rows if not r[0].startswith(KNOWN_UNDELIVERABLE_JID_PREFIXES)
+    ]
     if not live:
         return None
     return min(live, key=lambda r: (0 if r[1] == "main" else 1, r[0]))
