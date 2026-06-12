@@ -27,9 +27,8 @@ Brand voices for reference:
 
 Never mix brand voices between entities. A request for an entity outside
 your group's scope is OUT OF SCOPE — do not attempt it, even partially.
-Follow your group's Escalation Rules (write the escalation file and send
-the CEO a real-time alert), then point the requester to the main Atlas
-channel.
+Follow your group's Escalation Rules (write the escalation file so the
+CEO sees it), then point the requester to the main Atlas channel.
 
 ### Channels by Entity
 

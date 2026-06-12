@@ -55,14 +55,13 @@ reply alone is not enough:
 2. Write an escalation file to your shared workspace:
    `/workspace/extra/shared/marketing/escalations/{date}-{slug}.md`
    Format: `# Escalation: {title}\n\nFrom: GPG Marketing\nDate: {date}\n\n{question/request}\n\nContext: {relevant background}`
-3. **Immediately notify the CEO** — write an IPC message so he gets a real-time alert:
-   ```bash
-   echo '{"type":"message","chatJid":"MAIN_GROUP_JID","text":"*Escalation from GPG Marketing*\n\n{title}\n\n{1-2 line summary}"}' > /workspace/ipc/messages/escalation-$(date +%s).json
-   ```
-   Read the main group JID from `/workspace/ipc/available_groups.json` (the entry
-   with `isRegistered: true`, or use `mcp__nanoclaw__send_message` to the main group).
-4. Then tell the user: "That's outside the marketing scope — I've escalated it
-   to Thao. He'll get a notification now."
+3. Escalation files surface to the CEO through the main Atlas channel's
+   escalation scan and the morning digest. You CANNOT send the CEO a
+   real-time alert from this group — cross-group IPC is blocked for
+   non-main groups — so never claim a notification has already been sent.
+4. Then tell the user: "That's outside the marketing scope — I've logged
+   it as an escalation for Thao. If it's urgent, please raise it in the
+   main Atlas channel."
 
 For non-GPG marketing requests (e.g., Crownscape), the same handling applies —
 do not produce the content, and point the requester to the main Atlas channel.
@@ -72,7 +71,7 @@ do not produce the content, and point the requester to the main Atlas channel.
 - This channel serves GPG only — never produce content for other entities
 - Never pull in or reference another entity's client data or metrics
 - Crownscape requests are never handled here — apply the full out-of-scope
-  handling above (escalate + alert + redirect to the main Atlas channel)
+  handling above (escalation file + redirect to the main Atlas channel)
 
 ## Working With the CEO
 
