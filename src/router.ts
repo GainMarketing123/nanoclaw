@@ -97,7 +97,18 @@ export function isRetiredChannelJid(jid: string): boolean {
  * PREFIXES there must stay in lockstep with this file).
  *
  * Among live candidates the canonical `folder === 'main'` row wins (that is
- * the row the schema migration promotes), else the first encountered.
+ * the row the schema migration promotes), else the row with the
+ * lexicographically-smallest jid. The jid tie-break is load-bearing:
+ * candidates come from `SELECT … WHERE is_main = 1` with NO ORDER BY, and
+ * SQLite row order is undefined (it can change across a vacuum/rewrite).
+ * With two live mains whose folders are both ≠ 'main' (e.g. a legacy
+ * 'atlas_main' alongside 'atlas_teams'), a bare first-row fallback let each
+ * runtime mirror (this file, host/host-executor.py select_live_main_row,
+ * scripts/create-group.sh step 4) pick a DIFFERENT "main" — alerts emitted
+ * from one folder while the shared mount was patched onto another (codex
+ * 20924e0 finding 1). jid is registered_groups' primary key, so the
+ * (folder-rank, jid) order is total and every runtime computes the same
+ * winner from the same rows.
  * Returns undefined when NO live candidate exists — callers must treat that
  * as "no main group" rather than falling back to a retired JID.
  *
@@ -111,7 +122,14 @@ export function selectLiveMain<T extends { jid: string; folder?: string }>(
   candidates: T[],
 ): T | undefined {
   const live = candidates.filter((c) => !isRetiredChannelJid(c.jid));
-  return live.find((c) => c.folder === 'main') ?? live[0];
+  if (live.length === 0) return undefined;
+  // Deterministic total order: (folder === 'main' rank, then smallest jid).
+  return live.reduce((best, c) => {
+    const bestRank = best.folder === 'main' ? 0 : 1;
+    const cRank = c.folder === 'main' ? 0 : 1;
+    if (cRank !== bestRank) return cRank < bestRank ? c : best;
+    return c.jid < best.jid ? c : best;
+  });
 }
 
 export function selectLiveMainJid(

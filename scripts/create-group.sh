@@ -265,10 +265,14 @@ db = sqlite3.connect('${DB_PATH}')
 #      single-main normalization — a bare live[0] under SQLite's undefined
 #      row order could mutate a side row that later gets demoted, codex
 #      6859c4f finding 3);
-#   3. else the first live row.
+#   3. else the live row with the lexicographically-smallest jid — the same
+#      deterministic tie-break as selectLiveMain / select_live_main_row
+#      (codex 20924e0 finding 1: a bare first-row fallback let the three
+#      mirrors disagree on which chat is main when two live mains exist and
+#      neither folder is literally 'main').
 rows = db.execute('SELECT jid, folder, container_config FROM registered_groups WHERE is_main = 1').fetchall()
 live = [r for r in rows if not r[0].startswith(('tg:',))]
-row = next((r for r in live if r[1] == 'main'), live[0] if live else None)
+row = min(live, key=lambda r: (0 if r[1] == 'main' else 1, r[0])) if live else None
 if not row or not row[2]:
     print('  Warning: no live main group with a container config')
     db.close()

@@ -987,15 +987,19 @@ def select_live_main_row(rows):
         2026-06-11 trace);
       - among live rows the canonical folder == 'main' wins (the row the
         schema migration promotes);
-      - else the first live row encountered;
+      - else the live row with the lexicographically-smallest jid. The jid
+        tie-break is load-bearing (codex 20924e0 finding 1): rows come from
+        a SELECT with no ORDER BY and SQLite row order is undefined, so a
+        bare first-row fallback let this mirror disagree with the
+        TypeScript/shell mirrors about which chat is "the" main when two
+        live mains exist and neither folder is literally 'main';
       - None when no live candidate exists — callers must treat that as
         "no main group", never fall back to a retired JID.
     """
     live = [r for r in rows if not r[0].startswith(RETIRED_CHANNEL_JID_PREFIXES)]
-    for row in live:
-        if row[1] == "main":
-            return row
-    return live[0] if live else None
+    if not live:
+        return None
+    return min(live, key=lambda r: (0 if r[1] == "main" else 1, r[0]))
 
 
 def get_live_main_row():

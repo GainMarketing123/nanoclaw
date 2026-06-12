@@ -7,8 +7,9 @@
  *
  * Defaults:
  *   --chat-jid: reads from registered_groups where is_main=1 (live main).
- *     An explicit JID must itself be a registered group — the task's
- *     group_folder is resolved from its row, never assumed.
+ *     An explicit JID must itself be a registered group on a LIVE (non-
+ *     retired) channel — the task's group_folder is resolved from its row,
+ *     never assumed, and a retired-channel JID is rejected outright.
  *   --force: fully replace the existing orchestrator task (routing included)
  *
  * Run this on the VPS after Phase 3 deploy, or locally for testing.
@@ -19,7 +20,7 @@ import { CronExpressionParser } from 'cron-parser';
 import fs from 'fs';
 import path from 'path';
 
-import { selectLiveMain } from '../src/router.js';
+import { isRetiredChannelJid, selectLiveMain } from '../src/router.js';
 
 const TASK_ID = 'atlas-orchestrator-daily';
 const SCHEDULE_TYPE = 'cron';
@@ -135,13 +136,26 @@ if (!chatJid) {
   groupFolder = main.folder;
   console.log(`Found main group: ${chatJid} (folder ${groupFolder})`);
 } else {
-  // Explicit --chat-jid: resolve the task's group_folder from the registered
-  // row for that JID. The scheduler executes a task by matching
-  // task.group_folder against the registered groups' folders — NOT by
-  // chat_jid — so silently falling back to a hard-coded folder here seeded a
-  // permanently failing "Group not found" task whenever the JID's real
-  // folder differed (codex 6859c4f finding 2). An unregistered JID is
-  // rejected outright for the same reason: its task could never run.
+  // Explicit --chat-jid: must be DELIVERABLE, not merely registered. A
+  // retired-channel JID (e.g. the legacy Telegram main) can still hold a
+  // registered_groups row, and the default path is retirement-aware via
+  // selectLiveMain — so without this check the explicit path was the one
+  // remaining way to seed a task whose runs succeed but whose digest +
+  // auto-pause escalations are forwarded to a dead task.chat_jid
+  // (src/task-scheduler.ts) — a permanently black-holed morning briefing
+  // (codex 20924e0 finding 2).
+  if (isRetiredChannelJid(chatJid)) {
+    console.error(`--chat-jid ${chatJid} targets a retired channel; every digest delivery would silently fail.`);
+    console.error('Pass a live registered group JID, or omit --chat-jid to use the live main.');
+    process.exit(1);
+  }
+  // Resolve the task's group_folder from the registered row for that JID.
+  // The scheduler executes a task by matching task.group_folder against the
+  // registered groups' folders — NOT by chat_jid — so silently falling back
+  // to a hard-coded folder here seeded a permanently failing "Group not
+  // found" task whenever the JID's real folder differed (codex 6859c4f
+  // finding 2). An unregistered JID is rejected outright for the same
+  // reason: its task could never run.
   const row = db.prepare(
     'SELECT folder FROM registered_groups WHERE jid = ?'
   ).get(chatJid) as { folder: string } | undefined;

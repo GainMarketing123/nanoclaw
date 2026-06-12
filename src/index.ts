@@ -208,8 +208,11 @@ function loadState(): void {
   // next message on a live owner-gated channel re-promotes their chat via
   // ensureOwnerMainGroup below. Among live candidates the canonical
   // `folder === 'main'` row wins (the row the schema migration promotes:
-  // `UPDATE ... SET is_main = 1 WHERE folder = 'main'`), else the first
-  // encountered. Every other main is demoted in memory AND on disk.
+  // `UPDATE ... SET is_main = 1 WHERE folder = 'main'`), else the row with
+  // the lexicographically-smallest jid — a total order, so the survivor is
+  // the SAME row every runtime mirror picks regardless of SELECT row order
+  // (codex 20924e0 finding 1). Every other main is demoted in memory AND
+  // on disk.
   const mainEntries = Object.entries(registeredGroups)
     .filter(([, group]) => group.isMain)
     .map(([jid, group]) => ({ jid, folder: group.folder }));

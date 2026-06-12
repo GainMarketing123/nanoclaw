@@ -210,13 +210,38 @@ describe('selectLiveMainJid', () => {
     ).toBe('whatsapp-main@s.whatsapp.net');
   });
 
-  it('falls back to the first live candidate when none has folder "main"', () => {
+  it('falls back to the lexicographically-smallest jid when none has folder "main"', () => {
+    // NOT first-in-array: candidates come from a SELECT with no ORDER BY,
+    // so array order is SQLite row order — undefined, and not guaranteed to
+    // match what another runtime mirror sees (codex 20924e0 finding 1).
     expect(
       selectLiveMainJid([
         { jid: 'msteams:a:first', folder: 'atlas_teams' },
         { jid: 'dc:123', folder: 'discord_general' },
       ]),
-    ).toBe('msteams:a:first');
+    ).toBe('dc:123');
+  });
+
+  it('tie-break is deterministic — input order never changes the winner', () => {
+    // The round-2 review scenario: two live mains, neither folder literally
+    // 'main' (legacy 'atlas_main' alongside 'atlas_teams'). Every runtime
+    // (router.ts callers, host-executor.py, create-group.sh) must agree on
+    // one canonical row no matter what order the DB returns rows in.
+    const a = { jid: 'msteams:a:teams', folder: 'atlas_teams' };
+    const b = { jid: 'whatsapp-x@s.whatsapp.net', folder: 'atlas_main' };
+    expect(selectLiveMainJid([a, b])).toBe('msteams:a:teams');
+    expect(selectLiveMainJid([b, a])).toBe('msteams:a:teams');
+  });
+
+  it('canonical folder "main" beats a smaller jid', () => {
+    // Folder rank dominates the jid tie-break — the schema migration
+    // promotes folder='main', so that row stays the survivor everywhere.
+    expect(
+      selectLiveMainJid([
+        { jid: 'aaa@s.whatsapp.net', folder: 'atlas_main' },
+        { jid: 'zzz@s.whatsapp.net', folder: 'main' },
+      ]),
+    ).toBe('zzz@s.whatsapp.net');
   });
 
   it('returns undefined for an empty candidate list', () => {
