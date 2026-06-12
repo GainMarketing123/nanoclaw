@@ -6,8 +6,10 @@
  *   tsx scripts/seed-orchestrator.ts [--chat-jid <jid>] [--force]
  *
  * Defaults:
- *   --chat-jid: reads from registered_groups where is_main=1
- *   --force: replace existing orchestrator task if one exists
+ *   --chat-jid: reads from registered_groups where is_main=1 (live main).
+ *     An explicit JID must itself be a registered group — the task's
+ *     group_folder is resolved from its row, never assumed.
+ *   --force: fully replace the existing orchestrator task (routing included)
  *
  * Run this on the VPS after Phase 3 deploy, or locally for testing.
  */
@@ -20,12 +22,6 @@ import path from 'path';
 import { selectLiveMain } from '../src/router.js';
 
 const TASK_ID = 'atlas-orchestrator-daily';
-// Fallback only — when the main group can be resolved from the DB, the task
-// is seeded under the LIVE main group's folder (a task whose group_folder
-// names an unregistered folder never runs: the scheduler resolves the group
-// by folder). Used solely for the explicit --chat-jid path where no main row
-// is consulted.
-const FALLBACK_GROUP_FOLDER = 'atlas_main';
 const SCHEDULE_TYPE = 'cron';
 const SCHEDULE_VALUE = '0 6 * * *'; // 6AM daily
 const TIMEZONE = process.env.TZ || 'America/New_York';
@@ -124,7 +120,7 @@ const db = new Database(dbPath);
 // hard-coded 'atlas_main' folder produces a permanently failing "Group not
 // found" task whenever the live main lives in another folder (e.g. the VPS
 // Teams main in 'atlas_teams').
-let groupFolder = FALLBACK_GROUP_FOLDER;
+let groupFolder: string;
 if (!chatJid) {
   const mains = db.prepare(
     'SELECT jid, folder FROM registered_groups WHERE is_main = 1'
@@ -138,6 +134,24 @@ if (!chatJid) {
   chatJid = main.jid;
   groupFolder = main.folder;
   console.log(`Found main group: ${chatJid} (folder ${groupFolder})`);
+} else {
+  // Explicit --chat-jid: resolve the task's group_folder from the registered
+  // row for that JID. The scheduler executes a task by matching
+  // task.group_folder against the registered groups' folders — NOT by
+  // chat_jid — so silently falling back to a hard-coded folder here seeded a
+  // permanently failing "Group not found" task whenever the JID's real
+  // folder differed (codex 6859c4f finding 2). An unregistered JID is
+  // rejected outright for the same reason: its task could never run.
+  const row = db.prepare(
+    'SELECT folder FROM registered_groups WHERE jid = ?'
+  ).get(chatJid) as { folder: string } | undefined;
+  if (!row) {
+    console.error(`--chat-jid ${chatJid} is not in registered_groups; register the group first.`);
+    console.error('(The scheduler resolves tasks by the registered group folder, so a task seeded against an unregistered JID never runs.)');
+    process.exit(1);
+  }
+  groupFolder = row.folder;
+  console.log(`Resolved group folder for ${chatJid}: ${groupFolder}`);
 }
 
 // Check if task already exists
@@ -157,11 +171,27 @@ const nextRun = interval.next().toISOString();
 
 // Upsert the task
 if (existing) {
+  // A --force reseed must be a TRUE replace. The point of reseeding is to
+  // move the task off a stale group_folder / retired-channel chat_jid, so an
+  // update that only touched prompt/schedule/next_run left the old routing
+  // in place: the scheduler kept resolving the stale folder ("Group not
+  // found") and any dead-channel chat_jid stayed live (codex 6859c4f
+  // finding 1). Rewrite every column the INSERT sets except created_at.
   db.prepare(`
     UPDATE scheduled_tasks
-    SET prompt = ?, schedule_value = ?, next_run = ?, status = 'active'
+    SET group_folder = ?, chat_jid = ?, prompt = ?, schedule_type = ?,
+        schedule_value = ?, context_mode = ?, next_run = ?, status = 'active'
     WHERE id = ?
-  `).run(ORCHESTRATOR_PROMPT, SCHEDULE_VALUE, nextRun, TASK_ID);
+  `).run(
+    groupFolder,
+    chatJid,
+    ORCHESTRATOR_PROMPT,
+    SCHEDULE_TYPE,
+    SCHEDULE_VALUE,
+    'isolated', // Fresh context each run — no session carryover
+    nextRun,
+    TASK_ID,
+  );
   console.log(`Updated existing orchestrator task.`);
 } else {
   db.prepare(`

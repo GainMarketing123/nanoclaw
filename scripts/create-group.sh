@@ -254,21 +254,28 @@ python3 -c "
 import sqlite3, json
 
 db = sqlite3.connect('${DB_PATH}')
-# Retirement-aware main lookup (mirror of RETIRED_CHANNEL_JID_PREFIXES in
-# src/router.ts — keep in lockstep): a legacy retired-channel row (e.g. a
-# Telegram main left behind by the Teams migration) may still carry
-# is_main=1; writing the shared mount onto that dead row would silently
-# leave the LIVE main without shared-workspace access.
-rows = db.execute('SELECT jid, container_config FROM registered_groups WHERE is_main = 1').fetchall()
+# Live-main lookup — EXACT mirror of selectLiveMain in src/router.ts (and
+# select_live_main_row in host/host-executor.py); keep all three in lockstep:
+#   1. retired-channel JIDs are NEVER eligible (prefixes mirror
+#      RETIRED_CHANNEL_JID_PREFIXES — e.g. a legacy Telegram main row left
+#      behind by the Teams migration may still carry is_main=1, and writing
+#      the shared mount onto that dead row would silently leave the LIVE
+#      main without shared-workspace access);
+#   2. among live rows, folder == 'main' wins (the row loadState() keeps in
+#      single-main normalization — a bare live[0] under SQLite's undefined
+#      row order could mutate a side row that later gets demoted, codex
+#      6859c4f finding 3);
+#   3. else the first live row.
+rows = db.execute('SELECT jid, folder, container_config FROM registered_groups WHERE is_main = 1').fetchall()
 live = [r for r in rows if not r[0].startswith(('tg:',))]
-row = live[0] if live else None
-if not row or not row[1]:
+row = next((r for r in live if r[1] == 'main'), live[0] if live else None)
+if not row or not row[2]:
     print('  Warning: no live main group with a container config')
     db.close()
     exit(0)
 
 main_jid = row[0]
-config = json.loads(row[1])
+config = json.loads(row[2])
 mounts = config.get('additionalMounts', [])
 
 # Check if shared workspace mount already exists
