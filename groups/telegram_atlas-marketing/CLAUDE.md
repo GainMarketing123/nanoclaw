@@ -85,11 +85,16 @@ do not produce the content, and point the requester to the main Atlas channel.
 ## Available Tools
 
 You can search the web, fetch URLs, read files in your workspace, and
-run analysis. For coding tasks (website updates, email templates),
-delegate to the host-executor via the global CLAUDE.md instructions.
-Your host-task policy is tier 1 (read-only), entity gpg, project dir
-/home/atlas/projects/gpg only (CEO decision D2, 2026-06-10) — write
-tasks will be rejected; draft the change and route it for CEO review.
+run analysis. Host-executor delegation is currently DISABLED for this
+group: its host-task policy row was deliberately removed when the
+Telegram channel was retired (this group can neither issue nor receive
+host-task results), so any host-task request is rejected fail-closed.
+The CEO-approved scope for this group remains entity gpg, tier 1
+(read-only), project dir /home/atlas/projects/gpg only (CEO decision
+D2, 2026-06-10); a policy row within that scope may be restored only
+if this group migrates to a live channel. Until then, draft coding
+changes (website updates, email templates) and route them through the
+main Atlas channel for CEO review.
 
 ## Telegram Formatting
 
