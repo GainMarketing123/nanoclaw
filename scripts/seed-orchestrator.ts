@@ -34,10 +34,24 @@ const SCHEDULE_VALUE = '0 6 * * *'; // 6AM daily
 const CONTEXT_MODE = 'isolated'; // Fresh context each run — no session carryover
 const TIMEZONE = process.env.TZ || 'America/New_York';
 
+// Prompt rewritten 2026-06-12 per the briefing stale-content audit
+// (~/.atlas/capture/briefing-stale-content-audit-2026-06-12.md): the previous
+// generation pointed every old-Atlas state file at /workspace/extra/atlas-state/
+// — which, post-be97e23, is the per-group GOVERNANCE dir (only audit/ and
+// autonomy/ exist there) — and carried retired concepts (mode kill-switch,
+// graduation milestones, evolution-log friction retros, the quiet-log check),
+// so the 06:00 container briefing alarmed on "missing" files that live
+// elsewhere or nowhere. Current mount design: gov dir RW at
+// /workspace/extra/atlas-state; ~/.atlas read-only at /home/node/.atlas;
+// entity profiles NOT mounted.
+// NOTE: the live VPS scheduled_tasks row stores the prompt VERBATIM — this
+// rewrite changes nothing on the VPS until the CEO-gated re-seed
+// (npx tsx scripts/seed-orchestrator.ts --force).
 const ORCHESTRATOR_PROMPT = `[ORCHESTRATOR — Daily Morning Digest]
 
-You are Atlas running the daily 6AM orchestrator task. Your job: gather system state
-across all entities and produce a concise morning briefing for the CEO via Teams.
+You are Atlas running the daily 6AM orchestrator task. Your job: gather the system
+state visible from this container and produce a concise morning briefing for the
+CEO via Teams.
 
 *Step 1: Preflight* (governance module handles this — if you're reading this, you passed)
 
@@ -45,21 +59,15 @@ across all entities and produce a concise morning briefing for the CEO via Teams
 
 Read these files and summarize what you find:
 
-1. Mode: /workspace/extra/atlas-state/state/mode.json
-2. Graduation: /workspace/extra/atlas-state/autonomy/graduation-status.json
-3. Quota: /workspace/extra/atlas-state/autonomy/quota-tracking.jsonl (today's entries)
-4. Learning log: /workspace/extra/atlas-state/autonomy/learning-log.jsonl (last 24h)
-5. Approval queue: list files in /workspace/extra/atlas-state/approval-queue/pending/
-6. Audit logs: /workspace/extra/atlas-state/audit/ (each entity subfolder, today's file)
-7. Entity profiles: /workspace/extra/atlas-entities/ (read entity-profile.md for each)
-8. Agent performance: /workspace/extra/atlas-state/agent-performance/ (if exists)
-9. Evolution log: /workspace/extra/atlas-state/evolution-log.jsonl (all entries since last retro — check /workspace/extra/atlas-state/state/last-retro-marker.json for cutoff, or use last 7 days if no marker)
-10. Session count: /workspace/extra/atlas-state/hook-health/session-start.jsonl (count entries in last 7 days — this is how many CEO sessions happened)
-11. System health: /workspace/extra/atlas-state/state/system-health.json (check for CRITICAL or WARNING status)
+1. Quota: /workspace/extra/atlas-state/autonomy/quota-tracking.jsonl (today's entries; the calibration file is created lazily after a first rate-limit — its absence is normal)
+2. Learning log (this group): /workspace/extra/atlas-state/autonomy/learning-log.jsonl (last 24h)
+3. Approval queue: list files in /home/node/.atlas/approval-queue/pending/
+4. Audit logs: /workspace/extra/atlas-state/audit/ (each subfolder, today's file)
+5. Agent performance: /home/node/.atlas/agent-performance/ (read-only; written on the CEO's laptop and synced with lag — zero recent entries means "not visible from this host", never "failing")
+6. System health: /home/node/.atlas/state/system-health.json (flag CRITICAL/WARNING only)
+7. Entity profiles: NOT mounted in this container today. Say "entity status not visible from this container" — do not report entities as missing or unhealthy.
 
 If a file doesn't exist, note it briefly and move on. Don't error out.
-
-*Quiet-log check:* Compare session count (item 10) vs evolution log entries (item 9). If 5+ sessions happened but 0 friction events were logged, flag it: "Evolution log silent during N sessions — possible logging failure." This is important because a broken stop hook produces zero friction events, making everything look healthy when enforcement is actually dead.
 
 *Step 3: Produce the digest*
 
@@ -68,22 +76,13 @@ Format for chat delivery (no markdown headings — use *bold* for sections):
 *Morning Briefing — {today's date}*
 
 *Needs Your Attention*
-{Pending approval items with context. Anomalies. Failures. Empty = "Nothing urgent."}
+{Pending approval items with context. Anomalies. Failures on positive evidence. CRITICAL/WARNING system health. Empty = "Nothing urgent."}
 
 *Overnight Activity*
 Sessions: {n} | Autonomous: {n} | Errors: {n}
 
 *Entity Status*
-- GPG: {healthy/watch/concern} — {1 line}
-- Crownscape: {healthy/watch/concern} — {1 line}
-
-*Graduation*
-Milestone: {current} | Progress: {key metric}
-
-*Evolution*
-{n} friction events since last retro ({n} MAJOR, {n} MINOR) | {quiet-log warning if applicable}
-{If 3+ events share a theme: "Recurring: {theme} ({n} times) — graduation candidate"}
-{If system-health.json shows CRITICAL: "System health: CRITICAL — {detail}"}
+{Entity profiles are not mounted in this container — write "entity status not visible from this container." Never report entities as missing or unhealthy on that basis.}
 
 *Quota*
 {n} invocations | {weighted} weighted | {status}
@@ -97,6 +96,7 @@ Rules:
 - Under 500 words
 - Quantified — real numbers, not vague
 - If data is missing, say "no data" not a paragraph explaining why
+- Never alarm on data that is merely not visible from this container; only flag failures on positive evidence
 - If everything is healthy, keep it short: "All systems nominal"
 - Priorities should reference actual pending work, not generic advice
 `;

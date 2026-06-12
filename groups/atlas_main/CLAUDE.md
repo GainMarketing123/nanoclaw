@@ -16,13 +16,13 @@ daily briefings, approval queue management, and CEO direct communication.
 
 When running as a scheduled task (6AM daily digest), you:
 
-1. Read all entity states from mounted directories
-2. Check graduation progress at /workspace/extra/atlas-state/autonomy/graduation-status.json
-3. Read agent performance logs at /workspace/extra/atlas-state/agent-performance/
+1. Read quota status from /workspace/extra/atlas-state/autonomy/quota-tracking.jsonl (the calibration file is created lazily after a first rate-limit — its absence is normal)
+2. Read this group's learning log at /workspace/extra/atlas-state/autonomy/learning-log.jsonl
+3. Check the approval queue at /home/node/.atlas/approval-queue/pending/
 4. Summarize audit activity from /workspace/extra/atlas-state/audit/
-5. Check the approval queue at /workspace/extra/atlas-state/approval-queue/pending/
-6. Read quota status from /workspace/extra/atlas-state/autonomy/quota-tracking.jsonl
-7. Check mode at /workspace/extra/atlas-state/state/mode.json
+5. Read agent performance at /home/node/.atlas/agent-performance/ (read-only; written on the CEO's laptop and synced with lag — zero recent entries means "not visible from this host", never "failing")
+6. Check system health at /home/node/.atlas/state/system-health.json (flag CRITICAL/WARNING only)
+7. Entity profiles are NOT mounted in this container — report "entity status not visible from this container", never as missing or unhealthy
 
 Produce a morning digest following this format:
 
@@ -35,12 +35,7 @@ Produce a morning digest following this format:
 Sessions: {n} | Autonomous: {n} | Errors: {n}
 
 **Entity Status**
-- GPG (Gain PM + WorkSite Pros): {healthy/watch/concern} — {1 sentence}
-- Crownscape (Wise GD + future Crownscape LLC): {healthy/watch/concern} — {1 sentence}
-- WiseStream (parent + Gain RE 1): {healthy/watch/concern} — {1 sentence}
-
-**Graduation**
-Current milestone: {Mx} | Progress: {summary}
+{Entity profiles are not mounted in this container — write "entity status not visible from this container." Never report entities as missing or unhealthy on that basis.}
 
 **Quota**
 {n} invocations | {weighted} weighted | {normal/throttled/paused}
@@ -57,7 +52,8 @@ Current milestone: {Mx} | Progress: {summary}
 {Include escalations prominently:}
 Escalations pending: {n} — {1-line each with department and topic}
 
-Keep it under 500 words. Quantified. No fluff.
+Keep it under 500 words. Quantified. No fluff. Never alarm on data that is
+merely not visible from this container; only flag failures on positive evidence.
 
 ## Message Formatting
 
@@ -79,10 +75,13 @@ When you receive a coding task that involves modifying project files:
 ## Cross-Entity Access
 
 As the main group, you can:
-- Read all entity profiles at /workspace/extra/atlas-state/entities/
-- Read all agent definitions at /workspace/extra/atlas-state/agents/
+- Read all agent definitions at /home/node/.atlas/agents/ (read-only)
 - Send messages to any registered group via mcp__nanoclaw__send_message
 - Schedule tasks for any group via IPC
+
+Entity profiles are NOT mounted in this container today — when asked about
+entity state, say "entity status not visible from this container" rather than
+guessing or reporting entities as missing.
 
 You MUST NOT:
 - Share confidential data between entities without Tier 3 approval
@@ -91,7 +90,7 @@ You MUST NOT:
 
 ## Approval Queue
 
-Pending approvals are JSON files in /workspace/extra/atlas-state/approval-queue/pending/.
+Pending approvals are JSON files in /home/node/.atlas/approval-queue/pending/ (read-only mount).
 Each contains: id, entity, tier, action, summary, created_at.
 Present pending items in the morning digest with context.
 
@@ -206,15 +205,20 @@ CEO has FULL READ-WRITE access to all departments.
 
 ## Container Mounts
 
+Post-be97e23 mount design (the old "atlas-state = all of ~/.atlas, read-write"
+layout no longer exists):
+
 | Container Path | Host Path | Access |
 |----------------|-----------|--------|
 | /workspace/group | groups/atlas_main/ | read-write |
 | /workspace/global | groups/global/ | read-only |
-| /workspace/extra/atlas-state | ~/.atlas/ | read-write |
+| /workspace/extra/atlas-state | data/governance-state/atlas_main/ | read-write (per-group governance only: audit/, autonomy/) |
+| /home/node/.atlas | ~/.atlas/ | read-only |
 | /workspace/extra/shared | ~/.atlas/shared/ | read-write |
 | /workspace/extra/projects | /home/atlas/projects/ | read-only |
-| /workspace/extra/atlas-state/entities | ~/.atlas/entities/ | read-only (via atlas-state mount) |
-| /workspace/extra/atlas-state/agents | ~/.atlas/agents/ | read-only (via atlas-state mount) |
+
+Entity profiles (~/.atlas/entities) are a symlink whose target is NOT mounted —
+they are not visible from this container.
 
 ## Deployment Authorization Policy (CEO-DEFINED 2026-03-20)
 

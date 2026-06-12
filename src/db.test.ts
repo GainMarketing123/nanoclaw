@@ -823,9 +823,7 @@ describe('normalizeLegacyMigratedGroup (JSON->SQLite upgrade path)', () => {
     expect(normalized.isMain).toBeUndefined();
     expect(normalized.folder).toBe('main'); // everything else preserved
     // The normalized row passes the write-layer invariant — nothing drops.
-    expect(() =>
-      setRegisteredGroup('tg:7322433447', normalized),
-    ).not.toThrow();
+    expect(() => setRegisteredGroup('tg:7322433447', normalized)).not.toThrow();
     expect(getAllRegisteredGroups()['tg:7322433447']).toBeDefined();
   });
 
