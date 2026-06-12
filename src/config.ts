@@ -130,9 +130,18 @@ export const BRIDGE_CALLBACK_PORT = parseInt(
 
 // Health endpoint port — the orchestrator serves GET /health here so the
 // atlas-watchdog can detect an internally-wedged process (the message loop
-// stalled) that a bare `pgrep` still sees as "alive". Loopback-only; 3001 is
-// the credential proxy, 3002 the bridge callback.
-export const HEALTH_PORT = parsePositiveInt(process.env.HEALTH_PORT, 3003);
+// stalled) that a bare `pgrep` still sees as "alive". Loopback-only.
+//
+// Port map (VPS host): 3001 = credential proxy, 3002 = atlas-bridge callback,
+// 3003 = host-executor quality-check server (host/host-executor.py
+// QUALITY_CHECK_PORT — a POST-only Python handler that answers GET with 501).
+// The default here MUST NOT be 3003: the original 3003 default collided with
+// that server, so the orchestrator's health bind failed (best-effort: logged
+// and continued) and the watchdog's GET /health probe reached the
+// quality-check handler instead — the live "501 wrong-service-on-port"
+// finding from the 2026-06-11 trace. src/config.test.ts pins the defaults
+// pairwise-distinct so the collision cannot silently come back.
+export const HEALTH_PORT = parsePositiveInt(process.env.HEALTH_PORT, 3004);
 
 // How stale the message-loop heartbeat may get before /health reports 503.
 // Must sit comfortably above POLL_INTERVAL (2s) plus any in-loop await so a
