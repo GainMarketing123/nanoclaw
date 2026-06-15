@@ -119,6 +119,8 @@ const _loomEnv = readEnvFile([
   'SECOND_BRAIN_BASE_URL',
   'SECOND_BRAIN_API_KEY',
   'BRAIN_BASE_URL',
+  'ATLAS_SPACE_TOKEN',
+  'ATLAS_ALL_ACCESS_SECRET',
 ]);
 const LOOM_BRAIN = new SecondBrainClient(
   process.env.SECOND_BRAIN_BASE_URL ||
@@ -131,6 +133,12 @@ const LOOM_BRAIN = new SecondBrainClient(
     apiKey:
       process.env.SECOND_BRAIN_API_KEY ||
       _loomEnv.SECOND_BRAIN_API_KEY ||
+      undefined,
+    spaceToken:
+      process.env.ATLAS_SPACE_TOKEN || _loomEnv.ATLAS_SPACE_TOKEN || undefined,
+    allAccessSecret:
+      process.env.ATLAS_ALL_ACCESS_SECRET ||
+      _loomEnv.ATLAS_ALL_ACCESS_SECRET ||
       undefined,
   },
 );

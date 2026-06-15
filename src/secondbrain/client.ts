@@ -72,15 +72,24 @@ export class SecondBrainClient {
   private readonly baseUrl: string;
   private readonly timeoutMs: number;
   private readonly apiKey?: string;
+  private readonly spaceToken?: string;
+  private readonly allAccessSecret?: string;
 
   constructor(
     baseUrl: string,
-    opts: { timeoutMs?: number; apiKey?: string } = {},
+    opts: {
+      timeoutMs?: number;
+      apiKey?: string;
+      spaceToken?: string;
+      allAccessSecret?: string;
+    } = {},
   ) {
     // Normalize: strip a trailing slash so path concatenation is predictable.
     this.baseUrl = baseUrl.replace(/\/+$/, '');
     this.timeoutMs = opts.timeoutMs ?? 5000;
     this.apiKey = opts.apiKey;
+    this.spaceToken = opts.spaceToken;
+    this.allAccessSecret = opts.allAccessSecret;
   }
 
   /**
@@ -230,6 +239,12 @@ export class SecondBrainClient {
       }
       if (this.apiKey) {
         headers['X-Atlas-Ingest-Secret'] = this.apiKey;
+      }
+      if (this.spaceToken) {
+        headers['X-Atlas-Space-Token'] = this.spaceToken;
+      }
+      if (this.allAccessSecret) {
+        headers['X-Atlas-All-Access-Secret'] = this.allAccessSecret;
       }
 
       const req = transport.request(
