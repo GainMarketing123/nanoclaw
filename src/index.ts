@@ -1025,7 +1025,7 @@ async function main(): Promise<void> {
           channel
             ?.sendMessage(
               chatJid,
-              'Ask your courses something, e.g. "loom how do I write a hook?"',
+              'Ask your courses something, e.g. "loom how do I write a hook?" or "course how do I write a hook?"',
             )
             .catch((err) =>
               logger.error({ err, chatJid }, 'Loom usage hint send error'),

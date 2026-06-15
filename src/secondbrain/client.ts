@@ -57,15 +57,18 @@ interface RequestOutcome {
 const DEGRADED_OUTCOME: RequestOutcome = { envelope: null, degraded: true };
 
 /**
- * Parse a "loom" course-Q&A command. Pure (no network) so the regex lives in
- * one place and is unit-testable. Returns the question when the text is a loom
- * command, `''` when it is exactly "loom" with no question, and `null` when the
- * text is NOT a loom command (e.g. "I loom over the code").
+ * Parse a course-Q&A command. Pure (no network) so the regex lives in one
+ * place and is unit-testable. A LEADING `loom`, `course`, or `courses` word
+ * routes the rest of the text straight to the course brain. Returns the
+ * question when the text is such a command, `''` when it is exactly the
+ * trigger word with no question, and `null` when the text is NOT a trigger
+ * (e.g. "I loom over the code", "I took a course" — only a LEADING trigger
+ * counts). All triggers share the same strip/trim/case-insensitive semantics.
  */
 export function parseLoomQuestion(text: string): string | null {
   const trimmed = text.trim();
-  if (!/^loom\b/i.test(trimmed)) return null;
-  return trimmed.replace(/^loom\b[:,]?\s*/i, '').trim();
+  if (!/^(?:loom|courses?)\b/i.test(trimmed)) return null;
+  return trimmed.replace(/^(?:loom|courses?)\b[:,]?\s*/i, '').trim();
 }
 
 export class SecondBrainClient {
