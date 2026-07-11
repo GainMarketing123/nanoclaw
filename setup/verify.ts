@@ -12,6 +12,7 @@ import path from 'path';
 import Database from 'better-sqlite3';
 
 import { STORE_DIR } from '../src/config.js';
+import { detectAuthMode } from '../src/credential-proxy.js';
 import { readEnvFile } from '../src/env.js';
 import { logger } from '../src/logger.js';
 import {
@@ -144,62 +145,80 @@ export async function run(_args: string[]): Promise<void> {
 
   // 3. Check credentials
   //
-  // Codex 53ed80e F3 SOFT / c6ba137 F4 SOFT fix: align with runtime
-  // credential precedence in src/credential-proxy.ts:detectAuthMode and
-  // host/host-executor.py:_load_anthropic_api_key. Runtime auth loaders
-  // do NOT consult projectRoot/.env — including it as a verification
-  // source produced false successes when projectRoot/.env was stale
-  // but the runtime ignored it. The precedence below mirrors what the
-  // running services actually read; nothing else is a valid
-  // verification source.
+  // AUTHORITATIVE on the Claude Code OAuth credential FILE — the exact source
+  // the runtime inference paths read after the 2026-07-11 subscription cutover:
+  //   - host/host-executor.py:_load_oauth_token (the Haiku quality-check gate), and
+  //   - the credential proxy in OAuth mode
+  // both read claudeAiOauth.accessToken from $CLAUDE_CONFIG_DIR/.credentials.json,
+  // else $HOME/.claude/.credentials.json. Verify checks the SAME sources so a
+  // green verdict cannot diverge from runtime.
+  //
+  // The prior env / ATLAS_DIR/.env API-token checks (CLAUDE_CODE_OAUTH_TOKEN /
+  // ANTHROPIC_AUTH_TOKEN / the now-retired ANTHROPIC_API_KEY) are removed: none
+  // are read by the inference gate, so accepting them produced a green verify
+  // while every quality-check returned token_missing at runtime. The metered
+  // anthropic-api-key systemd LoadCredential source is likewise gone.
+  //
+  // OPERATOR CONTRACT: verify resolves $CLAUDE_CONFIG_DIR/$HOME from ITS OWN
+  // process env, which matches runtime only when run under the same identity
+  // (or the same overrides) as the services. On the VPS the services'
+  // effective credential root is /home/nanoclaw-he/.claude (atlas-user-split
+  // drop-in HOME= for the host-executor; oauth-shared-identity drop-in
+  // CLAUDE_CONFIG_DIR= for the orchestrator/proxy — see infra/systemd-dropins/).
+  // Run verify as root/another operator with
+  //   CLAUDE_CONFIG_DIR=/home/nanoclaw-he/.claude
+  // or its verdict describes the OPERATOR's credential, not the services'
+  // (same convention as host/refresh-claude-auth.sh, which passes
+  // CLAUDE_CONFIG_DIR explicitly to its post-write auth check).
+  //
+  // API-KEY MODE (codex review rounds 2+3 on the cutover branch — the two
+  // findings pull opposite ways; this is the synthesis): the runtime still
+  // supports api-key deployments for the PROXY/CONTAINER path —
+  // detectAuthMode() (imported from credential-proxy so the two can never
+  // drift) selects api-key mode whenever loadAnthropicApiKey() finds a key
+  // (the documented cutover ROLLBACK lever and the supported
+  // non-subscription mode). But the host quality-check gate
+  // (host/host-executor.py:_call_haiku) is subscription-OAuth-ONLY by CEO
+  // decision (2026-07-11 cutover — the metered key is never reintroduced
+  // there). A key WITHOUT an OAuth credential therefore runs containers
+  // fine while every CEO-facing quality check degrades to
+  // unavailable/token_missing — that is NOT a fully configured install, so
+  // verify stays FAIL-CLOSED: green requires the OAuth credential file.
+  // The api-key detection below exists to make the failure mode legible
+  // (named warning) instead of a bare credentials=missing, and to document
+  // the valid rollback shape: key present AND OAuth file present (proxy
+  // uses the key, quality gate uses OAuth) IS green — via the file check.
   let credentials = 'missing';
-  const credKeys = [
-    'CLAUDE_CODE_OAUTH_TOKEN',
-    'ANTHROPIC_AUTH_TOKEN',
-    'ANTHROPIC_API_KEY',
-  ];
-
-  // 3a. systemd LoadCredential — root-installed unit on VPS.
-  const credentialsDir = process.env.CREDENTIALS_DIRECTORY;
-  if (credentials === 'missing' && credentialsDir) {
-    const apiKeyFile = path.join(credentialsDir, 'anthropic-api-key');
-    if (fs.existsSync(apiKeyFile)) {
-      try {
-        if ((fs.readFileSync(apiKeyFile, 'utf-8') || '').trim()) {
-          credentials = 'configured';
-        }
-      } catch {
-        // unreadable — treat as missing for this source
+  const apiKeyMode = detectAuthMode() === 'api-key';
+  const oauthCredFiles = [
+    process.env.CLAUDE_CONFIG_DIR
+      ? path.join(process.env.CLAUDE_CONFIG_DIR, '.credentials.json')
+      : '',
+    path.join(homeDir, '.claude', '.credentials.json'),
+  ].filter(Boolean);
+  for (const credFile of oauthCredFiles) {
+    if (!fs.existsSync(credFile)) continue;
+    try {
+      const parsed = JSON.parse(fs.readFileSync(credFile, 'utf-8'));
+      const token = parsed?.claudeAiOauth?.accessToken;
+      if (typeof token === 'string' && token.trim()) {
+        credentials = 'configured';
+        break;
       }
+    } catch {
+      // unreadable / malformed JSON — treat as missing for this source
     }
   }
-
-  // 3b. Inherited process env (most operator workflows).
-  if (credentials === 'missing') {
-    if (credKeys.some((k) => (process.env[k] || '').trim())) {
-      credentials = 'configured';
-    }
-  }
-
-  // 3c. ATLAS_DIR/.env — Atlas-host-secrets contract used by the proxy
-  // for OAuth token + base URL when the systemd LoadCredential and
-  // process env paths are not in play. This is the LAST runtime source
-  // that the credential-proxy actually reads — projectRoot/.env was
-  // historically a fallback but is no longer consulted by runtime, so
-  // it is intentionally excluded from verification.
-  if (credentials === 'missing') {
-    const atlasDir = process.env.ATLAS_DIR || path.join(homeDir, '.atlas');
-    const atlasEnv = path.join(atlasDir, '.env');
-    if (fs.existsSync(atlasEnv)) {
-      try {
-        const c = fs.readFileSync(atlasEnv, 'utf-8');
-        if (new RegExp(`^(${credKeys.join('|')})=`, 'm').test(c)) {
-          credentials = 'configured';
-        }
-      } catch {
-        // unreadable
-      }
-    }
+  if (apiKeyMode && credentials !== 'configured') {
+    logger.warn(
+      { checkedOauthSources: oauthCredFiles },
+      'ANTHROPIC_API_KEY detected (proxy/container path would run in ' +
+        'api-key mode) but no Claude OAuth credential found. The host ' +
+        'quality-check gate is subscription-OAuth-only (2026-07-11 ' +
+        'cutover) and would return token_missing on every check — ' +
+        'credentials remain "missing" fail-closed. Provide the OAuth ' +
+        'credential file, or accept a dark quality gate knowingly.',
+    );
   }
 
   // 4. Check channel auth (detect configured channels by credentials)

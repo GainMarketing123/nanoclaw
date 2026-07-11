@@ -221,17 +221,31 @@ function saveCredentials(
     const tmpPath = `${credPath}.new.${process.pid}.${Date.now()}`;
     let targetUid: number | null = null;
     let targetGid: number | null = null;
+    // Subscription cutover 2026-07-11 (shared-identity Option A): preserve the
+    // existing file's MODE too, defaulting to 0600 only on first-time write.
+    // The shared credential is deliberately 0640 nanoclaw-he:atlas-svc so the
+    // proxy (running as nanoclaw-svc, Group=atlas-svc) can READ it; a
+    // hardcoded 0600 here would strip group-read on any successful save and
+    // lock the proxy out of its own credential on the next restart. Same
+    // preserve-mode contract as the :15/:45 auto-refresh cron's writer.
+    let targetMode = 0o600;
     try {
       const existingStat = fs.statSync(credPath);
       targetUid = existingStat.uid;
       targetGid = existingStat.gid;
+      targetMode = existingStat.mode & 0o777;
     } catch {
       // File doesn't exist yet — first-time write. uid/gid unset; the
       // rename will adopt the proxy process's defaults, which is correct
       // when there's no prior owner contract to preserve.
     }
     try {
-      fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), { mode: 0o600 });
+      fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), {
+        mode: targetMode,
+      });
+      // writeFileSync's mode is masked by the process umask at create;
+      // re-assert explicitly (umask-immune) so the preserved mode is exact.
+      fs.chmodSync(tmpPath, targetMode);
       if (targetUid !== null && targetGid !== null) {
         try {
           fs.chownSync(tmpPath, targetUid, targetGid);
@@ -569,6 +583,19 @@ export function startCredentialProxy(
   // ANTHROPIC_API_KEY uses the systemd → env → file precedence; .env-only
   // detection mis-classifies post-Phase-3.1 deployments (where the key only
   // exists at $CREDENTIALS_DIRECTORY/anthropic-api-key).
+  //
+  // POST-CUTOVER (2026-07-11): key-presence-selects-api-key-mode is KEPT
+  // deliberately. It is (a) the documented ROLLBACK lever for the
+  // subscription cutover — re-instating ANTHROPIC_API_KEY in exactly one
+  // source and restarting returns the deployment to metered mode with no
+  // code change — and (b) the supported auth mode for non-subscription
+  // deployments of this codebase. The cutover retires the key by REMOVING
+  // it from every live source (env, .env, LoadCredential), and the deploy
+  // verification sweeps for residue; a hard "ignore the key" gate here
+  // would break the rollback lever while only masking — not fixing — a
+  // stale-source hygiene failure. authMode is logged at startup
+  // ('Credential proxy started', authMode) precisely so an unexpected
+  // api-key mode is immediately visible.
   const apiKey = loadAnthropicApiKey();
   const authMode: AuthMode = apiKey ? 'api-key' : 'oauth';
   const envOauthToken =

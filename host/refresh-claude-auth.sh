@@ -25,6 +25,40 @@ BACKUP_FILE="$CLAUDE_HOME/.credentials.json.bak"
 
 echo "=== Atlas Claude Auth Refresh ==="
 
+# Shared-identity posture helper (CEO decision 2026-07-11, Option A): the
+# credential proxy runs as nanoclaw-svc with Group=atlas-svc and must be able
+# to group-READ the credential. Default posture for NEW credential files is
+# 0640 nanoclaw-he:atlas-svc. On a host without the atlas-svc group (non-VPS /
+# dev), fall back to the legacy private posture with a loud warning so a
+# fresh provision never silently leaves the proxy locked out where the group
+# exists, and never hard-fails where it legitimately doesn't.
+apply_shared_posture() {
+    if chown nanoclaw-he:atlas-svc "$1" 2>/dev/null; then
+        chmod 640 "$1"
+    else
+        echo "WARN: atlas-svc group unavailable — applying legacy 0600 nanoclaw-he:nanoclaw-he posture."
+        echo "      The credential proxy's shared-identity group-read will NOT work until this host is provisioned with atlas-svc."
+        chown nanoclaw-he:nanoclaw-he "$1"
+        chmod 600 "$1"
+    fi
+}
+
+# Capture the live credential's posture BEFORE any replacement so the
+# rollback path can restore the file exactly as it was (mode AND owner:group
+# — a 0640 nanoclaw-he:atlas-svc shared credential must not come back from a
+# failed refresh as 0600 nanoclaw-he:nanoclaw-he, which the credential proxy
+# cannot read).
+ORIG_POSTURE_CAPTURED=false
+ORIG_MODE=""
+ORIG_USER=""
+ORIG_GROUP=""
+if [ -f "$CREDS_FILE" ]; then
+    ORIG_MODE=$(stat -c '%a' "$CREDS_FILE")
+    ORIG_USER=$(stat -c '%U' "$CREDS_FILE")
+    ORIG_GROUP=$(stat -c '%G' "$CREDS_FILE")
+    ORIG_POSTURE_CAPTURED=true
+fi
+
 # Backup existing credentials
 if [ -f "$CREDS_FILE" ]; then
     cp "$CREDS_FILE" "$BACKUP_FILE"
@@ -34,8 +68,23 @@ fi
 # Check if credentials were provided via stdin (pipe mode)
 if [ ! -t 0 ]; then
     echo "Reading credentials from stdin..."
-    # Phase 3.2: ensure the .claude directory exists and is owned by nanoclaw-he
-    install -d -m 0755 -o nanoclaw-he -g nanoclaw-he "$CLAUDE_HOME"
+    # Phase 3.2: ensure the .claude directory exists and is owned by nanoclaw-he.
+    # Subscription cutover 2026-07-11 (shared-identity Option A): only create
+    # when MISSING — `install -d` on an existing dir re-applies mode+owner,
+    # which would strip the live setgid/atlas-svc group posture (2750
+    # nanoclaw-he:atlas-svc) that grants the credential proxy group-read
+    # traversal. An existing dir's posture is provisioning-owned; leave it.
+    if [ ! -d "$CLAUDE_HOME" ]; then
+        # Fresh provision: create with the shared-identity traversal posture
+        # (2750 nanoclaw-he:atlas-svc — group r-x lets the proxy reach the
+        # file; setgid makes future files inherit the atlas-svc group).
+        # Legacy 0755 private-group fallback when atlas-svc is absent.
+        if getent group atlas-svc >/dev/null 2>&1; then
+            install -d -m 2750 -o nanoclaw-he -g atlas-svc "$CLAUDE_HOME"
+        else
+            install -d -m 0755 -o nanoclaw-he -g nanoclaw-he "$CLAUDE_HOME"
+        fi
+    fi
 
     # Codex 8ac9c6c F2 BLOCKING fix: write to a temp file in the same
     # directory then atomic-rename into place. The prior `cat > "$CREDS_FILE"`
@@ -57,8 +106,19 @@ if [ ! -t 0 ]; then
         echo "ERROR: stdin credentials are not valid JSON. Aborting."
         exit 1
     fi
-    chmod 600 "$TMP_CREDS"
-    chown nanoclaw-he:nanoclaw-he "$TMP_CREDS"
+    # Preserve the live file's mode+ownership when it exists (shared-identity
+    # posture is 0640 nanoclaw-he:atlas-svc — a hardcoded 600/nanoclaw-he
+    # group here would strip the proxy's group-read until the next :15/:45
+    # refresher tick re-asserts it). A FIRST-TIME write gets the shared
+    # posture directly (0640 nanoclaw-he:atlas-svc, legacy fallback inside
+    # the helper) — a fresh provision must not start with a credential the
+    # credential proxy cannot read.
+    if [ -f "$CREDS_FILE" ]; then
+        chmod --reference="$CREDS_FILE" "$TMP_CREDS"
+        chown --reference="$CREDS_FILE" "$TMP_CREDS"
+    else
+        apply_shared_posture "$TMP_CREDS"
+    fi
     mv -f "$TMP_CREDS" "$CREDS_FILE"
     trap - EXIT
     echo "Credentials written from stdin (atomic replace)"
@@ -120,10 +180,23 @@ else
     # — `claude auth status` and the post-restart services would fail
     # auth instead of recovering. install(1) sets ownership and mode
     # atomically as part of the copy so the rolled-back file is
-    # immediately usable by nanoclaw-he.
+    # immediately usable.
+    # Shared-identity fix (2026-07-11 cutover): restore the CAPTURED
+    # pre-replacement posture, not a hardcoded 600/nanoclaw-he — a failed
+    # refresh must hand back the 0640 nanoclaw-he:atlas-svc shared
+    # credential exactly as it was, or host-executor recovers while the
+    # credential proxy stays locked out. A backup implies the original
+    # existed, so the capture is always populated here; the defensive
+    # else-branch applies the shared default.
     if [ -f "$BACKUP_FILE" ]; then
-        install -m 600 -o nanoclaw-he -g nanoclaw-he "$BACKUP_FILE" "$CREDS_FILE"
-        echo "Restored previous credentials from backup (nanoclaw-he-owned)"
+        if [ "$ORIG_POSTURE_CAPTURED" = true ]; then
+            install -m "$ORIG_MODE" -o "$ORIG_USER" -g "$ORIG_GROUP" "$BACKUP_FILE" "$CREDS_FILE"
+            echo "Restored previous credentials from backup (posture ${ORIG_MODE} ${ORIG_USER}:${ORIG_GROUP} preserved)"
+        else
+            install -m 600 -o nanoclaw-he -g nanoclaw-he "$BACKUP_FILE" "$CREDS_FILE"
+            apply_shared_posture "$CREDS_FILE"
+            echo "Restored previous credentials from backup (shared posture applied)"
+        fi
     fi
     exit 1
 fi

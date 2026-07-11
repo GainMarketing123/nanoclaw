@@ -501,65 +501,59 @@ QUALITY_CHECK_PORT = 3003
 
 # --- Quality Check HTTP Server ---
 # Runs in a background thread. Containers POST response text here,
-# host-executor calls Haiku with the real API key, returns the score.
-# This avoids putting API keys in containers and works around OAuth
-# not being supported on the /v1/messages endpoint.
+# host-executor grades them with Haiku on the subscription OAuth credential
+# and returns the score. Credentials never enter containers: the OAuth access
+# token is read host-side from the service user's Claude Code credential file
+# and used directly against /v1/messages.
 
-def _load_anthropic_api_key() -> str:
-    """Read ANTHROPIC_API_KEY: systemd LoadCredential first, then env, then file.
+def _load_oauth_token() -> str:
+    """Read the Claude Code subscription OAuth access token.
 
-    Phase 3.1 (1.A.6): production reads ANTHROPIC_API_KEY from a systemd-
-    injected credential file at $CREDENTIALS_DIRECTORY/anthropic-api-key.
-    The matching unit declaration is
-      LoadCredential=anthropic-api-key:/etc/atlas/anthropic-api-key.secret
-    The source file at /etc/atlas/anthropic-api-key.secret is root-owned
-    mode 0400. systemd reads it as root, then exposes the rendered copy to
-    the service inside its private credential namespace — readable only by
-    the service's User=. Net effect: atlas-svc group members, cron, other
-    services, and the gateway-era shared file all lose read access; only
-    the running atlas-host-executor process can see the key.
+    Subscription cutover (2026-07-11): the quality-check gate authenticates to
+    /v1/messages with the Max-subscription OAuth token instead of a metered
+    ANTHROPIC_API_KEY. The subscription supports /v1/messages directly
+    (Authorization: Bearer + anthropic-beta: oauth-2025-04-20 — verified live
+    on this host), so the metered key was retired from every source.
 
-    Path() wrap is required (codex R1 F1 catch in the Phase 3.1 spec):
-    `os.environ.get(...)` returns str; `str / str` raises TypeError; the
-    wrap is the only thing preventing a startup-time crash on the new
-    code path.
+    Source order:
+      1. $CLAUDE_CONFIG_DIR/.credentials.json  (explicit override; laptop/dev)
+      2. $HOME/.claude/.credentials.json        (production — the running
+         service user's home: /home/atlas/.claude under the in-repo base unit,
+         /home/nanoclaw-he/.claude under the live Phase 3.2 drop-in. Both carry
+         the same auto-refreshed OAuth credential `claude -p` uses on this host,
+         so the gate works regardless of the User= migration state.)
+    Both read claudeAiOauth.accessToken.
 
-    Legacy paths preserved for laptop / dev / partial-deployment cases:
-      1. ANTHROPIC_API_KEY env var (production EnvironmentFile= injection
-         pre-Phase 3.1; also matches direct shell-set for ad-hoc test).
-      2. ATLAS_DIR/.env file (laptop fallback when no env var set).
-
-    Returns "" if all three paths fail; main() surfaces a clear startup
-    error rather than running with an empty key.
+    The token is rotated ~every 30 min by an external refresher, so this MUST
+    be read fresh per request (never cached across the process lifetime) and
+    re-read on a 401 (see _call_haiku). Returns "" when no readable source
+    carries a non-empty token; the caller emits the canonical token_missing
+    tri-state rather than crashing.
     """
-    cred_dir = os.environ.get("CREDENTIALS_DIRECTORY")
-    if cred_dir:
-        cred_file = Path(cred_dir) / "anthropic-api-key"
+    candidates = []
+    cfg_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    if cfg_dir:
+        candidates.append(Path(cfg_dir) / ".credentials.json")
+    candidates.append(Path.home() / ".claude" / ".credentials.json")
+    for cred_file in candidates:
         try:
-            content = cred_file.read_text().strip()
-            if content:
-                return content
-        except (FileNotFoundError, PermissionError, OSError):
-            # Transient read failure — fall through to legacy paths rather
-            # than crash. Auth failures downstream surface a clearer error.
-            pass
-    key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if key:
-        return key
-    env_path = ATLAS_DIR / ".env"
-    try:
-        for line in env_path.read_text().splitlines():
-            if line.startswith("ANTHROPIC_API_KEY="):
-                return line.split("=", 1)[1].strip()
-    except (FileNotFoundError, PermissionError, OSError):
-        # Codex 9285383 R1 SOFT fix: match the broader exception catch in
-        # _load_quality_check_token() below. Pre-fix, only FileNotFoundError
-        # was caught — a permission denial or unrelated OSError on .env
-        # would propagate and crash the quality-check call site instead of
-        # routing through the canonical token_missing response. Treat any
-        # read failure as "no key in this fallback" and let the empty-key
-        # path emit the operator-actionable error message.
-        pass
+            data = json.loads(cred_file.read_text())
+        except (FileNotFoundError, PermissionError, OSError,
+                json.JSONDecodeError, UnicodeDecodeError):
+            # Missing / unreadable / malformed / non-UTF-8 → try the next
+            # source, then fall through to "" so the caller routes through the
+            # canonical token_missing tri-state rather than a handler api_error.
+            continue
+        if not isinstance(data, dict):
+            # Valid JSON but wrong top-level shape ([], null, a scalar). Treat
+            # as no-token-here and try the next source — guards against an
+            # AttributeError from data.get() escaping the loader, and lets a
+            # bad CLAUDE_CONFIG_DIR override still fall through to $HOME.
+            continue
+        oauth = data.get("claudeAiOauth")
+        token = oauth.get("accessToken", "") if isinstance(oauth, dict) else ""
+        if isinstance(token, str) and token:
+            return token
     return ""
 
 
@@ -713,64 +707,19 @@ def _maybe_send_operator_alert(reason: str, detail: str) -> None:
             log(f"Operator alert send failed (reason={reason}): {e}")
 
 
-def _call_haiku(response_text: str) -> dict:
-    """Call Haiku /v1/messages with direct API key. Returns tri-state dict.
+def _haiku_request_once(filled_prompt: str, oauth_token: str) -> tuple:
+    """One Haiku /v1/messages call on the subscription OAuth credential.
 
-    Pass:        {"status":"pass", "score":N, "violations":[]}
-    Fail:        {"status":"fail", "score":N, "violations":[...]}
-    Unavailable: {"status":"unavailable", "reason":<R>, "retryable":bool, "detail":"..."}
+    Returns (tri_state_dict, stale_auth). `stale_auth` is True ONLY on a
+    401/unauthorized — the single case _call_haiku retries after re-reading
+    the (rotated) OAuth token. Every other outcome returns stale_auth=False.
 
-    Reason taxonomy (must stay in lockstep with response-interceptor.ts
-    UnavailableReason union and audit doc 1.A.6 §5.4):
-      billing       — credit/quota exhaustion. NOT retryable; operator alert.
-      auth          — 401/unauthorized. NOT retryable; operator alert.
-      token_missing — ANTHROPIC_API_KEY absent. NOT retryable; operator alert.
-      network       — 5xx/URLError. Retryable; soft-window alert (N=3 in 5min).
-      timeout       — request timeout. Retryable; soft-window alert.
-      parse         — Haiku JSON unparseable. NOT retryable; loud-log only.
-      api_error     — other 4xx / unclassified exception. NOT retryable; loud-log.
-
-    INTENTIONAL ANTHROPIC_API_KEY USAGE — do NOT include in env-strip sweeps.
-    --------------------------------------------------------------------------
-    Cost-burn audit 2026-05-12 (the $76 XgAA-key leak) introduced an
-    `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` env-strip pattern that gets
-    applied to every site that spawns `claude -p` so the CLI falls through
-    to OAuth Max subscription instead of silently billing the metered key.
-    THAT PATTERN DOES NOT APPLY HERE. This function is a direct HTTPS POST
-    to `https://api.anthropic.com/v1/messages` carrying the API key in the
-    `x-api-key` header — no `claude -p`, no subprocess, no child env. The
-    OAuth Max subscription does not support `/v1/messages` (see comment at
-    L428-432 above), so the metered API key is the only viable auth here.
-    Stripping it would break quality-check entirely, returning every grade
-    as `token_missing` and degrading the governance gate.
-
-    Future env-strip sweeps: this site is OUT OF SCOPE — leave the key in
-    place. The in-scope leak surface in this file is the `claude -p` spawn
-    in `process_task()` around L1336-L1361 (handled in this same commit).
+    Auth shape (verified live 2026-07-11 on this host): Authorization: Bearer
+    <oauth> + anthropic-beta: oauth-2025-04-20 (load-bearing — omit it and the
+    call 401s) + anthropic-version. Responses carry anthropic-ratelimit-
+    unified-* headers, proving the subscription paid, not the metered wallet.
+    The token is never logged.
     """
-    api_key = _load_anthropic_api_key()
-    if not api_key:
-        return _unavailable(
-            "token_missing", False,
-            "ANTHROPIC_API_KEY missing from all sources: "
-            "$CREDENTIALS_DIRECTORY/anthropic-api-key (Phase 3.1 LoadCredential), "
-            "$ANTHROPIC_API_KEY env var, ~/.atlas/.env file"
-        )
-
-    if not QUALITY_CHECK_PROMPT:
-        # Host runs in degraded mode when the prompt file is missing/invalid
-        # at startup (codex F2 fix on c839228: don't crash main() on a
-        # missing auxiliary asset). Return the canonical prompt_missing
-        # tri-state response so the container parser routes correctly and
-        # operator alert dedup fires on first hit.
-        return _unavailable(
-            "prompt_missing",
-            False,
-            f"Host prompt file unreadable at {QUALITY_CHECK_PROMPT_PATH}; restore + restart.",
-        )
-
-    filled_prompt = QUALITY_CHECK_PROMPT.replace("{RESPONSE}", response_text[:4000])
-
     body = json.dumps({
         "model": "claude-haiku-4-5-20251001",
         "max_tokens": 1024,
@@ -782,7 +731,8 @@ def _call_haiku(response_text: str) -> dict:
         data=body,
         headers={
             "Content-Type": "application/json",
-            "x-api-key": api_key,
+            "Authorization": f"Bearer {oauth_token}",
+            "anthropic-beta": "oauth-2025-04-20",
             "anthropic-version": "2023-06-01",
         },
         method="POST",
@@ -821,7 +771,7 @@ def _call_haiku(response_text: str) -> dict:
                     log(f"Haiku JSON parse failed even after salvage: {e2}")
                     log(f"Text length: {len(text)}, first 200: {repr(text[:200])}")
                     log(f"Last 200: {repr(text[-200:])}")
-                    return _unavailable("parse", False, f"Haiku JSON parse: {str(e2)}")
+                    return _unavailable("parse", False, f"Haiku JSON parse: {str(e2)}"), False
             # Map Haiku's score+violations into the tri-state contract. Score
             # threshold semantics preserved from prior versions (>=85 pass).
             raw_score = result.get("score")
@@ -829,7 +779,7 @@ def _call_haiku(response_text: str) -> dict:
             raw_violations = result.get("violations", [])
             violations = raw_violations if isinstance(raw_violations, list) else []
             status = "pass" if score >= 85 else "fail"
-            return {"status": status, "score": score, "violations": violations}
+            return {"status": status, "score": score, "violations": violations}, False
     except urllib.error.HTTPError as e:
         err_body = ""
         try:
@@ -842,21 +792,101 @@ def _call_haiku(response_text: str) -> dict:
         # billing exhaustion; not retryable until topped up. Operator alert
         # fires immediately because no in-band retry will recover.
         if "insufficient_quota" in body_lower or "credit balance" in body_lower:
-            return _unavailable("billing", False, f"HTTP {e.code}: credit/quota exhausted")
+            return _unavailable("billing", False, f"HTTP {e.code}: credit/quota exhausted"), False
         if e.code == 401 or "unauthorized" in body_lower:
-            return _unavailable("auth", False, f"HTTP {e.code}: unauthorized")
+            # Classify as auth either way. Only a true 401 is a stale-token
+            # signal (the OAuth token rotates ~every 30 min; our in-hand copy
+            # may have expired between read and use), so _call_haiku re-reads
+            # and retries exactly once. A non-401 4xx whose body merely
+            # contains "unauthorized" is a hard auth failure, NOT staleness —
+            # do not trigger a re-read for it.
+            return _unavailable("auth", False, f"HTTP {e.code}: unauthorized"), e.code == 401
         if 500 <= e.code < 600:
             # Upstream server error — retry might recover; classify as network.
-            return _unavailable("network", True, f"HTTP {e.code}: upstream error")
-        return _unavailable("api_error", False, f"HTTP {e.code}: {err_body[:200]}")
+            return _unavailable("network", True, f"HTTP {e.code}: upstream error"), False
+        return _unavailable("api_error", False, f"HTTP {e.code}: {err_body[:200]}"), False
     except urllib.error.URLError as e:
-        return _unavailable("network", True, f"Network error: {e.reason}")
+        return _unavailable("network", True, f"Network error: {e.reason}"), False
     except json.JSONDecodeError as e:
-        return _unavailable("parse", False, f"JSON parse error: {str(e)}")
+        return _unavailable("parse", False, f"JSON parse error: {str(e)}"), False
     except TimeoutError:
-        return _unavailable("timeout", True, "Anthropic request timed out (10s)")
+        return _unavailable("timeout", True, "Anthropic request timed out (10s)"), False
     except Exception as e:
-        return _unavailable("api_error", False, str(e))
+        return _unavailable("api_error", False, str(e)), False
+
+
+def _call_haiku(response_text: str) -> dict:
+    """Grade a container response with Haiku. Returns tri-state dict.
+
+    Pass:        {"status":"pass", "score":N, "violations":[]}
+    Fail:        {"status":"fail", "score":N, "violations":[...]}
+    Unavailable: {"status":"unavailable", "reason":<R>, "retryable":bool, "detail":"..."}
+
+    Reason taxonomy (must stay in lockstep with response-interceptor.ts
+    UnavailableReason union and audit doc 1.A.6 §5.4):
+      billing       — credit/quota exhaustion. NOT retryable; operator alert.
+      auth          — 401/unauthorized after a token re-read. NOT retryable; operator alert.
+      token_missing — OAuth access token absent. NOT retryable; operator alert.
+      network       — 5xx/URLError. Retryable; soft-window alert (N=3 in 5min).
+      timeout       — request timeout. Retryable; soft-window alert.
+      parse         — Haiku JSON unparseable. NOT retryable; loud-log only.
+      api_error     — other 4xx / unclassified exception. NOT retryable; loud-log.
+
+    SUBSCRIPTION OAUTH — do NOT reintroduce the metered API key.
+    --------------------------------------------------------------------------
+    2026-07-11 cutover: this gate authenticates with the Max-subscription
+    OAuth token (Authorization: Bearer + anthropic-beta: oauth-2025-04-20),
+    NOT a metered ANTHROPIC_API_KEY. The subscription supports /v1/messages
+    directly (verified live on this host), so the metered key was retired
+    everywhere — env, systemd LoadCredential, and the .secret source. Token
+    source is _load_oauth_token(); it is read fresh per call and re-read once
+    on a 401 (the copy may go stale between read and use because an external
+    refresher rotates it ~every 30 min). Never put an API key back here.
+    """
+    oauth_token = _load_oauth_token()
+    if not oauth_token:
+        return _unavailable(
+            "token_missing", False,
+            "OAuth access token missing from all sources: "
+            "$CLAUDE_CONFIG_DIR/.credentials.json, "
+            "$HOME/.claude/.credentials.json (claudeAiOauth.accessToken)"
+        )
+
+    if not QUALITY_CHECK_PROMPT:
+        # Host runs in degraded mode when the prompt file is missing/invalid
+        # at startup (codex F2 fix on c839228: don't crash main() on a
+        # missing auxiliary asset). Return the canonical prompt_missing
+        # tri-state response so the container parser routes correctly and
+        # operator alert dedup fires on first hit.
+        return _unavailable(
+            "prompt_missing",
+            False,
+            f"Host prompt file unreadable at {QUALITY_CHECK_PROMPT_PATH}; restore + restart.",
+        )
+
+    filled_prompt = QUALITY_CHECK_PROMPT.replace("{RESPONSE}", response_text[:4000])
+
+    result, stale_auth = _haiku_request_once(filled_prompt, oauth_token)
+    if stale_auth:
+        # 401 on the first try. Re-read the (rotated) OAuth token and retry
+        # exactly once — but only if the file now yields a *different* token,
+        # so a genuine credential problem doesn't cost a pointless second 401.
+        #
+        # DELIBERATE: re-read, never refresh. This process does NOT run the
+        # OAuth refresh_token grant itself — the shared credential already has
+        # a dedicated refresh WRITER (the :15/:45 nanoclaw-he auto-refresh
+        # cron; the credential proxy also refreshes in its own deployments).
+        # A third refresher racing the cron on the same refresh token risks
+        # refresh-token-reuse invalidation (observed failure mode on this
+        # host), which would kill the credential for every consumer. Worst
+        # case for read-only recovery here: quality checks degrade to
+        # "unavailable/auth" until the next cron tick (≤30 min), and the
+        # operator alert fires — strictly better than a dead refresh chain.
+        refreshed = _load_oauth_token()
+        if refreshed and refreshed != oauth_token:
+            log("Haiku 401 — retrying once with re-read OAuth token")
+            result, _ = _haiku_request_once(filled_prompt, refreshed)
+    return result
 
 
 class QualityCheckHandler(BaseHTTPRequestHandler):
@@ -1520,9 +1550,10 @@ def process_task(task_path: Path) -> None:
         # on API-key 401 — verified in-session.
         #
         # This strip is path-specific to the `claude -p` spawn. The
-        # _call_haiku() function above intentionally KEEPS the API key —
-        # its docstring documents that exemption explicitly so future
-        # env-strip sweeps don't accidentally regress it.
+        # _call_haiku() quality-check gate above now authenticates with the
+        # subscription OAuth token as well (2026-07-11 cutover) — the metered
+        # ANTHROPIC_API_KEY was fully retired, so there is no longer any
+        # metered-key exemption anywhere in this file.
         #
         # Phase 3 (post-vendor 2026-05-13): use the vendored
         # claude_subprocess_env() helper. Single source of truth across

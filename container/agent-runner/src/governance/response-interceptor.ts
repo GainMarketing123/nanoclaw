@@ -30,7 +30,7 @@ export type UnavailableReason =
   | 'network'        // 5xx/URLError/transport; retryable; soft-window alert.
   | 'auth'           // 401/unauthorized; not retryable; operator alert.
   | 'parse'          // Haiku returned unparseable text; not retryable; loud-log only.
-  | 'token_missing'  // ANTHROPIC_API_KEY absent on host; not retryable; operator alert.
+  | 'token_missing'  // OAuth access token absent on host; not retryable; operator alert.
   | 'api_error'      // unclassified upstream/handler fault; not retryable.
   | 'busy'           // host in-flight cap reached; retryable.
   | 'prompt_missing' // bundled prompt asset missing in image; not retryable.
