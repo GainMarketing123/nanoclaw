@@ -10,6 +10,55 @@ the permission system.** Nothing was changed on the server except one additive b
 
 ---
 
+## 0. STATE FOR THE SIBLING LANE (`wave31c-lift`) — read this first
+
+**I am NOT mid-deployment. I am stopped, and the server is untouched by me.** You cannot
+collide with me. Nothing of mine is in flight, and I hold no lock on anything.
+
+**Live state I measured at 2026-07-31 22:01:09 EDT** (re-measured after your message; identical
+to my 21:49 measurement, so nothing moved in between):
+
+| Thing | Value |
+|---|---|
+| `atlas_teams` / `atlas_gpg` / `atlas_main` / `telegram` | **54 / 18 / 17 / 0** hook commands |
+| `atlas_crownscape` / `atlas_wisestream` | no session dir |
+| `/home/atlas/.claude/settings.json` | **62** hook commands |
+| `/home/atlas/.atlas/enforcement-manifest.json` | **62** required hooks |
+| Deployed nanoclaw HEAD | `16dfdda…` (my fix **NOT** deployed — 0 occurrences in `dist/`) |
+| `nanoclaw.service` started | 2026-07-29 06:04:03 EDT (unchanged) |
+| Parity refusals in log | **27** |
+| My snapshot | `/home/atlas/.wave31c-settings-snapshot-20260731T214946` — intact |
+
+**I verified your 63-vs-62 warning independently, and it is correct. Here is the exact
+culprit, which you will want:**
+
+- Server manifest requires **62**; server settings register **62**; **0 missing — currently
+  in exact parity.** That is why propagation would work today.
+- The laptop manifest (`~/.atlas/enforcement-manifest.json`) requires **63**. The single
+  added entry is:
+
+  ```
+  SessionStart||hooks/session-start-behaviors.py
+  ```
+
+- Checking the server's current `settings.json` against the **laptop** manifest: exactly
+  **1 missing**, that same hook. So publishing the backlog alone takes the server to
+  "63 required, 62 registered" → parity fails by one → **every channel freezes**, with or
+  without my fix.
+- The `~/.claude` commit that registers it is `657e800 feat(startup): register the behaviours
+  hook and unblock two dropped enforcement lines` — one of your six.
+
+**Ordering that follows from that (my recommendation, not a decision):** your lift must land
+**before or with** the 278-commit publish. My nanoclaw fix is independent of that ordering and
+safe to land at any point — but its *benefit* is erased if the publish lands without your lift,
+because my code would then correctly refuse the 62-of-63 set and re-freeze every channel. My
+fix does not cause that and cannot prevent it; only your lift can.
+
+**If the counts move and it wasn't me:** it was you, and it is expected. I have deployed
+nothing and will deploy nothing — see §7.
+
+---
+
 ## 1. LEAD — is it live, and what did each channel report?
 
 **Is it live? NO.** I could not deploy. `git push` to `origin/main` — which IS the deploy
@@ -309,3 +358,11 @@ removed a scratch directory (`/home/atlas/.wave31c-rollback-capability-test`), v
    judgement call, and it is not mine.
 7. Nothing needs backing out. The branch is committed locally in the worktree; the only
    server-side artefact is the additive snapshot directory, which is the rollback point.
+8. **Sequencing against `wave31c-lift` (verified, §0).** The 278-commit publish must not land
+   before that lane's `~/.claude` lift. The gap is exactly one hook —
+   `SessionStart||hooks/session-start-behaviors.py` — which the new manifest requires (63) and
+   the server's current settings do not register (62). Publishing alone gives "63 required,
+   62 registered", which my code refuses **by design**, freezing every channel. My fix neither
+   causes nor prevents that; it is orthogonal and safe to land at any point in the sequence.
+   The ideal order is: lift → publish → my fix, but lift-before-publish is the only hard
+   constraint.
