@@ -429,13 +429,16 @@ interface EnforcementManifest {
 function loadEnforcementManifest(): EnforcementManifest {
   const manifestPath = path.join(ATLAS_STATE_DIR, 'enforcement-manifest.json');
   let stamp = '';
+  let fd: number | undefined;
   try {
-    stamp = `${manifestPath}|${fs.statSync(manifestPath).mtimeMs.toString()}`;
-  } catch {
-    // Best-effort only: an unstattable manifest is reported by the read below.
-  }
-  try {
-    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8')) as {
+    // Stat and read through ONE descriptor. A separate statSync + readFileSync
+    // samples the path twice: if the manifest is rewritten in between (git-sync
+    // regenerates it on every deploy) the stamp would describe a different
+    // version than the content actually used for the parity decision, and the
+    // per-group marker would then record that mismatched pair as "fresh".
+    fd = fs.openSync(manifestPath, 'r');
+    stamp = `${manifestPath}|${fs.fstatSync(fd).mtimeMs.toString()}`;
+    const manifest = JSON.parse(fs.readFileSync(fd, 'utf-8')) as {
       required_hooks?: Array<{
         event: string;
         matcher?: string;
@@ -464,6 +467,14 @@ function loadEnforcementManifest(): EnforcementManifest {
       'Atlas enforcement manifest unreadable — container-spawn parity check SKIPPED. Not blocking spawn to avoid DoS; investigate the manifest deploy state.',
     );
     return { required: null, stamp };
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // Descriptor already gone; nothing to recover.
+      }
+    }
   }
 }
 

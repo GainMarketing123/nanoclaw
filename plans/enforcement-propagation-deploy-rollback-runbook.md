@@ -89,13 +89,20 @@ post-deploy state and be worthless as a rollback point. Take it **before** D2.
 Run as `atlas` on the VPS:
 
 ```bash
+set -u
 SNAP=/home/atlas/.wave31c-settings-snapshot-$(date +%Y%m%dT%H%M%S)
 mkdir -p "$SNAP"
-for g in atlas_gpg atlas_main atlas_teams telegram_atlas-marketing atlas_crownscape atlas_wisestream; do
+GROUPS="atlas_gpg atlas_main atlas_teams telegram_atlas-marketing atlas_crownscape atlas_wisestream"
+for g in $GROUPS; do
   d=/home/atlas/nanoclaw/data/sessions/$g/.claude
   mkdir -p "$SNAP/$g"
-  if [ -f "$d/settings.json" ]; then cp -p "$d/settings.json" "$SNAP/$g/"; else echo ABSENT > "$SNAP/$g/settings.json.ABSENT"; fi
-  if [ -f "$d/settings.json.source-mtime" ]; then cp -p "$d/settings.json.source-mtime" "$SNAP/$g/"; else echo ABSENT > "$SNAP/$g/settings.json.source-mtime.ABSENT"; fi
+  for f in settings.json settings.json.source-mtime; do
+    if [ -f "$d/$f" ]; then
+      cp -p "$d/$f" "$SNAP/$g/$f" || { echo "SNAPSHOT FAILED: $g/$f" >&2; exit 1; }
+    else
+      : > "$SNAP/$g/$f.ABSENT"
+    fi
+  done
 done
 echo "$SNAP"
 ```
@@ -105,7 +112,26 @@ today, and `atlas_crownscape` / `atlas_wisestream` have **no session dir at all*
 for those means **deleting** what the deploy created, not restoring a prior copy. A
 restore-only rollback silently leaves them enforced.
 
-Record the snapshot path. Verify it contains 6 subdirectories before continuing.
+**Verify the snapshot properly — do NOT just count directories.** The loop above creates
+all six directories unconditionally, so a directory count is always 6 even if every single
+copy failed. That check would pass on a completely empty snapshot and you would discover it
+only when you needed to roll back. Assert instead that every group recorded a definite
+state — either a real copy or an explicit sentinel — for both files:
+
+```bash
+for g in $GROUPS; do
+  for f in settings.json settings.json.source-mtime; do
+    if [ ! -f "$SNAP/$g/$f" ] && [ ! -f "$SNAP/$g/$f.ABSENT" ]; then
+      echo "SNAPSHOT INCOMPLETE: $g/$f — DO NOT DEPLOY" >&2
+    fi
+  done
+done
+echo "snapshot verified: $SNAP"
+```
+
+Cross-check the copied files against §1.1: `atlas_teams` must be 54 hook commands,
+`atlas_gpg` 18, `atlas_main` 17, `telegram_atlas-marketing` 0. A snapshot that disagrees
+with the recorded pre-deploy state is not a valid rollback point. Record the snapshot path.
 
 ### D2 — Push (this deploys)
 
@@ -293,6 +319,13 @@ recreating the file would leave it owned by `atlas`, silently changing the owner
 service expects. One uniform privileged path avoids both failure modes and restores exact
 ownership and mode:
 
+The service stays running throughout, so each restore must be **atomic**: copy to a
+temp name in the same directory, set ownership and mode there, then `mv` into place.
+`rename(2)` within a directory is atomic, so a container spawning mid-rollback sees either
+the old file or the restored one — never a half-written enforcement file. A plain `cp` over
+a live `settings.json` is a torn-read window on exactly the file that decides which safety
+checks the container runs.
+
 ```bash
 SNAP=<snapshot path from D1>
 for g in atlas_gpg atlas_main atlas_teams telegram_atlas-marketing; do
@@ -300,19 +333,20 @@ for g in atlas_gpg atlas_main atlas_teams telegram_atlas-marketing; do
   docker run --rm -u 0:0 \
     -v /home/atlas/nanoclaw/data/sessions/$g/.claude:/target \
     -v "$SNAP/$g":/snap:ro alpine:latest sh -c '
-      if [ -f /snap/settings.json ]; then
-        cp /snap/settings.json /target/settings.json
-        chown 996:1001 /target/settings.json && chmod 644 /target/settings.json
-      fi
-      if [ -f /snap/settings.json.source-mtime ]; then
-        cp /snap/settings.json.source-mtime /target/settings.json.source-mtime
-        chown 996:1001 /target/settings.json.source-mtime
-        chmod 644 /target/settings.json.source-mtime
-      else
-        # telegram_atlas-marketing had NO marker pre-deploy — restoring one
-        # would change its state rather than restore it.
-        rm -f /target/settings.json.source-mtime
-      fi'
+      set -e
+      for f in settings.json settings.json.source-mtime; do
+        if [ -f "/snap/$f" ]; then
+          cp "/snap/$f" "/target/.rollback.$f"
+          chown 996:1001 "/target/.rollback.$f"
+          chmod 644 "/target/.rollback.$f"
+          mv -f "/target/.rollback.$f" "/target/$f"
+        else
+          # An .ABSENT sentinel means the file did not exist pre-deploy
+          # (telegram_atlas-marketing had NO marker). Restoring one would
+          # change its state rather than restore it.
+          rm -f "/target/$f"
+        fi
+      done'
 done
 ```
 

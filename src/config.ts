@@ -66,6 +66,16 @@ export const HOST_CLAUDE_DIR = CLAUDE_CONFIG_DIR;
 // is correct on the VPS with no unit change. The dedicated env var exists so a
 // future settings relocation (or a rollback of this fix) can repoint the
 // rulebook WITHOUT touching the credential path, and vice versa.
+//
+// OPERATOR NOTE: the override is environment-only. `setup/` writes ATLAS_DIR and
+// CLAUDE_CONFIG_DIR into the generated systemd unit / launchd plist / nohup
+// wrapper, but it does NOT emit CLAUDE_SETTINGS_SOURCE_DIR. Setting it in a
+// shell therefore affects `npm run dev` but NOT the installed service. If you
+// ever need a non-default rulebook location, add it to the service unit
+// explicitly (e.g. a drop-in alongside
+// infra/systemd-dropins/nanoclaw.service.d/oauth-shared-identity.conf) — do not
+// assume the installer carries it. The DEFAULT needs no such step, which is why
+// the 2026-07-31 fix required no VPS unit change.
 export const CLAUDE_SETTINGS_SOURCE_DIR =
   process.env.CLAUDE_SETTINGS_SOURCE_DIR || path.join(HOME_DIR, '.claude');
 
