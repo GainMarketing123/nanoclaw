@@ -227,13 +227,101 @@ describe('container enforcement-hook propagation source', () => {
     writeContainerSettings(dirs.groupSettingsFile);
 
     const sourceFile = path.join(dirs.settingsSourceDir, 'settings.json');
+    const manifestFile = path.join(dirs.atlasDir, 'enforcement-manifest.json');
     const marker = `${dirs.groupSettingsFile}.source-mtime`;
     expect(fs.existsSync(marker)).toBe(true);
-    // Path AND mtime. An mtime-only marker cannot distinguish "same file,
-    // unchanged" from "different file with a coincidentally equal mtime".
+    // Source path AND mtime AND the manifest stamp. An mtime-only marker cannot
+    // distinguish "same file, unchanged" from "different file with a
+    // coincidentally equal mtime", and omitting the manifest would skip
+    // re-validation when a newly-required hook is added.
     expect(fs.readFileSync(marker, 'utf-8').trim()).toBe(
-      `${sourceFile}|${fs.statSync(sourceFile).mtimeMs.toString()}`,
+      `${sourceFile}|${fs.statSync(sourceFile).mtimeMs.toString()}` +
+        `|${manifestFile}|${fs.statSync(manifestFile).mtimeMs.toString()}`,
     );
+  });
+
+  it('re-validates when the enforcement MANIFEST changes but the source does not', async () => {
+    const dirs = makeDirs();
+    const manifestFile = path.join(dirs.atlasDir, 'enforcement-manifest.json');
+
+    const first = await importWithConfig(dirs, dirs.settingsSourceDir);
+    first.writeContainerSettings(dirs.groupSettingsFile);
+    expect(fs.existsSync(dirs.groupSettingsFile)).toBe(true);
+
+    // Add a newly-required hook the settings source does NOT provide, leaving
+    // the source file untouched. The next spawn must re-run parity and REFUSE,
+    // not short-circuit on an unchanged source.
+    fs.writeFileSync(
+      manifestFile,
+      JSON.stringify({
+        required_hooks: [
+          { event: 'SessionStart', script: 'hooks/session-start.py' },
+          {
+            event: 'PreToolUse',
+            matcher: 'Edit|Write',
+            script: 'hooks/pretool-discipline.py',
+          },
+          { event: 'SessionEnd', script: 'hooks/brand-new-required-hook.py' },
+        ],
+      }) + '\n',
+    );
+    const bumped = new Date(Date.now() + 5000);
+    fs.utimesSync(manifestFile, bumped, bumped);
+
+    const second = await importWithConfig(dirs, dirs.settingsSourceDir);
+    second.writeContainerSettings(dirs.groupSettingsFile);
+
+    expect(
+      second.warn.mock.calls.some(
+        (call) =>
+          (call[0] as { event?: string })?.event ===
+          'container_settings_parity_refused',
+      ),
+      'a manifest change must re-trigger parity validation',
+    ).toBe(true);
+  });
+
+  it('warns when the manifest parses but has no usable required_hooks array', async () => {
+    const dirs = makeDirs();
+    fs.writeFileSync(
+      path.join(dirs.atlasDir, 'enforcement-manifest.json'),
+      JSON.stringify({ required_hooks: 'not-an-array' }) + '\n',
+    );
+
+    const { writeContainerSettings, warn } = await importWithConfig(
+      dirs,
+      dirs.settingsSourceDir,
+    );
+
+    writeContainerSettings(dirs.groupSettingsFile);
+
+    expect(
+      warn.mock.calls.some(
+        (call) =>
+          (call[0] as { event?: string })?.event ===
+          'enforcement_manifest_malformed',
+      ),
+      'a malformed manifest must not disable parity checking silently',
+    ).toBe(true);
+  });
+
+  it('never leaves a partial settings.json behind (atomic write)', async () => {
+    const dirs = makeDirs();
+    const { writeContainerSettings } = await importWithConfig(
+      dirs,
+      dirs.settingsSourceDir,
+    );
+
+    writeContainerSettings(dirs.groupSettingsFile);
+
+    // No temp artefacts left in the group dir, and the file parses cleanly.
+    const groupDir = path.dirname(dirs.groupSettingsFile);
+    expect(
+      fs.readdirSync(groupDir).filter((f) => f.includes('.tmp-')),
+    ).toHaveLength(0);
+    expect(() =>
+      JSON.parse(fs.readFileSync(dirs.groupSettingsFile, 'utf-8')),
+    ).not.toThrow();
   });
 
   it('regenerates when the source PATH changes even if the mtime is identical', async () => {

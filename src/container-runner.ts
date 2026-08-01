@@ -408,18 +408,32 @@ function rewriteHookCommand(command: string): string {
  * user's, silently defeating the gate. Same env-aware pattern the rest of this
  * file uses (e.g. CLAUDE_SETTINGS_SOURCE_DIR for settings.json).
  *
- * A null return means "check SKIPPED", not "nothing required": refusing every
- * spawn over a manifest hiccup would DoS the autonomous engine for something
- * the deploy step (git-sync.sh + validate-settings-parity.py) is supposed to
- * catch upstream. Logged loudly because on the production VPS it is a deploy
- * regression worth chasing.
+ * A null `required` means "check SKIPPED", not "nothing required": refusing
+ * every spawn over a manifest hiccup would DoS the autonomous engine for
+ * something the deploy step (git-sync.sh + validate-settings-parity.py) is
+ * supposed to catch upstream. Logged loudly because on the production VPS it is
+ * a deploy regression worth chasing — including the malformed-but-parseable
+ * case (valid JSON whose `required_hooks` is missing or not an array), which
+ * silently disabled parity checking before.
+ *
+ * Also returns a `stamp` (path|mtime, empty when unavailable) so the per-group
+ * freshness check can invalidate on a MANIFEST change, not just a settings
+ * change. Without it, adding a newly-required hook to the manifest would not
+ * re-trigger parity validation for a group whose settings source had not moved.
  */
-function loadEnforcementManifest(): Array<{
-  event: string;
-  matcher?: string;
-  script: string;
-}> | null {
+interface EnforcementManifest {
+  required: Array<{ event: string; matcher?: string; script: string }> | null;
+  stamp: string;
+}
+
+function loadEnforcementManifest(): EnforcementManifest {
   const manifestPath = path.join(ATLAS_STATE_DIR, 'enforcement-manifest.json');
+  let stamp = '';
+  try {
+    stamp = `${manifestPath}|${fs.statSync(manifestPath).mtimeMs.toString()}`;
+  } catch {
+    // Best-effort only: an unstattable manifest is reported by the read below.
+  }
   try {
     const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8')) as {
       required_hooks?: Array<{
@@ -428,9 +442,18 @@ function loadEnforcementManifest(): Array<{
         script: string;
       }>;
     };
-    return Array.isArray(manifest.required_hooks)
-      ? manifest.required_hooks
-      : null;
+    if (Array.isArray(manifest.required_hooks)) {
+      return { required: manifest.required_hooks, stamp };
+    }
+    logger.warn(
+      {
+        event: 'enforcement_manifest_malformed',
+        manifestPath,
+        requiredHooksType: typeof manifest?.required_hooks,
+      },
+      'Atlas enforcement manifest parsed but has no usable required_hooks array — container-spawn parity check SKIPPED. Investigate the manifest deploy state.',
+    );
+    return { required: null, stamp };
   } catch (err) {
     logger.warn(
       {
@@ -440,7 +463,7 @@ function loadEnforcementManifest(): Array<{
       },
       'Atlas enforcement manifest unreadable — container-spawn parity check SKIPPED. Not blocking spawn to avoid DoS; investigate the manifest deploy state.',
     );
-    return null;
+    return { required: null, stamp };
   }
 }
 
@@ -498,7 +521,8 @@ export function writeContainerSettings(settingsFile: string): void {
   // running with a stale hook set). Turning refusal into a spawn abort is a
   // deliberate availability trade-off and an orchestrator/CEO decision, not a
   // silent change to make here.
-  const manifestRequired = loadEnforcementManifest();
+  const { required: manifestRequired, stamp: manifestStamp } =
+    loadEnforcementManifest();
   const enforcementRequired = !!manifestRequired && manifestRequired.length > 0;
 
   const markerFile = settingsFile + '.source-mtime';
@@ -546,7 +570,10 @@ export function writeContainerSettings(settingsFile: string): void {
     // unreadable. Outside the try, either would throw straight out of this
     // function and take the container spawn down with it.
     const hostMtime = fs.statSync(hostSettingsPath).mtimeMs.toString();
-    const sourceStamp = `${hostSettingsPath}|${hostMtime}`;
+    // The manifest stamp is part of the freshness key: the parity check
+    // validates the source AGAINST the manifest, so a manifest change must
+    // re-trigger validation even when the settings source has not moved.
+    const sourceStamp = `${hostSettingsPath}|${hostMtime}|${manifestStamp}`;
     const cachedStamp = fs.existsSync(markerFile)
       ? fs.readFileSync(markerFile, 'utf-8').trim()
       : '';
@@ -675,10 +702,31 @@ export function writeContainerSettings(settingsFile: string): void {
       },
     };
 
-    fs.writeFileSync(
-      settingsFile,
-      JSON.stringify(containerSettings, null, 2) + '\n',
-    );
+    // Write the enforcement file ATOMICALLY: same-directory temp + rename, so a
+    // crash or a concurrent spawn can never expose a half-written settings.json.
+    // A torn file is worse than a stale one — the container would either fail to
+    // parse its settings or come up with a truncated hook set, and the marker
+    // logic cannot detect either. rename(2) within a directory is atomic.
+    //
+    // Ordering: settings FIRST, marker SECOND. A crash between them leaves a
+    // complete settings file with a stale marker, so the next spawn simply
+    // regenerates — the safe direction. The reverse order could record "fresh"
+    // for content that was never written.
+    const tmpSettingsFile = `${settingsFile}.tmp-${process.pid}-${Date.now()}`;
+    try {
+      fs.writeFileSync(
+        tmpSettingsFile,
+        JSON.stringify(containerSettings, null, 2) + '\n',
+      );
+      fs.renameSync(tmpSettingsFile, settingsFile);
+    } catch (writeErr) {
+      try {
+        fs.rmSync(tmpSettingsFile, { force: true });
+      } catch {
+        // Best-effort cleanup; the original error is what matters.
+      }
+      throw writeErr;
+    }
     fs.writeFileSync(markerFile, sourceStamp);
 
     logger.info(
