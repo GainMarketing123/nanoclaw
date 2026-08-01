@@ -477,16 +477,31 @@ export function writeContainerSettings(settingsFile: string): void {
   };
 
   // Load the enforcement manifest FIRST — before the source-existence check —
-  // so every failure path below can ask "is enforcement required here?" and
-  // fail CLOSED when it is. Pre-fix this lived inside the try block, so the
-  // two paths that run BEFORE it (source missing, and the catch handler on a
-  // read/parse error) could write a hook-less container config that bypassed
-  // the parity gate entirely. Now that the settings source is a separately
-  // configurable path, a typo'd or unreadable CLAUDE_SETTINGS_SOURCE_DIR would
-  // have turned a frozen-but-present hook set into NO hooks at all — strictly
-  // worse than the incident this change fixes.
+  // so every failure path below can ask "is enforcement required here?".
+  // Pre-fix this lived inside the try block, so the two paths that run BEFORE
+  // it (source missing, and the catch handler on a read/parse error) could
+  // write a hook-less container config that bypassed the parity gate entirely.
+  // Now that the settings source is a separately configurable path, a typo'd or
+  // unreadable CLAUDE_SETTINGS_SOURCE_DIR would have turned a frozen-but-present
+  // hook set into NO hooks at all — strictly worse than the incident this
+  // change fixes.
+  //
+  // SCOPE OF THE REFUSAL — read this before calling it "fail closed". Refusing
+  // here does NOT abort the container spawn; this function returns void and
+  // buildVolumeMounts continues. What it guarantees is that a group which
+  // already has a good settings.json KEEPS it rather than being downgraded to
+  // no hooks. A group with NO previous settings file still spawns unenforced.
+  // That is the same contract the pre-existing parity-refusal path below has
+  // always had, and it is deliberate: aborting spawns on an enforcement-source
+  // hiccup would DoS the whole autonomous engine (during the 2026-07-11 → 07-31
+  // incident that would have failed EVERY spawn for three weeks instead of
+  // running with a stale hook set). Turning refusal into a spawn abort is a
+  // deliberate availability trade-off and an orchestrator/CEO decision, not a
+  // silent change to make here.
   const manifestRequired = loadEnforcementManifest();
   const enforcementRequired = !!manifestRequired && manifestRequired.length > 0;
+
+  const markerFile = settingsFile + '.source-mtime';
 
   // If no host settings, write minimal config — but ONLY when the manifest does
   // not require enforcement. When it does, refuse and keep the previous
@@ -498,9 +513,10 @@ export function writeContainerSettings(settingsFile: string): void {
           event: 'container_settings_source_unavailable',
           hostSettingsPath,
           settingsFile,
+          settingsFilePresent: fs.existsSync(settingsFile),
           requiredHooks: manifestRequired?.length,
         },
-        'Refusing to write container settings.json — the enforcement settings SOURCE is missing while the manifest requires hooks. Keeping previous per-group settings file (if any) live; marker NOT updated so the next spawn re-checks. Check CLAUDE_SETTINGS_SOURCE_DIR.',
+        'Refusing to write container settings.json — the enforcement settings SOURCE is missing while the manifest requires hooks. Keeping the previous per-group settings file (if any) live; marker NOT updated so the next spawn re-checks. NOTE: the container still spawns — if settingsFilePresent is false it runs with no hooks. Check CLAUDE_SETTINGS_SOURCE_DIR.',
       );
       return;
     }
@@ -513,28 +529,32 @@ export function writeContainerSettings(settingsFile: string): void {
     return;
   }
 
-  // Check if the host settings changed since the last write.
-  //
-  // The marker records the SOURCE PATH as well as the mtime. Recording mtime
-  // alone was safe only while the source path was a compile-time constant: now
-  // that CLAUDE_SETTINGS_SOURCE_DIR can be repointed (including by a rollback),
-  // a marker carrying just an mtime cannot tell "same file, unchanged" from
-  // "different file that happens to share an mtime" — and the latter would
-  // silently retain settings generated from the PREVIOUS source. Any marker
-  // that does not match both fields (including a legacy mtime-only marker) is
-  // treated as stale, which forces exactly one regeneration.
-  const hostMtime = fs.statSync(hostSettingsPath).mtimeMs.toString();
-  const sourceStamp = `${hostSettingsPath}|${hostMtime}`;
-  const markerFile = settingsFile + '.source-mtime';
-  const cachedStamp = fs.existsSync(markerFile)
-    ? fs.readFileSync(markerFile, 'utf-8').trim()
-    : '';
-
-  if (cachedStamp === sourceStamp && fs.existsSync(settingsFile)) {
-    return; // Same source file, unchanged — skip regeneration
-  }
-
   try {
+    // Check if the host settings changed since the last write.
+    //
+    // The marker records the SOURCE PATH as well as the mtime. Recording mtime
+    // alone was safe only while the source path was a compile-time constant:
+    // now that CLAUDE_SETTINGS_SOURCE_DIR can be repointed (including by a
+    // rollback), a marker carrying just an mtime cannot tell "same file,
+    // unchanged" from "different file that happens to share an mtime" — and the
+    // latter would silently retain settings generated from the PREVIOUS source.
+    // Any marker that does not match both fields (including a legacy
+    // mtime-only marker) is treated as stale, forcing one regeneration.
+    //
+    // These reads live INSIDE the try on purpose: statSync races the
+    // existsSync above (the source can vanish in between) and the marker can be
+    // unreadable. Outside the try, either would throw straight out of this
+    // function and take the container spawn down with it.
+    const hostMtime = fs.statSync(hostSettingsPath).mtimeMs.toString();
+    const sourceStamp = `${hostSettingsPath}|${hostMtime}`;
+    const cachedStamp = fs.existsSync(markerFile)
+      ? fs.readFileSync(markerFile, 'utf-8').trim()
+      : '';
+
+    if (cachedStamp === sourceStamp && fs.existsSync(settingsFile)) {
+      return; // Same source file, unchanged — skip regeneration
+    }
+
     const hostSettings = JSON.parse(fs.readFileSync(hostSettingsPath, 'utf-8'));
 
     // SECURITY GATE: validate the host settings.json against the Atlas
@@ -678,9 +698,10 @@ export function writeContainerSettings(settingsFile: string): void {
           error: err,
           hostSettingsPath,
           settingsFile,
+          settingsFilePresent: fs.existsSync(settingsFile),
           requiredHooks: manifestRequired?.length,
         },
-        'Refusing to write container settings.json — the enforcement settings SOURCE could not be read/parsed while the manifest requires hooks. Keeping previous per-group settings file (if any) live.',
+        'Refusing to write container settings.json — the enforcement settings SOURCE could not be read/parsed while the manifest requires hooks. Keeping the previous per-group settings file (if any) live. NOTE: the container still spawns — if settingsFilePresent is false it runs with no hooks.',
       );
       return;
     }

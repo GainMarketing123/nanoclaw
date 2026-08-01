@@ -42,8 +42,11 @@ the same symptom.
 
 ### 1.3 What the `atlas` user can and cannot do (verified live)
 
-- **CAN**: read every per-group `settings.json` + marker; write `atlas_gpg`, `atlas_main`,
-  `telegram_atlas-marketing` `.claude` dirs; write `/run/atlas/restart-queue/requests`;
+- **CAN**: read every per-group `settings.json` + marker; create/delete entries in the
+  `atlas_gpg`, `atlas_main`, `telegram_atlas-marketing` `.claude` **directories** (but NOT
+  overwrite the existing `0644` `nanoclaw-svc`-owned files in them — group access is
+  read-only, so a plain `cp` onto one fails `EACCES`; see §4.3 R-3);
+  write `/run/atlas/restart-queue/requests`;
   run `/home/atlas/regen-config-hashes.sh`; run `/home/atlas/git-sync.sh`; use `docker`
   (member of the `docker` group).
 - **CANNOT**: `systemctl start/stop/restart` anything — `sudo -l` grants exactly four
@@ -257,13 +260,20 @@ git -C /home/thao/projects/ops/nanoclaw worktree add /tmp/nc-rollback-$$ origin/
 cd /tmp/nc-rollback-$$
 git log --oneline -1                       # MUST equal the deployed commit (§D4)
 git revert --no-edit <deployed-commit-sha>
-git push origin HEAD:main
 ```
 
-Before pushing, confirm the push is a fast-forward carrying exactly the revert commit:
+**Now validate, and only then push.** The push is irreversible in effect (it auto-deploys
+within 5 minutes), so the check belongs before it, not after:
 
 ```bash
-git log --oneline origin/main..HEAD        # expect ONE commit, the revert
+git log --oneline origin/main..HEAD        # MUST be exactly ONE commit: the revert
+```
+
+If that prints more than one commit, STOP — the checkout is not clean and pushing would
+ship unrelated work to production. Only when it prints exactly one:
+
+```bash
+git push origin HEAD:main
 ```
 
 Remove the throwaway worktree (`git worktree remove /tmp/nc-rollback-$$`) once R-4 passes.
@@ -273,32 +283,42 @@ Remove the throwaway worktree (`git worktree remove /tmp/nc-rollback-$$`) once R
 read from `CLAUDE_SETTINGS_SOURCE_DIR`. Proceeding early reintroduces exactly the race this
 ordering exists to avoid.
 
-**R-3 — Restore per-group state from the snapshot.** For the three atlas-writable groups:
+**R-3 — Restore per-group state from the snapshot.**
+
+**Restore every group through docker-root — including the three whose directories `atlas`
+can write.** Directory write permission is not enough: the per-group files are mode `0644`
+owned by `nanoclaw-svc`, and `atlas` (group `atlas-svc`) has only group-**read** on them, so
+a plain `cp` onto an existing file fails `EACCES`. Working around that by deleting and
+recreating the file would leave it owned by `atlas`, silently changing the ownership the
+service expects. One uniform privileged path avoids both failure modes and restores exact
+ownership and mode:
 
 ```bash
 SNAP=<snapshot path from D1>
-for g in atlas_gpg atlas_main telegram_atlas-marketing; do
-  d=/home/atlas/nanoclaw/data/sessions/$g/.claude
-  [ -f "$SNAP/$g/settings.json" ] && cp -p "$SNAP/$g/settings.json" "$d/settings.json"
-  if [ -f "$SNAP/$g/settings.json.source-mtime" ]; then
-    cp -p "$SNAP/$g/settings.json.source-mtime" "$d/settings.json.source-mtime"
-  else
-    rm -f "$d/settings.json.source-mtime"   # telegram had NO marker pre-deploy
-  fi
+for g in atlas_gpg atlas_main atlas_teams telegram_atlas-marketing; do
+  [ -d "$SNAP/$g" ] || continue
+  docker run --rm -u 0:0 \
+    -v /home/atlas/nanoclaw/data/sessions/$g/.claude:/target \
+    -v "$SNAP/$g":/snap:ro alpine:latest sh -c '
+      if [ -f /snap/settings.json ]; then
+        cp /snap/settings.json /target/settings.json
+        chown 996:1001 /target/settings.json && chmod 644 /target/settings.json
+      fi
+      if [ -f /snap/settings.json.source-mtime ]; then
+        cp /snap/settings.json.source-mtime /target/settings.json.source-mtime
+        chown 996:1001 /target/settings.json.source-mtime
+        chmod 644 /target/settings.json.source-mtime
+      else
+        # telegram_atlas-marketing had NO marker pre-deploy — restoring one
+        # would change its state rather than restore it.
+        rm -f /target/settings.json.source-mtime
+      fi'
 done
 ```
 
-For `atlas_teams` (not atlas-writable — needs docker-root):
-
-```bash
-docker run --rm -u 0:0 \
-  -v /home/atlas/nanoclaw/data/sessions/atlas_teams/.claude:/target \
-  -v "$SNAP/atlas_teams":/snap:ro alpine:latest sh -c '
-    cp /snap/settings.json /target/settings.json
-    cp /snap/settings.json.source-mtime /target/settings.json.source-mtime
-    chown 996:1001 /target/settings.json /target/settings.json.source-mtime
-    chmod 644 /target/settings.json /target/settings.json.source-mtime'
-```
+`996:1001` is `nanoclaw-svc:atlas-svc`, verified live on 2026-07-31 — not assumed from the
+name. Re-check with `id -u nanoclaw-svc; id -g nanoclaw-svc` before running if any user
+migration has happened since.
 
 For `atlas_crownscape` / `atlas_wisestream` — they had **no session dir** pre-deploy, so
 rollback is deletion, not restoration:
