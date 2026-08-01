@@ -17,6 +17,11 @@ vi.mock('./config.js', () => ({
   DATA_DIR: '/tmp/nanoclaw-test-data',
   GROUPS_DIR: '/tmp/nanoclaw-test-groups',
   HOST_CLAUDE_DIR: '/tmp/test-claude-dir',
+  // Credential root and rulebook root are separate constants (2026-07-31
+  // propagation fix). Distinct values here so a re-aliasing regression cannot
+  // hide behind an identical mock.
+  CLAUDE_CONFIG_DIR: '/tmp/test-claude-dir',
+  CLAUDE_SETTINGS_SOURCE_DIR: '/tmp/test-settings-source-dir',
   IDLE_TIMEOUT: 1800000, // 30min
   TIMEZONE: 'America/Los_Angeles',
 }));

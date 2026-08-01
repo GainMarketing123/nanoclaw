@@ -39,6 +39,36 @@ export const CLAUDE_CONFIG_DIR =
   process.env.CLAUDE_CONFIG_DIR || path.join(HOME_DIR, '.claude');
 export const HOST_CLAUDE_DIR = CLAUDE_CONFIG_DIR;
 
+// CLAUDE_SETTINGS_SOURCE_DIR is the host directory the ENFORCEMENT RULEBOOK is
+// read from — the settings.json whose hooks writeContainerSettings() propagates
+// into every per-group container settings file.
+//
+// This is deliberately SEPARATE from CLAUDE_CONFIG_DIR above. The two answer
+// different questions: CLAUDE_CONFIG_DIR is "where do the CREDENTIALS live",
+// CLAUDE_SETTINGS_SOURCE_DIR is "where do the RULES live". They were the same
+// constant until 2026-07-31, and that cost us three weeks of frozen enforcement:
+//
+//   The 2026-07-11 shared-identity OAuth cutover added
+//   `Environment=CLAUDE_CONFIG_DIR=/home/nanoclaw-he/.claude` to
+//   nanoclaw.service (infra/systemd-dropins/nanoclaw.service.d/
+//   oauth-shared-identity.conf) so the credential proxy could reach the shared
+//   subscription credential. The RULEBOOK never moved — it still lives at
+//   /home/atlas/.claude/settings.json — but container-runner.ts located it
+//   through the same constant. /home/nanoclaw-he/.claude/settings.json is
+//   literally `{}`, so from 2026-07-11 the container-spawn parity gate compared
+//   62 manifest-required hooks against zero registered ones, correctly refused
+//   to propagate, and left every channel frozen on its last-good hook set
+//   (measured 2026-07-31: atlas_teams 54, atlas_gpg 18, atlas_main 17, two
+//   groups zero). The gate was right; it was pointed at the wrong file.
+//
+// Default resolves to the atlas home's .claude via HOME_DIR, which the
+// nanoclaw.service EnvironmentFile already pins to /home/atlas — so the default
+// is correct on the VPS with no unit change. The dedicated env var exists so a
+// future settings relocation (or a rollback of this fix) can repoint the
+// rulebook WITHOUT touching the credential path, and vice versa.
+export const CLAUDE_SETTINGS_SOURCE_DIR =
+  process.env.CLAUDE_SETTINGS_SOURCE_DIR || path.join(HOME_DIR, '.claude');
+
 // Mount security: allowlist stored OUTSIDE project root, never mounted into containers
 export const MOUNT_ALLOWLIST_PATH = path.join(
   HOME_DIR,

@@ -12,13 +12,13 @@ import http from 'http';
 import {
   ATLAS_STATE_DIR,
   BRIDGE_CALLBACK_PORT,
+  CLAUDE_SETTINGS_SOURCE_DIR,
   CONTAINER_IMAGE,
   CONTAINER_MAX_OUTPUT_SIZE,
   CONTAINER_TIMEOUT,
   CREDENTIAL_PROXY_PORT,
   DATA_DIR,
   GROUPS_DIR,
-  HOST_CLAUDE_DIR,
   IDLE_TIMEOUT,
   TIMEZONE,
 } from './config.js';
@@ -400,11 +400,28 @@ function rewriteHookCommand(command: string): string {
 
 /**
  * Generate container settings.json with enforcement hooks and env vars.
- * Reads host ~/.claude/settings.json, rewrites paths for Linux container,
- * merges with required NanoClaw env vars. Regenerates when host settings change.
+ * Reads the host settings SOURCE (~/.claude/settings.json on the atlas home),
+ * rewrites paths for Linux container, merges with required NanoClaw env vars.
+ * Regenerates when host settings change.
+ *
+ * Exported for the propagation regression test
+ * (`container-settings-source.test.ts`). There is no other seam: the only
+ * caller is `buildVolumeMounts`, which is itself private and reachable only
+ * through `runContainerAgent` (which spawns a real container). The wiring this
+ * function encodes — WHICH host file the enforcement hooks are read from — is
+ * deployment-critical and silently froze every business channel's hook set
+ * between 2026-07-11 and 2026-07-31, so it gets a direct behavioural test.
  */
-function writeContainerSettings(settingsFile: string): void {
-  const hostSettingsPath = path.join(HOST_CLAUDE_DIR, 'settings.json');
+export function writeContainerSettings(settingsFile: string): void {
+  // CLAUDE_SETTINGS_SOURCE_DIR, never CLAUDE_CONFIG_DIR/HOST_CLAUDE_DIR: the
+  // latter is the CREDENTIAL root and is pointed at /home/nanoclaw-he/.claude
+  // on the VPS, which holds no rulebook. Reading it here froze enforcement
+  // propagation on every channel from 2026-07-11 to 2026-07-31. See the
+  // CLAUDE_SETTINGS_SOURCE_DIR comment in config.ts.
+  const hostSettingsPath = path.join(
+    CLAUDE_SETTINGS_SOURCE_DIR,
+    'settings.json',
+  );
 
   // Required env vars for containers
   const containerEnv = {
@@ -456,7 +473,8 @@ function writeContainerSettings(settingsFile: string): void {
     // resolves correctly on the VPS where nanoclaw runs as a non-atlas service
     // user — os.homedir() would resolve to the service user's home, not the
     // atlas user's, silently defeating the gate. Same env-aware pattern the
-    // rest of this file uses (e.g. HOST_CLAUDE_DIR for settings.json).
+    // rest of this file uses (e.g. CLAUDE_SETTINGS_SOURCE_DIR for
+    // settings.json).
     const manifestPath = path.join(
       ATLAS_STATE_DIR,
       'enforcement-manifest.json',
