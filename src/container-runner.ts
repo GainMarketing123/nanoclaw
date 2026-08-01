@@ -399,6 +399,52 @@ function rewriteHookCommand(command: string): string {
 }
 
 /**
+ * Read the Atlas enforcement manifest — the authoritative list of hooks every
+ * container MUST run. Returns null when it is unreadable or malformed.
+ *
+ * Uses the env-aware ATLAS_STATE_DIR (aliased to ATLAS_DIR in config) so this
+ * resolves correctly on the VPS where nanoclaw runs as a non-atlas service user
+ * — os.homedir() would resolve to the service user's home, not the atlas
+ * user's, silently defeating the gate. Same env-aware pattern the rest of this
+ * file uses (e.g. CLAUDE_SETTINGS_SOURCE_DIR for settings.json).
+ *
+ * A null return means "check SKIPPED", not "nothing required": refusing every
+ * spawn over a manifest hiccup would DoS the autonomous engine for something
+ * the deploy step (git-sync.sh + validate-settings-parity.py) is supposed to
+ * catch upstream. Logged loudly because on the production VPS it is a deploy
+ * regression worth chasing.
+ */
+function loadEnforcementManifest(): Array<{
+  event: string;
+  matcher?: string;
+  script: string;
+}> | null {
+  const manifestPath = path.join(ATLAS_STATE_DIR, 'enforcement-manifest.json');
+  try {
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8')) as {
+      required_hooks?: Array<{
+        event: string;
+        matcher?: string;
+        script: string;
+      }>;
+    };
+    return Array.isArray(manifest.required_hooks)
+      ? manifest.required_hooks
+      : null;
+  } catch (err) {
+    logger.warn(
+      {
+        event: 'enforcement_manifest_unavailable',
+        manifestPath,
+        message: (err as Error).message,
+      },
+      'Atlas enforcement manifest unreadable — container-spawn parity check SKIPPED. Not blocking spawn to avoid DoS; investigate the manifest deploy state.',
+    );
+    return null;
+  }
+}
+
+/**
  * Generate container settings.json with enforcement hooks and env vars.
  * Reads the host settings SOURCE (~/.claude/settings.json on the atlas home),
  * rewrites paths for Linux container, merges with required NanoClaw env vars.
@@ -430,8 +476,34 @@ export function writeContainerSettings(settingsFile: string): void {
     CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
   };
 
-  // If no host settings, write minimal config
+  // Load the enforcement manifest FIRST — before the source-existence check —
+  // so every failure path below can ask "is enforcement required here?" and
+  // fail CLOSED when it is. Pre-fix this lived inside the try block, so the
+  // two paths that run BEFORE it (source missing, and the catch handler on a
+  // read/parse error) could write a hook-less container config that bypassed
+  // the parity gate entirely. Now that the settings source is a separately
+  // configurable path, a typo'd or unreadable CLAUDE_SETTINGS_SOURCE_DIR would
+  // have turned a frozen-but-present hook set into NO hooks at all — strictly
+  // worse than the incident this change fixes.
+  const manifestRequired = loadEnforcementManifest();
+  const enforcementRequired = !!manifestRequired && manifestRequired.length > 0;
+
+  // If no host settings, write minimal config — but ONLY when the manifest does
+  // not require enforcement. When it does, refuse and keep the previous
+  // per-group file live, exactly like the parity-failure path below.
   if (!fs.existsSync(hostSettingsPath)) {
+    if (enforcementRequired) {
+      logger.warn(
+        {
+          event: 'container_settings_source_unavailable',
+          hostSettingsPath,
+          settingsFile,
+          requiredHooks: manifestRequired?.length,
+        },
+        'Refusing to write container settings.json — the enforcement settings SOURCE is missing while the manifest requires hooks. Keeping previous per-group settings file (if any) live; marker NOT updated so the next spawn re-checks. Check CLAUDE_SETTINGS_SOURCE_DIR.',
+      );
+      return;
+    }
     if (!fs.existsSync(settingsFile)) {
       fs.writeFileSync(
         settingsFile,
@@ -441,15 +513,25 @@ export function writeContainerSettings(settingsFile: string): void {
     return;
   }
 
-  // Check if host settings changed since last write
+  // Check if the host settings changed since the last write.
+  //
+  // The marker records the SOURCE PATH as well as the mtime. Recording mtime
+  // alone was safe only while the source path was a compile-time constant: now
+  // that CLAUDE_SETTINGS_SOURCE_DIR can be repointed (including by a rollback),
+  // a marker carrying just an mtime cannot tell "same file, unchanged" from
+  // "different file that happens to share an mtime" — and the latter would
+  // silently retain settings generated from the PREVIOUS source. Any marker
+  // that does not match both fields (including a legacy mtime-only marker) is
+  // treated as stale, which forces exactly one regeneration.
   const hostMtime = fs.statSync(hostSettingsPath).mtimeMs.toString();
+  const sourceStamp = `${hostSettingsPath}|${hostMtime}`;
   const markerFile = settingsFile + '.source-mtime';
-  const cachedMtime = fs.existsSync(markerFile)
+  const cachedStamp = fs.existsSync(markerFile)
     ? fs.readFileSync(markerFile, 'utf-8').trim()
     : '';
 
-  if (cachedMtime === hostMtime && fs.existsSync(settingsFile)) {
-    return; // Host settings unchanged, skip regeneration
+  if (cachedStamp === sourceStamp && fs.existsSync(settingsFile)) {
+    return; // Same source file, unchanged — skip regeneration
   }
 
   try {
@@ -469,50 +551,9 @@ export function writeContainerSettings(settingsFile: string): void {
     // the next spawn re-checks. Early-return (not throw) — the catch handler
     // below strips ALL hooks on JSON/IO errors and must NOT fire for a parity
     // refusal.
-    // Use the env-aware ATLAS_STATE_DIR (aliased to ATLAS_DIR in config) so this
-    // resolves correctly on the VPS where nanoclaw runs as a non-atlas service
-    // user — os.homedir() would resolve to the service user's home, not the
-    // atlas user's, silently defeating the gate. Same env-aware pattern the
-    // rest of this file uses (e.g. CLAUDE_SETTINGS_SOURCE_DIR for
-    // settings.json).
-    const manifestPath = path.join(
-      ATLAS_STATE_DIR,
-      'enforcement-manifest.json',
-    );
+    // The manifest is loaded once at the top of this function (see
+    // loadEnforcementManifest) so the pre-try failure paths can fail closed too.
     let parityFailure: string | null = null;
-    let manifestRequired: Array<{
-      event: string;
-      matcher?: string;
-      script: string;
-    }> | null = null;
-    try {
-      // Narrow catch: ONLY manifest read+parse failures land here. Log loudly
-      // (on production VPS this is a deploy regression worth chasing) and let
-      // manifestRequired stay null so the check is SKIPPED below. Refusing
-      // spawn over a manifest hiccup would DoS the autonomous engine for what
-      // the deploy step (git-sync.sh + validate-settings-parity.py) is supposed
-      // to catch upstream. Iteration errors over hostSettings.hooks are handled
-      // defensively below — they do NOT land here.
-      const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8')) as {
-        required_hooks?: Array<{
-          event: string;
-          matcher?: string;
-          script: string;
-        }>;
-      };
-      if (Array.isArray(manifest.required_hooks)) {
-        manifestRequired = manifest.required_hooks;
-      }
-    } catch (err) {
-      logger.warn(
-        {
-          event: 'enforcement_manifest_unavailable',
-          manifestPath,
-          message: (err as Error).message,
-        },
-        'Atlas enforcement manifest unreadable — container-spawn parity check SKIPPED. Not blocking spawn to avoid DoS; investigate the manifest deploy state.',
-      );
-    }
 
     if (manifestRequired && manifestRequired.length > 0) {
       // Build the required set as (event, matcher, atlas-relative path).
@@ -618,13 +659,31 @@ export function writeContainerSettings(settingsFile: string): void {
       settingsFile,
       JSON.stringify(containerSettings, null, 2) + '\n',
     );
-    fs.writeFileSync(markerFile, hostMtime);
+    fs.writeFileSync(markerFile, sourceStamp);
 
     logger.info(
       { settingsFile, hookEvents: Object.keys(containerHooks) },
       'Generated container settings.json with enforcement hooks',
     );
   } catch (err) {
+    // Read/parse failure on the settings source. Fail CLOSED when the manifest
+    // requires enforcement: writing the minimal config here would strip every
+    // hook, which is strictly worse than keeping the previous per-group file.
+    // The marker is deliberately NOT updated either way, so the next spawn
+    // re-checks.
+    if (enforcementRequired) {
+      logger.warn(
+        {
+          event: 'container_settings_source_unreadable',
+          error: err,
+          hostSettingsPath,
+          settingsFile,
+          requiredHooks: manifestRequired?.length,
+        },
+        'Refusing to write container settings.json — the enforcement settings SOURCE could not be read/parsed while the manifest requires hooks. Keeping previous per-group settings file (if any) live.',
+      );
+      return;
+    }
     logger.warn(
       { error: err, hostSettingsPath },
       'Failed to read host settings, writing minimal container config',

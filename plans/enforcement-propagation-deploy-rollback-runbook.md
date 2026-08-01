@@ -160,18 +160,24 @@ exact environment**, writing to a scratch path so no live state is touched:
 
 ```bash
 cd /home/atlas/nanoclaw
+VERIFY_DIR=$(mktemp -d /tmp/wave31c-verify-XXXXXX) \
 HOME=/home/atlas CLAUDE_CONFIG_DIR=/home/nanoclaw-he/.claude \
   node --input-type=module -e '
     import { writeContainerSettings } from "/home/atlas/nanoclaw/dist/container-runner.js";
     import fs from "fs";
-    const out = "/tmp/wave31c-verify/settings.json";
-    fs.mkdirSync("/tmp/wave31c-verify", { recursive: true });
+    const out = process.env.VERIFY_DIR + "/settings.json";
     writeContainerSettings(out);
+    if (!fs.existsSync(out)) { console.log("REFUSED — no file written"); process.exit(1); }
     const s = JSON.parse(fs.readFileSync(out, "utf-8"));
     let n = 0; for (const es of Object.values(s.hooks ?? {})) for (const e of es) n += (e.hooks ?? []).length;
     console.log("hook commands propagated:", n);
   '
 ```
+
+The output directory MUST be fresh each run (`mktemp -d`). A reused path keeps its
+`settings.json` **and** its `.source-mtime` marker, so a second run short-circuits on the
+freshness check and reprints the previous run's count without reading the source at all —
+a green result that proves nothing.
 
 **PASS = `62`.** Anything less (especially `0`, or no file written) means the deployed build
 is still reading the credential dir. `CLAUDE_CONFIG_DIR` is deliberately set to the
@@ -237,12 +243,30 @@ report. It removes the only step that needed a privilege `atlas` does not have.
 
 ### 4.3 Steps
 
-**R-1 — Revert the code (this re-deploys automatically).** From the laptop:
+**R-1 — Revert the code (this re-deploys automatically).**
+
+**Do NOT revert in the canonical checkout `/home/thao/projects/ops/nanoclaw`.** That
+checkout sits on an unrelated feature branch (`al-router-cred-routing` at the time of
+writing) carrying other lanes' *unpushed* commits. Reverting there and pushing `HEAD:main`
+would ship all of that other work to production alongside the rollback. Roll back from a
+throwaway checkout synchronised to the deployed `origin/main` and nothing else:
 
 ```bash
-git -C /home/thao/projects/ops/nanoclaw revert --no-edit <deployed-commit-sha>
-git -C /home/thao/projects/ops/nanoclaw push origin HEAD:main
+git -C /home/thao/projects/ops/nanoclaw fetch origin
+git -C /home/thao/projects/ops/nanoclaw worktree add /tmp/nc-rollback-$$ origin/main
+cd /tmp/nc-rollback-$$
+git log --oneline -1                       # MUST equal the deployed commit (§D4)
+git revert --no-edit <deployed-commit-sha>
+git push origin HEAD:main
 ```
+
+Before pushing, confirm the push is a fast-forward carrying exactly the revert commit:
+
+```bash
+git log --oneline origin/main..HEAD        # expect ONE commit, the revert
+```
+
+Remove the throwaway worktree (`git worktree remove /tmp/nc-rollback-$$`) once R-4 passes.
 
 **R-2 — Wait for git-sync to rebuild and restart** (§D3/§D4 checks). Do not proceed until
 `ExecMainStartTimestamp` has advanced and `dist/config.js` no longer drives the settings

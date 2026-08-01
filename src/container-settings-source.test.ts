@@ -217,7 +217,7 @@ describe('container enforcement-hook propagation source', () => {
     expect(JSON.stringify(written)).not.toContain('/home/atlas/.atlas/hooks/');
   });
 
-  it('stamps the freshness marker from the settings source mtime', async () => {
+  it('stamps the freshness marker with the source PATH as well as its mtime', async () => {
     const dirs = makeDirs();
     const { writeContainerSettings } = await importWithConfig(
       dirs,
@@ -226,23 +226,156 @@ describe('container enforcement-hook propagation source', () => {
 
     writeContainerSettings(dirs.groupSettingsFile);
 
+    const sourceFile = path.join(dirs.settingsSourceDir, 'settings.json');
     const marker = `${dirs.groupSettingsFile}.source-mtime`;
     expect(fs.existsSync(marker)).toBe(true);
+    // Path AND mtime. An mtime-only marker cannot distinguish "same file,
+    // unchanged" from "different file with a coincidentally equal mtime".
     expect(fs.readFileSync(marker, 'utf-8').trim()).toBe(
-      fs
-        .statSync(path.join(dirs.settingsSourceDir, 'settings.json'))
-        .mtimeMs.toString(),
+      `${sourceFile}|${fs.statSync(sourceFile).mtimeMs.toString()}`,
     );
   });
 
-  it('keeps the credential dir independently configurable (no re-aliasing)', async () => {
+  it('regenerates when the source PATH changes even if the mtime is identical', async () => {
     const dirs = makeDirs();
+
+    // Second rulebook, different directory, IDENTICAL mtime, different content.
+    const otherSourceDir = path.join(dirs.root, 'other', '.claude');
+    fs.mkdirSync(otherSourceDir, { recursive: true });
+    const original = path.join(dirs.settingsSourceDir, 'settings.json');
+    const other = path.join(otherSourceDir, 'settings.json');
+    const settings = JSON.parse(fs.readFileSync(original, 'utf-8'));
+    settings.env.MARKER_PROBE = 'second-source';
+    fs.writeFileSync(other, JSON.stringify(settings, null, 2) + '\n');
+    // Pin BOTH files to the same whole-second timestamp. Setting one from the
+    // other's stat is not enough: utimesSync truncates sub-millisecond
+    // precision, so the two mtimes would differ by a fraction of a millisecond
+    // and the test would pass for the wrong reason.
+    const pinned = new Date(1785547001000);
+    fs.utimesSync(original, pinned, pinned);
+    fs.utimesSync(other, pinned, pinned);
+    expect(fs.statSync(other).mtimeMs).toBe(fs.statSync(original).mtimeMs);
+
+    const first = await importWithConfig(dirs, dirs.settingsSourceDir);
+    first.writeContainerSettings(dirs.groupSettingsFile);
+    expect(
+      JSON.parse(fs.readFileSync(dirs.groupSettingsFile, 'utf-8')).env
+        .MARKER_PROBE,
+    ).toBeUndefined();
+
+    // Repoint at the other source. Same mtime — an mtime-only marker would
+    // short-circuit here and silently retain the previous source's settings.
+    const second = await importWithConfig(dirs, otherSourceDir);
+    second.writeContainerSettings(dirs.groupSettingsFile);
+    expect(
+      JSON.parse(fs.readFileSync(dirs.groupSettingsFile, 'utf-8')).env
+        .MARKER_PROBE,
+    ).toBe('second-source');
+  });
+
+  it('keeps the credential dir independently configurable (no re-aliasing)', async () => {
+    // Reproduce the exact VPS environment that caused the incident: HOME on the
+    // atlas home, CLAUDE_CONFIG_DIR repointed at the credential-only dir. The
+    // rulebook must NOT follow the credentials.
+    vi.resetModules();
+    vi.stubEnv('HOME', '/home/atlas');
+    vi.stubEnv('CLAUDE_CONFIG_DIR', '/home/nanoclaw-he/.claude');
+    vi.stubEnv('CLAUDE_SETTINGS_SOURCE_DIR', '');
+    delete process.env.CLAUDE_SETTINGS_SOURCE_DIR;
+
     const config = await import('./config.js');
-    // Guard the shape of the real module, not the mock: the two roles must be
-    // separate exported constants so a future credential move cannot drag the
-    // rulebook with it.
-    expect(typeof config.CLAUDE_SETTINGS_SOURCE_DIR).toBe('string');
-    expect(typeof config.CLAUDE_CONFIG_DIR).toBe('string');
+
+    expect(config.CLAUDE_CONFIG_DIR).toBe('/home/nanoclaw-he/.claude');
+    expect(config.HOST_CLAUDE_DIR).toBe('/home/nanoclaw-he/.claude');
+    expect(config.CLAUDE_SETTINGS_SOURCE_DIR).toBe('/home/atlas/.claude');
+    expect(config.CLAUDE_SETTINGS_SOURCE_DIR).not.toBe(
+      config.CLAUDE_CONFIG_DIR,
+    );
+
+    vi.unstubAllEnvs();
+  });
+
+  it('honours its own env var so a rollback can repoint the rulebook alone', async () => {
+    vi.resetModules();
+    vi.stubEnv('HOME', '/home/atlas');
+    vi.stubEnv('CLAUDE_CONFIG_DIR', '/home/nanoclaw-he/.claude');
+    vi.stubEnv('CLAUDE_SETTINGS_SOURCE_DIR', '/srv/rulebook');
+
+    const config = await import('./config.js');
+
+    expect(config.CLAUDE_SETTINGS_SOURCE_DIR).toBe('/srv/rulebook');
+    expect(config.CLAUDE_CONFIG_DIR).toBe('/home/nanoclaw-he/.claude');
+
+    vi.unstubAllEnvs();
+  });
+
+  it('fails CLOSED when the settings source is MISSING and hooks are required', async () => {
+    const dirs = makeDirs();
+    // A typo'd / unmounted CLAUDE_SETTINGS_SOURCE_DIR. Pre-fix this wrote a
+    // hook-less minimal config, bypassing the parity gate entirely — strictly
+    // worse than the frozen-but-present set the incident produced.
+    const { writeContainerSettings, warn } = await importWithConfig(
+      dirs,
+      path.join(dirs.root, 'does-not-exist', '.claude'),
+    );
+
+    writeContainerSettings(dirs.groupSettingsFile);
+
+    expect(fs.existsSync(dirs.groupSettingsFile)).toBe(false);
+    expect(
+      warn.mock.calls.some(
+        (call) =>
+          (call[0] as { event?: string })?.event ===
+          'container_settings_source_unavailable',
+      ),
+      'a missing settings source must refuse, not write a hook-less config',
+    ).toBe(true);
+  });
+
+  it('fails CLOSED when the settings source is UNPARSEABLE and hooks are required', async () => {
+    const dirs = makeDirs();
+    fs.writeFileSync(
+      path.join(dirs.settingsSourceDir, 'settings.json'),
+      '{ this is not json',
+    );
+
+    const { writeContainerSettings, warn } = await importWithConfig(
+      dirs,
+      dirs.settingsSourceDir,
+    );
+
+    writeContainerSettings(dirs.groupSettingsFile);
+
+    expect(fs.existsSync(dirs.groupSettingsFile)).toBe(false);
+    expect(
+      warn.mock.calls.some(
+        (call) =>
+          (call[0] as { event?: string })?.event ===
+          'container_settings_source_unreadable',
+      ),
+      'an unreadable settings source must refuse, not write a hook-less config',
+    ).toBe(true);
+  });
+
+  it('still bootstraps a minimal config when NO manifest requires enforcement', async () => {
+    const dirs = makeDirs();
+    // No manifest at all -> nothing is required -> a fresh install must still
+    // get a usable settings file. Failing closed here would DoS a cold start.
+    fs.rmSync(path.join(dirs.atlasDir, 'enforcement-manifest.json'));
+
+    const { writeContainerSettings } = await importWithConfig(
+      dirs,
+      path.join(dirs.root, 'does-not-exist', '.claude'),
+    );
+
+    writeContainerSettings(dirs.groupSettingsFile);
+
+    expect(fs.existsSync(dirs.groupSettingsFile)).toBe(true);
+    const written = JSON.parse(
+      fs.readFileSync(dirs.groupSettingsFile, 'utf-8'),
+    );
+    expect(written.env).toBeTruthy();
+    expect(countHookCommands(written)).toBe(0);
   });
 
   it('still fails CLOSED when the settings source genuinely has no hooks', async () => {
