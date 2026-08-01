@@ -359,11 +359,20 @@ the old file or the restored one — never a half-written enforcement file. A pl
 a live `settings.json` is a torn-read window on exactly the file that decides which safety
 checks the container runs.
 
+**Every step below is status-checked.** A `docker run` that fails — image pull error,
+missing mount, the in-container `exit 1` guard firing — still lets the surrounding loop
+continue to the next group. Unchecked, the rollback would skip a group and finish
+"successfully" while that channel stayed on the deployed 62-hook set. Abort on the first
+failure and fix it before continuing:
+
 ```bash
+set -u
 SNAP=<snapshot path from D1>
+ROLLBACK_FAILED=""
+
 for g in atlas_gpg atlas_main atlas_teams telegram_atlas-marketing; do
-  [ -d "$SNAP/$g" ] || continue
-  docker run --rm -u 0:0 \
+  [ -d "$SNAP/$g" ] || { ROLLBACK_FAILED="$ROLLBACK_FAILED $g(no-snapshot)"; continue; }
+  if ! docker run --rm -u 0:0 \
     -v /home/atlas/nanoclaw/data/sessions/$g/.claude:/target \
     -v "$SNAP/$g":/snap:ro alpine:latest sh -c '
       set -e
@@ -384,7 +393,9 @@ for g in atlas_gpg atlas_main atlas_teams telegram_atlas-marketing; do
           echo "ROLLBACK ABORT: no snapshot copy and no sentinel for $f" >&2
           exit 1
         fi
-      done'
+      done'; then
+    ROLLBACK_FAILED="$ROLLBACK_FAILED $g"
+  fi
 done
 ```
 
@@ -397,12 +408,23 @@ rollback is deletion, not restoration:
 
 ```bash
 for g in atlas_crownscape atlas_wisestream; do
-  d=/home/atlas/nanoclaw/data/sessions/$g/.claude
-  [ -f "$SNAP/$g/settings.json.ABSENT" ] && docker run --rm -u 0:0 \
+  [ -f "$SNAP/$g/settings.json.ABSENT" ] || continue
+  if ! docker run --rm -u 0:0 \
     -v /home/atlas/nanoclaw/data/sessions:/s alpine:latest \
-    sh -c "rm -f /s/$g/.claude/settings.json /s/$g/.claude/settings.json.source-mtime"
+    sh -c "rm -f /s/$g/.claude/settings.json /s/$g/.claude/settings.json.source-mtime"; then
+    ROLLBACK_FAILED="$ROLLBACK_FAILED $g"
+  fi
 done
+
+[ -z "$ROLLBACK_FAILED" ] || {
+  echo "ROLLBACK INCOMPLETE for:$ROLLBACK_FAILED — these channels are STILL on the deployed set" >&2
+  exit 1
+}
+echo "rollback restore completed for all groups"
 ```
+
+Do not treat the rollback as done on the strength of this script alone — R-4 re-reads the
+counts from the running system, which is what actually proves it.
 
 **R-4 — Verify the rollback from the running system.** Re-run V2: counts must be back to
 54 / 18 / 17 / 0 and the two never-provisioned groups must have no file. Re-run V3: the
