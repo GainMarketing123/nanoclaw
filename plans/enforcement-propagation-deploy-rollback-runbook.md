@@ -119,21 +119,40 @@ only when you needed to roll back. Assert instead that every group recorded a de
 state — either a real copy or an explicit sentinel — for both files:
 
 ```bash
+SNAP_OK=1
 for g in $GROUPS; do
   for f in settings.json settings.json.source-mtime; do
     if [ ! -f "$SNAP/$g/$f" ] && [ ! -f "$SNAP/$g/$f.ABSENT" ]; then
       echo "SNAPSHOT INCOMPLETE: $g/$f — DO NOT DEPLOY" >&2
+      SNAP_OK=0
     fi
   done
 done
+[ "$SNAP_OK" = 1 ] || { echo "SNAPSHOT INVALID — DO NOT DEPLOY" >&2; exit 1; }
 echo "snapshot verified: $SNAP"
 ```
+
+The `SNAP_OK` flag matters: without it the loop prints its warnings and then falls through
+to "snapshot verified" with a zero exit status, so both a human skimming the output and any
+wrapping script would read a broken snapshot as a good one.
 
 Cross-check the copied files against §1.1: `atlas_teams` must be 54 hook commands,
 `atlas_gpg` 18, `atlas_main` 17, `telegram_atlas-marketing` 0. A snapshot that disagrees
 with the recorded pre-deploy state is not a valid rollback point. Record the snapshot path.
 
-### D2 — Push (this deploys)
+### D2 — Record the deploy base, then push (this deploys)
+
+**Record the deploy base FIRST.** After the push, `origin/main` advances and the pre-deploy
+commit is no longer recoverable from a ref name — and §4.3 R-1 needs it to revert the whole
+range:
+
+```bash
+git -C /home/thao/projects/ops/nanoclaw fetch origin
+git -C /home/thao/projects/ops/nanoclaw rev-parse origin/main    # DEPLOY BASE — write it down
+```
+
+At the time of writing that is `16dfdda6d77055c6611cca4d6fe6e9bee753ba35`, and the server's
+checkout is at exactly that commit (0 ahead / 0 behind).
 
 From the **laptop** (the server cannot push):
 
@@ -142,7 +161,9 @@ git -C /home/thao/projects/ops/nanoclaw/.worktrees/wave31c-rulebook-fix push ori
 ```
 
 The branch is based on `origin/main` with no intervening commits, so this is a
-fast-forward. It does **not** carry any other lane's work.
+fast-forward. It does **not** carry any other lane's work. Note it pushes a **multi-commit**
+branch — record the tip too (`git rev-parse HEAD`); rollback reverts the whole
+base..tip range, not just the tip.
 
 ### D3 — Watch git-sync land it (do not skip)
 
@@ -285,18 +306,30 @@ git -C /home/thao/projects/ops/nanoclaw fetch origin
 git -C /home/thao/projects/ops/nanoclaw worktree add /tmp/nc-rollback-$$ origin/main
 cd /tmp/nc-rollback-$$
 git log --oneline -1                       # MUST equal the deployed commit (§D4)
-git revert --no-edit <deployed-commit-sha>
+
+# Revert the WHOLE deployed RANGE, not just the tip.
+git revert --no-edit <deploy-base-sha>..<deployed-tip-sha>
 ```
+
+**Revert the range, never a single commit.** This deploy pushes a multi-commit branch
+(`<deploy-base-sha>..<deployed-tip-sha>`), so `git revert <tip>` would undo only the last
+commit and leave the rest of the change live — a rollback that reports success while the
+propagation fix is still deployed and still writing 62-hook files. `<deploy-base-sha>` is
+the `origin/main` commit recorded in §D2 **before** the push; capture it there, at deploy
+time, because after the push `origin/main` no longer points at it.
 
 **Now validate, and only then push.** The push is irreversible in effect (it auto-deploys
 within 5 minutes), so the check belongs before it, not after:
 
 ```bash
-git log --oneline origin/main..HEAD        # MUST be exactly ONE commit: the revert
+git log --oneline origin/main..HEAD   # ONLY revert commits — one per reverted commit
+git diff --stat <deploy-base-sha> HEAD  # MUST be EMPTY: tree is back to pre-deploy
 ```
 
-If that prints more than one commit, STOP — the checkout is not clean and pushing would
-ship unrelated work to production. Only when it prints exactly one:
+The `git diff` is the real check: an empty diff against the deploy base proves the revert
+restored the pre-deploy tree exactly. If it prints anything, STOP — either the revert did
+not cover the whole range, or the checkout carries unrelated work that pushing would ship
+to production. Only when the diff is empty:
 
 ```bash
 git push origin HEAD:main
@@ -340,11 +373,16 @@ for g in atlas_gpg atlas_main atlas_teams telegram_atlas-marketing; do
           chown 996:1001 "/target/.rollback.$f"
           chmod 644 "/target/.rollback.$f"
           mv -f "/target/.rollback.$f" "/target/$f"
-        else
-          # An .ABSENT sentinel means the file did not exist pre-deploy
-          # (telegram_atlas-marketing had NO marker). Restoring one would
-          # change its state rather than restore it.
+        elif [ -f "/snap/$f.ABSENT" ]; then
+          # Deleting requires POSITIVE proof the file did not exist pre-deploy.
+          # telegram_atlas-marketing genuinely had no marker.
           rm -f "/target/$f"
+        else
+          # Neither a copy nor a sentinel: the snapshot is incomplete for this
+          # file. Treating that as "was absent" would DELETE live state on the
+          # strength of a snapshot bug. Refuse and leave it alone.
+          echo "ROLLBACK ABORT: no snapshot copy and no sentinel for $f" >&2
+          exit 1
         fi
       done'
 done
